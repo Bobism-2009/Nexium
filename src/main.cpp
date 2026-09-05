@@ -377,6 +377,12 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
 
     ImFontConfig code_fc = fc;
     code_fc.RasterizerMultiply = 1.0f;
+    static const ImWchar code_ranges[] = {
+        0x0020, 0x00FF,
+        0x2190, 0x21FF,
+        0x2500, 0x259F,
+        0
+    };
     const char* code_fonts[] = {
         "C:\\Windows\\Fonts\\CascadiaCode.ttf",
         "C:\\Windows\\Fonts\\cascadiacode.ttf",
@@ -386,13 +392,13 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     };
     for (const char* f : code_fonts) {
         if (file_exists(f)) {
-            app.font_code = io.Fonts->AddFontFromFileTTF(f, px(16.0f), &code_fc);
+            app.font_code = io.Fonts->AddFontFromFileTTF(f, px(16.0f), &code_fc, code_ranges);
             if (app.font_code) break;
         }
     }
     for (const char* f : code_fonts) {
         if (file_exists(f)) {
-            app.font_agent_code = io.Fonts->AddFontFromFileTTF(f, px(16.0f), &code_fc);
+            app.font_agent_code = io.Fonts->AddFontFromFileTTF(f, px(16.0f), &code_fc, code_ranges);
             if (app.font_agent_code) break;
         }
     }

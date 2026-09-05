@@ -504,24 +504,18 @@ static std::string tool_run_command(const Json& args) {
     if (g_app) {
         g_app->bottom = BottomTab::Terminal;
         g_app->settings.show_panel = true;
-        std::lock_guard<std::mutex> lock(g_app->proc.mu);
-        if (!g_app->proc.output.empty() && g_app->proc.output.back() != '\n')
-            g_app->proc.output += "\n";
-        g_app->proc.output += "$ " + cmd + "\n";
+        term_write_local("$ " + cmd + "\n");
     }
     ProcCapture cap;
     if (!proc_run_capture(cmd, cwd, timeout, cap)) {
-        if (g_app) {
-            std::lock_guard<std::mutex> lock(g_app->proc.mu);
-            g_app->proc.output += cap.output + "\n";
-        }
+        if (g_app) term_write_local(cap.output + "\n");
         return cap.output;
     }
     if (g_app) {
-        std::lock_guard<std::mutex> lock(g_app->proc.mu);
-        g_app->proc.output += cap.output;
-        if (cap.output.empty() || cap.output.back() != '\n') g_app->proc.output += "\n";
-        g_app->proc.output += "[exit " + std::to_string(cap.exit_code) + "]\n";
+        std::string echo = cap.output;
+        if (echo.empty() || echo.back() != '\n') echo += "\n";
+        echo += "[exit " + std::to_string(cap.exit_code) + "]\n";
+        term_write_local(echo);
     }
     std::string body = cap.output;
     if (body.size() > 80000) {
@@ -558,8 +552,8 @@ static std::string tool_run_nexa(const Json& args) {
     std::string cmd = nexac + (run ? " --run" : " build");
     proc_start(cmd, dir);
     Sleep(400);
-    std::lock_guard<std::mutex> lock(g_app->proc.mu);
-    return g_app->proc.output.empty() ? "Started Nexa" : g_app->proc.output;
+    std::string dump = term_plain_text();
+    return dump.empty() ? "Started Nexa" : dump;
 }
 
 static std::string tool_open_info() {

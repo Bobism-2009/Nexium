@@ -218,6 +218,30 @@ struct AgentRuntime {
     std::vector<std::string> tool_open;
 };
 
+struct TermCell {
+    uint32_t ch = 32;
+    ImU32 fg = IM_COL32(0xCC, 0xCC, 0xCC, 255);
+};
+
+struct TermScreen {
+    int cols = 80;
+    int rows = 24;
+    int cx = 0;
+    int cy = 0;
+    int saved_cx = 0;
+    int saved_cy = 0;
+    bool cursor_vis = true;
+    ImU32 fg = IM_COL32(0xCC, 0xCC, 0xCC, 255);
+    std::vector<TermCell> cells;
+    std::vector<std::vector<TermCell>> scrollback;
+    int parse = 0;
+    bool csi_q = false;
+    std::string seq;
+    uint32_t utf = 0;
+    int utf_need = 0;
+    uint64_t gen = 0;
+};
+
 struct ProcJob {
     HANDLE process = nullptr;
     HANDLE stdout_rd = nullptr;
@@ -228,6 +252,7 @@ struct ProcJob {
     std::string output;
     std::string typed;
     std::string cwd;
+    TermScreen screen;
     std::atomic<bool> running{false};
     DWORD exit_code = 0;
     bool is_shell = false;
@@ -235,8 +260,6 @@ struct ProcJob {
     bool shutdown = false;
     int cols = 80;
     int rows = 24;
-    int vt = 0;
-    bool cr = false;
 };
 
 struct AppSettings {
@@ -442,8 +465,12 @@ bool proc_run_capture(const std::string& command, const std::string& cwd,
                       DWORD timeout_ms, ProcCapture& out);
 void term_ensure_shell(const std::string& cwd = {});
 void term_write(const void* data, size_t n);
+void term_write_local(const std::string& s);
+void term_clear();
 void term_poll_input();
 void term_resize(int cols, int rows);
+void draw_terminal(const ImVec2& size);
+std::string term_plain_text();
 void run_active(bool execute);
 void build_folder();
 

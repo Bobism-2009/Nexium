@@ -1419,10 +1419,7 @@ static void draw_bottom() {
     if (g_app->proc.running) {
         if (icon_hit("##kill", IC_STOP, "Stop")) proc_stop();
     } else if (g_app->bottom == BottomTab::Terminal) {
-        if (icon_hit("##clear", IC_DELETE, "Clear")) {
-            std::lock_guard<std::mutex> lock(g_app->proc.mu);
-            g_app->proc.output.clear();
-        }
+        if (icon_hit("##clear", IC_DELETE, "Clear")) term_clear();
     }
 
     ImGui::SetCursorScreenPos(ImVec2(pos.x + 12, pos.y + hdr_h + 8));
@@ -1437,61 +1434,7 @@ static void draw_bottom() {
     body.y -= 12.0f;
     ImGui::BeginChild("bottom_body", body, ImGuiChildFlags_None);
     if (g_app->bottom == BottomTab::Terminal) {
-        term_ensure_shell();
-        if (g_app->font_code) {
-            float cw = g_app->font_code->GetCharAdvance('M');
-            if (cw < 1.0f) cw = 8.0f;
-            int cols = (int)(body.x / cw);
-            int rows = (int)(body.y / g_app->font_code->FontSize);
-            term_resize(cols, rows);
-        }
-        bool term_hov = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
-        if (ImGui::IsMouseClicked(0)) {
-            if (term_hov) {
-                ImGui::ClearActiveID();
-                ImGui::SetWindowFocus();
-                g_app->terminal_focused = true;
-                g_app->editor_focused = false;
-            } else {
-                g_app->terminal_focused = false;
-            }
-        }
-        if (g_app->terminal_focused) {
-            term_poll_input();
-        }
-        if (g_app->font_code) ImGui::PushFont(g_app->font_code);
-        std::string out;
-        {
-            std::lock_guard<std::mutex> lock(g_app->proc.mu);
-            out = g_app->proc.output;
-        }
-        if (!g_app->proc.use_pty && !g_app->proc.typed.empty()) out += g_app->proc.typed;
-        bool visible = false;
-        for (unsigned char c : out) {
-            if (c > 32) { visible = true; break; }
-        }
-        if (!visible) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.55f, 1));
-            ImGui::TextUnformatted("Click here and type. F5 runs NexaC --run in this shell.");
-            ImGui::PopStyleColor();
-        } else {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.88f, 0.88f, 0.88f, 1));
-            ImGui::TextUnformatted(out.c_str());
-            ImGui::PopStyleColor();
-        }
-        if (g_app->terminal_focused) {
-            ImVec2 cpos = ImGui::GetCursorScreenPos();
-            float ch = ImGui::GetFontSize();
-            ImGui::GetWindowDrawList()->AddRectFilled(
-                ImVec2(cpos.x, cpos.y), ImVec2(cpos.x + 8.0f, cpos.y + ch),
-                IM_COL32(0xCC, 0xCC, 0xCC, ((int)(ImGui::GetTime() * 2.0) % 2) ? 0xFF : 0x40));
-        }
-        static size_t last_term_len = 0;
-        if (visible && out.size() != last_term_len) {
-            ImGui::SetScrollHereY(1.0f);
-            last_term_len = out.size();
-        }
-        if (g_app->font_code) ImGui::PopFont();
+        draw_terminal(body);
     } else if (g_app->bottom == BottomTab::Problems) {
         draw_problems();
     } else {
@@ -1938,13 +1881,21 @@ static void modals() {
 // Shortcuts
 // ---------------------------------------------------------------------------
 void ide_shortcuts() {
-    if (ImGui::GetIO().WantTextInput) {
-        // still allow global shortcuts with Ctrl, but not typing keys
-    }
     ImGuiIO& io = ImGui::GetIO();
     bool ctrl  = io.KeyCtrl;
     bool shift = io.KeyShift;
     bool alt   = io.KeyAlt;
+    if (g_app->terminal_focused) {
+        if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_J))
+            g_app->settings.show_panel = !g_app->settings.show_panel;
+        if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_B))
+            g_app->settings.show_sidebar = !g_app->settings.show_sidebar;
+        if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_P)) g_app->palette_open = true;
+        if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_L))
+            g_app->settings.show_agent = !g_app->settings.show_agent;
+        if (ImGui::IsKeyPressed(ImGuiKey_F5)) run_active(true);
+        return;
+    }
     if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_N)) new_untitled();
     if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_O)) {
         std::string p; if (open_file_dialog(p)) open_path(p, false);
