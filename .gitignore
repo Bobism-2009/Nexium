@@ -1,0 +1,12 @@
+Nexium.exe
+*.o
+*.obj
+imgui.ini
+.nexa/
+_current.png
+.DS_Store
+Thumbs.db
+*.user
+*.suo
+.env
+.env.*
