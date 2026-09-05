@@ -339,7 +339,7 @@ void highlight_nexa(const std::string& src, std::vector<HighlightSpan>& out) {
         static const char* ops[] = {
             "<<=", ">>=", "...", "<<", ">>", "==", "!=", "<=", ">=", "&&", "||",
             "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "++", "--", "->",
-            "=", "<", ">", "+", "-", "*", "/", "%", "!", "&", "|", "^", "~"
+            "=", "<", ">", "+", "-", "*", "/", "%", "!", "&", "|", "^", "~", "?"
         };
         bool op = false;
         for (const char* o : ops) {
@@ -412,6 +412,17 @@ void diagnose_nexa(const std::string& src, const std::string& path, std::vector<
         d.message = e.what();
         d.line = 1;
         std::string msg = d.message;
+        auto sep = msg.find(": ");
+        if (sep != std::string::npos) {
+            std::string prefix = msg.substr(0, sep);
+            if (prefix.find(".nxa") != std::string::npos ||
+                prefix.find('\\') != std::string::npos ||
+                prefix.find('/') != std::string::npos) {
+                d.path = prefix;
+                d.message = msg.substr(sep + 2);
+                msg = d.message;
+            }
+        }
         auto pos = msg.rfind("line ");
         if (pos != std::string::npos) {
             d.line = std::max(1, std::atoi(msg.c_str() + pos + 5));
