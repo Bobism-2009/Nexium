@@ -49,7 +49,7 @@ static void collect_nxa(const std::string& dir, std::vector<std::string>& out, i
         if (e.second) {
             if (e.first == "node_modules" || e.first == "dist" || e.first == "build") continue;
             collect_nxa(p, out, depth + 1);
-        } else if (path_is_nexa(p)) {
+        } else if (path_is_nexa(p) || path_is_json(p)) {
             out.push_back(p);
         }
     }
@@ -446,7 +446,7 @@ void draw_run_view() {
     ImGui::Indent(12);
     ui_begin_card("run_card");
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.82f, 0.82f, 1));
-    ImGui::TextWrapped("Runs Nexa in the open folder. NexaC finds the .nxa with fn main() itself.");
+    ImGui::TextWrapped("Builds with NexaC in the open folder, then launches the program. Arguments go to your program, not the compiler.");
     ImGui::PopStyleColor();
     ImGui::Dummy(ImVec2(1, 8));
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.72f, 0.72f, 1));
@@ -456,7 +456,7 @@ void draw_run_view() {
     ui_push_field();
     ImGui::SetNextItemWidth(-FLT_MIN);
     ImGui::InputTextWithHint("##args", "Optional args passed to the program",
-                             g_app->run_args, sizeof(g_app->run_args));
+                             g_app->settings.run_args, sizeof(g_app->settings.run_args));
     ui_pop_field();
     ImGui::Dummy(ImVec2(1, 10));
     if (ui_accent_button("Run  ·  F5", ImVec2(-FLT_MIN, 32))) run_active(true);

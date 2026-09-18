@@ -178,6 +178,7 @@ struct TextBuffer {
     bool spans_dirty = true;
     bool outline_dirty = true;
     bool is_nexa = false;
+    bool is_json = false;
     double last_edit = 0.0;
     double last_type = 0.0;
 };
@@ -225,7 +226,7 @@ struct TermCell {
 
 struct TermScreen {
     int cols = 80;
-    int rows = 24;
+    int rows = 8;
     int cx = 0;
     int cy = 0;
     int saved_cx = 0;
@@ -259,7 +260,7 @@ struct ProcJob {
     bool use_pty = false;
     bool shutdown = false;
     int cols = 80;
-    int rows = 24;
+    int rows = 8;
 };
 
 struct AppSettings {
@@ -272,6 +273,7 @@ struct AppSettings {
     bool show_sidebar = true;
     bool show_agent = true;
     bool show_panel = true;
+    char run_args[512] = {};
     AgentSettings agent;
 };
 
@@ -350,7 +352,6 @@ struct App {
     bool models_listed = false;
 
     ProcJob proc;
-    char run_args[512] = {};
 
     bool confirm_close = false;
     int close_index = -1;
@@ -379,6 +380,7 @@ std::string path_parent(const std::string& p);
 std::string path_ext(const std::string& p);
 std::string path_norm(const std::string& p);
 bool path_is_nexa(const std::string& p);
+bool path_is_json(const std::string& p);
 bool file_read(const std::string& path, std::string& out, std::string* err = nullptr);
 bool file_write(const std::string& path, const std::string& data, std::string* err = nullptr);
 bool file_exists(const std::string& path);
@@ -403,6 +405,7 @@ void reveal_in_explorer(const std::string& path);
 ImU32 highlight_color(HighlightKind k);
 const char* highlight_name(HighlightKind k);
 void highlight_nexa(const std::string& src, std::vector<HighlightSpan>& out);
+void highlight_json(const std::string& src, std::vector<HighlightSpan>& out, bool nexa_manifest);
 void index_nexa(const std::string& src, std::vector<IndexedDef>& out);
 void diagnose_nexa(const std::string& src, const std::string& path, std::vector<Diagnostic>& out);
 std::vector<std::string> completions_for(const TextBuffer& buf, int cursor, std::string& prefix);

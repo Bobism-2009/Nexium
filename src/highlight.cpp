@@ -73,11 +73,12 @@ static const std::unordered_set<std::string> kControl = {
 };
 
 static const std::unordered_set<std::string> kKeyword = {
-    "let", "const", "struct", "enum", "new", "delete", "sizeof", "in"
+    "let", "const", "struct", "enum", "new", "delete", "sizeof", "in", "self"
 };
 
 static const std::unordered_set<std::string> kType = {
-    "int", "short", "long", "size_t", "string", "bool", "float", "char", "void", "unsigned"
+    "int", "short", "long", "size_t", "string", "bool", "float", "char", "void", "unsigned",
+    "map", "Result", "result", "Json", "json", "HttpResponse", "HttpServer", "HttpRequest"
 };
 
 static const std::unordered_set<std::string> kConstant = {
@@ -85,12 +86,16 @@ static const std::unordered_set<std::string> kConstant = {
 };
 
 static const std::unordered_set<std::string> kModule = {
-    "io", "os", "dll", "file", "random", "math", "crypto", "http", "time", "thread"
+    "io", "os", "dll", "file", "random", "math", "crypto", "network",
+    "http", "tcp", "udp", "json", "time", "thread", "gfx"
 };
 
 static const std::unordered_set<std::string> kBuiltin = {
     "len", "trim", "upper", "lower", "contains", "starts_with", "ends_with",
-    "index_of", "replace", "substring", "repeat", "split", "main", "__init__"
+    "index_of", "replace", "substring", "repeat", "split", "push", "pop",
+    "insert", "remove", "clear", "has", "sort", "sort_desc", "reverse",
+    "min", "max", "sum", "join", "keys", "values", "ok", "err", "value",
+    "error", "main", "__init__"
 };
 
 static bool is_ident_start(char c) {
@@ -108,6 +113,133 @@ static void push_span(std::vector<HighlightSpan>& out, int start, int end, Highl
         return;
     }
     out.push_back({start, end, kind});
+}
+
+static bool is_nexapkg_key(const std::string& k) {
+    static const char* keys[] = {
+        "name", "version", "entry", "output", "dll", "dllOutput", "dependencies"
+    };
+    for (const char* key : keys) {
+        if (k == key) return true;
+    }
+    return false;
+}
+
+void highlight_json(const std::string& src, std::vector<HighlightSpan>& out, bool nexa_manifest) {
+    out.clear();
+    const int n = (int)src.size();
+    int i = 0;
+    auto peek = [&](int d = 0) -> char {
+        int p = i + d;
+        return (p >= 0 && p < n) ? src[(size_t)p] : '\0';
+    };
+
+    while (i < n) {
+        char c = src[(size_t)i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            i++;
+            continue;
+        }
+        if (c == '/' && peek(1) == '/') {
+            int s = i;
+            while (i < n && src[(size_t)i] != '\n') i++;
+            push_span(out, s, i, HighlightKind::Comment);
+            continue;
+        }
+        if (c == '/' && peek(1) == '*') {
+            int s = i;
+            i += 2;
+            while (i + 1 < n && !(src[(size_t)i] == '*' && src[(size_t)i + 1] == '/')) i++;
+            if (i + 1 < n) i += 2;
+            else i = n;
+            push_span(out, s, i, HighlightKind::Comment);
+            continue;
+        }
+        if (c == '"') {
+            const int open = i;
+            i++;
+            std::string key;
+            bool escaped = false;
+            while (i < n && src[(size_t)i] != '"') {
+                if (src[(size_t)i] == '\\') {
+                    escaped = true;
+                    i++;
+                    if (i < n) {
+                        if (src[(size_t)i] == 'u' && i + 4 < n) i += 5;
+                        else i++;
+                    }
+                    continue;
+                }
+                key += src[(size_t)i];
+                i++;
+            }
+            if (i < n) i++;
+            int j = i;
+            while (j < n && (src[(size_t)j] == ' ' || src[(size_t)j] == '\t' ||
+                             src[(size_t)j] == '\n' || src[(size_t)j] == '\r')) j++;
+            if (j < n && src[(size_t)j] == ':') {
+                HighlightKind kind = (nexa_manifest && is_nexapkg_key(key))
+                    ? HighlightKind::Keyword : HighlightKind::Identifier;
+                push_span(out, open, i, kind);
+                continue;
+            }
+            if (!escaped) {
+                push_span(out, open, i, HighlightKind::String);
+                continue;
+            }
+            int p = open;
+            i = open + 1;
+            while (i < n && src[(size_t)i] != '"') {
+                if (src[(size_t)i] == '\\') {
+                    if (i > p) push_span(out, p, i, HighlightKind::String);
+                    int es = i;
+                    i++;
+                    if (i < n) {
+                        if (src[(size_t)i] == 'u' && i + 4 < n) i += 5;
+                        else i++;
+                    }
+                    push_span(out, es, i, HighlightKind::Escape);
+                    p = i;
+                    continue;
+                }
+                i++;
+            }
+            if (i < n) i++;
+            push_span(out, p, i, HighlightKind::String);
+            continue;
+        }
+        if (c == '-' || std::isdigit((unsigned char)c)) {
+            int s = i;
+            if (c == '-') i++;
+            while (i < n && std::isdigit((unsigned char)src[(size_t)i])) i++;
+            if (i < n && src[(size_t)i] == '.') {
+                i++;
+                while (i < n && std::isdigit((unsigned char)src[(size_t)i])) i++;
+            }
+            if (i < n && (src[(size_t)i] == 'e' || src[(size_t)i] == 'E')) {
+                i++;
+                if (i < n && (src[(size_t)i] == '+' || src[(size_t)i] == '-')) i++;
+                while (i < n && std::isdigit((unsigned char)src[(size_t)i])) i++;
+            }
+            push_span(out, s, i, HighlightKind::Number);
+            continue;
+        }
+        if (is_ident_start(c)) {
+            int s = i++;
+            while (i < n && is_ident(src[(size_t)i])) i++;
+            std::string id = src.substr((size_t)s, (size_t)(i - s));
+            HighlightKind kind = HighlightKind::Identifier;
+            if (id == "true" || id == "false" || id == "null") kind = HighlightKind::Constant;
+            push_span(out, s, i, kind);
+            continue;
+        }
+        if (c == '{' || c == '}' || c == '[' || c == ']' || c == ',' || c == ':') {
+            push_span(out, i, i + 1, HighlightKind::Punct);
+            i++;
+            continue;
+        }
+        i++;
+    }
 }
 
 void highlight_nexa(const std::string& src, std::vector<HighlightSpan>& out) {
@@ -226,7 +358,16 @@ void highlight_nexa(const std::string& src, std::vector<HighlightSpan>& out) {
             int s = i++;
             if (i < n && src[(size_t)i] == '\\') {
                 i++;
-                if (i < n) i++;
+                if (i < n && (src[(size_t)i] == 'x' || src[(size_t)i] == 'X')) {
+                    i++;
+                    int digits = 0;
+                    while (i < n && digits < 2 && std::isxdigit((unsigned char)src[(size_t)i])) {
+                        i++;
+                        digits++;
+                    }
+                } else if (i < n) {
+                    i++;
+                }
             } else if (i < n) {
                 i++;
             }
@@ -316,6 +457,10 @@ void highlight_nexa(const std::string& src, std::vector<HighlightSpan>& out) {
                 push_span(out, s, i, HighlightKind::Module);
                 continue;
             }
+            if ((id == "ok" || id == "err") && call) {
+                push_span(out, s, i, HighlightKind::Builtin);
+                continue;
+            }
             if (dotted && kBuiltin.count(id)) {
                 push_span(out, s, i, HighlightKind::Builtin);
                 continue;
@@ -337,7 +482,7 @@ void highlight_nexa(const std::string& src, std::vector<HighlightSpan>& out) {
         }
 
         static const char* ops[] = {
-            "<<=", ">>=", "...", "<<", ">>", "==", "!=", "<=", ">=", "&&", "||",
+            "<<=", ">>=", "...", "::", "<<", ">>", "==", "!=", "<=", ">=", "&&", "||",
             "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "++", "--", "->",
             "=", "<", ">", "+", "-", "*", "/", "%", "!", "&", "|", "^", "~", "?"
         };
@@ -434,12 +579,15 @@ void diagnose_nexa(const std::string& src, const std::string& path, std::vector<
 static const char* kKeywords[] = {
     "fn", "extern", "let", "const", "struct", "enum", "if", "else", "while", "for",
     "switch", "case", "default", "return", "break", "continue", "goto", "try", "catch",
-    "throw", "new", "delete", "sizeof", "true", "false", "null", "in"
+    "throw", "new", "delete", "sizeof", "true", "false", "null", "in", "self", "ok", "err"
 };
 
 static const char* kTypes[] = {
     "int", "unsigned int", "unsigned char", "short", "unsigned short", "long",
-    "unsigned long", "size_t", "string", "bool", "float", "char", "void", "*int", "*char", "*void"
+    "unsigned long", "size_t", "string", "bool", "float", "char", "void",
+    "*int", "*char", "*void", "*size_t", "[]int", "[]string", "[]float",
+    "map", "fn", "Json", "json", "Result", "result",
+    "HttpResponse", "HttpServer", "HttpRequest"
 };
 
 struct ModuleMember {
@@ -450,48 +598,129 @@ struct ModuleMember {
 static const ModuleMember kMembers[] = {
     {"io", "print"}, {"io", "println"}, {"io", "flush"}, {"io", "readln"},
     {"io", "read_int"}, {"io", "to_int"}, {"io", "getline"}, {"io", "trim"},
+
     {"os", "system"}, {"os", "spawn"}, {"os", "spawn_wait"}, {"os", "spawn_at"},
     {"os", "wait"}, {"os", "kill"}, {"os", "platform"}, {"os", "arch"},
     {"os", "cpu_count"}, {"os", "getenv"}, {"os", "setenv"}, {"os", "unsetenv"},
-    {"os", "hostname"}, {"os", "username"}, {"os", "home"}, {"os", "tempdir"},
-    {"os", "cwd"}, {"os", "chdir"}, {"os", "executable"}, {"os", "which"},
-    {"os", "total_mem"}, {"os", "avail_mem"}, {"os", "page_size"}, {"os", "uptime"},
-    {"os", "shell"}, {"os", "newline"}, {"os", "path_sep"}, {"os", "lang"},
-    {"os", "isatty"}, {"os", "environ"}, {"os", "env"}, {"os", "config_dir"},
-    {"os", "cache_dir"}, {"os", "desktop"}, {"os", "endian"}, {"os", "exit"},
-    {"os", "getpid"}, {"os", "exe_dir"}, {"os", "clip_get"}, {"os", "clip_set"},
-    {"os", "notify"}, {"os", "open"}, {"os", "lock"}, {"os", "set_volume"},
-    {"os", "get_volume"}, {"os", "set_brightness"}, {"os", "get_brightness"},
-    {"os", "type"},
+    {"os", "hostname"}, {"os", "username"}, {"os", "user"}, {"os", "home"},
+    {"os", "tempdir"}, {"os", "cwd"}, {"os", "chdir"}, {"os", "executable"},
+    {"os", "which"}, {"os", "total_mem"}, {"os", "avail_mem"}, {"os", "page_size"},
+    {"os", "uptime"}, {"os", "shell"}, {"os", "newline"}, {"os", "path_sep"},
+    {"os", "lang"}, {"os", "isatty"}, {"os", "environ"}, {"os", "env"},
+    {"os", "config_dir"}, {"os", "cache_dir"}, {"os", "desktop"}, {"os", "endian"},
+    {"os", "exit"}, {"os", "getpid"}, {"os", "getprocessid"}, {"os", "exe_dir"},
+    {"os", "clip_get"}, {"os", "clip_set"}, {"os", "notify"}, {"os", "open"},
+    {"os", "load"}, {"os", "save"}, {"os", "play"}, {"os", "lock"},
+    {"os", "shutdown"}, {"os", "reboot"}, {"os", "suspend"}, {"os", "logout"},
+    {"os", "set_volume"}, {"os", "get_volume"}, {"os", "mute"}, {"os", "unmute"},
+    {"os", "toggle_mute"}, {"os", "set_brightness"}, {"os", "get_brightness"},
+    {"os", "type"}, {"os", "hideconsolewindow"}, {"os", "showconsolewindow"},
+    {"os", "minimizeconsolewindow"}, {"os", "maximizeconsolewindow"},
+    {"os", "messagebox"}, {"os", "grepkeys"}, {"os", "getkey"}, {"os", "keypressed"},
+
     {"file", "read"}, {"file", "write"}, {"file", "append"}, {"file", "exists"},
-    {"file", "mkdir"}, {"file", "list"}, {"file", "cwd"}, {"file", "join"}, {"file", "abspath"},
+    {"file", "mkdir"}, {"file", "remove"}, {"file", "delete"}, {"file", "remove_all"},
+    {"file", "rename"}, {"file", "move"}, {"file", "copy"}, {"file", "list"},
+    {"file", "listdir"}, {"file", "isdir"}, {"file", "isfile"}, {"file", "size"},
+    {"file", "cwd"}, {"file", "chdir"}, {"file", "abspath"}, {"file", "join"},
+    {"file", "dirname"}, {"file", "parent"}, {"file", "basename"}, {"file", "name"},
+    {"file", "extension"},
+
     {"random", "int"}, {"random", "seed"},
+
     {"math", "abs"}, {"math", "min"}, {"math", "max"}, {"math", "pow"}, {"math", "sqrt"},
     {"math", "floor"}, {"math", "ceil"}, {"math", "round"}, {"math", "sin"}, {"math", "cos"},
+    {"math", "tan"}, {"math", "log"}, {"math", "log10"}, {"math", "exp"},
     {"math", "pi"}, {"math", "e"},
-    {"crypto", "sha256"}, {"crypto", "hmac_sha256"}, {"crypto", "xor"},
-    {"crypto", "hex_encode"}, {"crypto", "base64_encode"},
-    {"http", "get"}, {"http", "post"},
+
+    {"crypto", "xor"}, {"crypto", "sha256"}, {"crypto", "sha1"}, {"crypto", "hmac_sha256"},
+    {"crypto", "hex_encode"}, {"crypto", "hex_decode"},
+    {"crypto", "base64_encode"}, {"crypto", "base64_decode"}, {"crypto", "random_bytes"},
+
+    {"http", "get"}, {"http", "post"}, {"http", "put"}, {"http", "patch"}, {"http", "delete"},
+    {"http", "request"}, {"http", "localhost"}, {"http", "accept"}, {"http", "reply"},
+    {"http", "raw"}, {"http", "close"},
+
+    {"tcp", "connect"}, {"tcp", "listen"}, {"tcp", "accept"}, {"tcp", "send"},
+    {"tcp", "recv"}, {"tcp", "port"}, {"tcp", "close"},
+
+    {"udp", "open"}, {"udp", "port"}, {"udp", "send"}, {"udp", "recv"},
+    {"udp", "sender"}, {"udp", "sender_port"}, {"udp", "close"},
+
+    {"json", "parse"}, {"json", "stringify"}, {"json", "of"}, {"json", "null"},
+    {"json", "bool"}, {"json", "int"}, {"json", "float"}, {"json", "string"},
+    {"json", "array"}, {"json", "object"},
+
     {"time", "sleep"}, {"time", "seconds"}, {"time", "milliseconds"}, {"time", "now_ms"},
+
     {"thread", "spawn"}, {"thread", "join"}, {"thread", "worker"}, {"thread", "run"},
     {"thread", "worker_join"},
+
     {"dll", "load"}, {"dll", "call"},
+
+    {"gfx", "open"}, {"gfx", "resize"}, {"gfx", "width"}, {"gfx", "height"}, {"gfx", "scale"},
+    {"gfx", "title"}, {"gfx", "close"}, {"gfx", "poll"}, {"gfx", "closed"},
+    {"gfx", "clear"}, {"gfx", "plot"}, {"gfx", "get"}, {"gfx", "fill"},
+    {"gfx", "rect"}, {"gfx", "round_rect"}, {"gfx", "fill_round_rect"},
+    {"gfx", "line"}, {"gfx", "circle"}, {"gfx", "fill_circle"},
+    {"gfx", "ellipse"}, {"gfx", "fill_ellipse"}, {"gfx", "arc"}, {"gfx", "pie"},
+    {"gfx", "tri"}, {"gfx", "fill_tri"}, {"gfx", "poly"}, {"gfx", "fill_poly"},
+    {"gfx", "alpha"}, {"gfx", "save"}, {"gfx", "text"}, {"gfx", "text_size"},
+    {"gfx", "text_width"}, {"gfx", "text_height"}, {"gfx", "present"}, {"gfx", "maxfps"},
+    {"gfx", "fullscreen"}, {"gfx", "borderless"}, {"gfx", "ontop"}, {"gfx", "transparent"},
+    {"gfx", "audio"}, {"gfx", "sample"}, {"gfx", "audio_queued"}, {"gfx", "audio_flush"},
+    {"gfx", "sound"}, {"gfx", "play"}, {"gfx", "loop"}, {"gfx", "stop"}, {"gfx", "volume"},
+    {"gfx", "image"}, {"gfx", "decode"}, {"gfx", "image_w"}, {"gfx", "image_h"},
+    {"gfx", "blit"}, {"gfx", "blit_rot"}, {"gfx", "icon"}, {"gfx", "cursor"},
+    {"gfx", "key"}, {"gfx", "pressed"}, {"gfx", "released"},
+    {"gfx", "wheel"}, {"gfx", "wheel_x"}, {"gfx", "typed"},
+    {"gfx", "mouse_x"}, {"gfx", "mouse_y"}, {"gfx", "mouse"},
+    {"gfx", "drop"}, {"gfx", "opendialog"}, {"gfx", "openfile"},
 };
 
 static const char* kStringMethods[] = {
     "upper", "lower", "trim", "len", "contains", "starts_with", "ends_with",
-    "index_of", "replace", "substring", "repeat", "split"
+    "index_of", "replace", "substring", "repeat", "split",
+    "push", "pop", "insert", "remove", "clear", "has",
+    "sort", "sort_desc", "reverse", "min", "max", "sum", "join",
+    "keys", "values", "ok", "value", "error",
+    "kind", "is_null", "is_bool", "is_number", "is_string", "is_array",
+    "is_object", "is_error", "as_bool", "as_int", "as_float", "as_string",
+    "get", "set"
 };
 
 static const char* kIncludes[] = {
     "std/io", "std/os", "std/file", "std/dll", "std/random", "std/math",
-    "std/crypto", "std/http", "std/time", "std/thread", "std/inline"
+    "std/crypto", "std/network", "std/json", "std/gfx", "std/time",
+    "std/thread", "std/inline"
 };
 
 std::vector<std::string> completions_for(const TextBuffer& buf, int cursor, std::string& prefix) {
     std::vector<std::string> out;
     prefix.clear();
     const std::string& t = buf.text;
+    if (buf.is_json) {
+        int i = std::max(0, std::min(cursor, (int)t.size()));
+        int s = i;
+        while (s > 0 && is_ident(t[(size_t)s - 1])) s--;
+        prefix = t.substr((size_t)s, (size_t)(i - s));
+        auto add_if = [&](const char* w) {
+            if (prefix.empty() || std::strncmp(w, prefix.c_str(), prefix.size()) == 0) out.push_back(w);
+        };
+        if (path_filename(buf.path) == "nexapkg.json") {
+            add_if("name");
+            add_if("version");
+            add_if("entry");
+            add_if("output");
+            add_if("dll");
+            add_if("dllOutput");
+            add_if("dependencies");
+        }
+        add_if("true");
+        add_if("false");
+        add_if("null");
+        return out;
+    }
     int i = std::max(0, std::min(cursor, (int)t.size()));
     int line_start = i;
     while (line_start > 0 && t[(size_t)line_start - 1] != '\n') line_start--;
@@ -547,8 +776,13 @@ std::vector<std::string> completions_for(const TextBuffer& buf, int cursor, std:
     auto add_if = [&](const char* w) {
         if (prefix.empty() || std::strncmp(w, prefix.c_str(), prefix.size()) == 0) out.push_back(w);
     };
+    static const char* kModuleNames[] = {
+        "io", "os", "dll", "file", "random", "math", "crypto",
+        "http", "tcp", "udp", "json", "time", "thread", "gfx"
+    };
     for (const char* w : kKeywords) add_if(w);
     for (const char* w : kTypes) add_if(w);
+    for (const char* w : kModuleNames) add_if(w);
     for (const char* w : kIncludes) add_if(w);
     for (const auto& d : buf.outline) {
         if (prefix.empty() || d.name.rfind(prefix, 0) == 0) out.push_back(d.name);

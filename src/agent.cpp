@@ -652,7 +652,10 @@ std::string agent_system_prompt() {
         const size_t per_file = groq ? 1000 : 2500;
         std::string syntax;
         std::string root = g_app->settings.nexa_lang;
-        const char* files[] = {"SYNTAX/Core.txt", "SYNTAX/ControlFlow.txt", "SYNTAX/Modules.txt", "SYNTAX/CLI.txt"};
+        const char* files[] = {
+            "SYNTAX/Includes.txt", "SYNTAX/Core.txt", "SYNTAX/ControlFlow.txt",
+            "SYNTAX/Modules.txt", "SYNTAX/Inline.txt", "SYNTAX/CLI.txt"
+        };
         for (const char* rel : files) {
             std::string text;
             if (!file_read(path_join(root, rel), text)) continue;

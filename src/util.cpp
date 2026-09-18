@@ -76,6 +76,10 @@ bool path_is_nexa(const std::string& p) {
     return path_ext(p) == ".nxa";
 }
 
+bool path_is_json(const std::string& p) {
+    return path_ext(p) == ".json";
+}
+
 bool file_read(const std::string& path, std::string& out, std::string* err) {
     std::ifstream in(std::filesystem::u8path(path), std::ios::binary);
     if (!in) {
@@ -499,12 +503,14 @@ static bool file_dialog(bool save, bool folder, std::string& out, const char* fi
     if (folder) opts |= FOS_PICKFOLDERS;
     dlg->SetOptions(opts);
     if (!folder && filter) {
-        COMDLG_FILTERSPEC spec[2];
+        COMDLG_FILTERSPEC spec[3];
         spec[0].pszName = L"Nexa files";
         spec[0].pszSpec = L"*.nxa";
-        spec[1].pszName = L"All files";
-        spec[1].pszSpec = L"*.*";
-        dlg->SetFileTypes(2, spec);
+        spec[1].pszName = L"JSON files";
+        spec[1].pszSpec = L"*.json";
+        spec[2].pszName = L"All files";
+        spec[2].pszSpec = L"*.*";
+        dlg->SetFileTypes(3, spec);
     }
     hr = dlg->Show(g_app ? g_app->hwnd : nullptr);
     bool ok = false;
@@ -620,6 +626,10 @@ void load_settings(AppSettings& s) {
     s.show_sidebar = j.boolean("show_sidebar", true);
     s.show_agent = j.boolean("show_agent", true);
     s.show_panel = j.boolean("show_panel", true);
+    {
+        const std::string args = j.str("run_args");
+        std::snprintf(s.run_args, sizeof(s.run_args), "%s", args.c_str());
+    }
     s.agent.temperature = (float)j.num("temperature", 0.2);
     s.agent.provider = parse_provider(j.str("provider", "openai"));
     s.agent.mode = (j.str("mode", "agent") == "chat") ? AgentMode::Chat : AgentMode::Agent;
@@ -652,6 +662,7 @@ void save_settings(const AppSettings& s) {
       << "  \"show_sidebar\": " << (s.show_sidebar ? "true" : "false") << ",\n"
       << "  \"show_agent\": " << (s.show_agent ? "true" : "false") << ",\n"
       << "  \"show_panel\": " << (s.show_panel ? "true" : "false") << ",\n"
+      << "  \"run_args\": \"" << json_escape(s.run_args) << "\",\n"
       << "  \"provider\": \"" << provider_id(s.agent.provider) << "\",\n"
       << "  \"mode\": \"" << (s.agent.mode == AgentMode::Chat ? "chat" : "agent") << "\",\n"
       << "  \"temperature\": " << s.agent.temperature << ",\n"

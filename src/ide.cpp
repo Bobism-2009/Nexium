@@ -506,7 +506,8 @@ void draw_editor_tabs(float strip_h) {
         ImU32 tcol = active ? vs::tab_text_active : vs::tab_text_dim;
         if (g_app->preview_tab == i && !active) tcol = IM_COL32(0xC5, 0xC5, 0xC5, 0xFF);
 
-        ImU32 ficol = b.is_nexa ? vs::nexa_icon : vs::file_icon;
+        ImU32 ficol = b.is_nexa ? vs::nexa_icon
+                    : (b.is_json ? IM_COL32(0xE2, 0xC0, 0x8D, 255) : vs::file_icon);
         if (!active) ficol = (ficol & 0x00FFFFFF) | 0xB0000000;
         float ix = rmin.x + pad_x;
         dl->AddText(ImVec2(ix, rmin.y + pad_y), ficol, IC_FILE);
@@ -1478,6 +1479,7 @@ static void draw_status(float y, float w) {
     if (g_app->active >= 0) {
         const TextBuffer& b = g_app->buffers[(size_t)g_app->active];
         if (b.is_nexa) lang = "Nexa";
+        else if (b.is_json) lang = (b.name == "nexapkg.json") ? "Nexa JSON" : "JSON";
         line = buffer_line_at(b, b.cursor) + 1;
         col = buffer_col_at(b, b.cursor) + 1;
     }
@@ -1987,9 +1989,14 @@ void draw_ide() {
     // Middle: editor + bottom panel
     ImGui::BeginChild("mid", ImVec2(mid_w, main_h), false,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    if (g_app->settings.show_panel) {
+        float max_panel = main_h - 80.0f - kSplitter;
+        if (max_panel < 80.0f) max_panel = 80.0f;
+        if (g_app->settings.panel_h > max_panel) g_app->settings.panel_h = max_panel;
+    }
     float panel_total = g_app->settings.show_panel ? g_app->settings.panel_h + kSplitter : 0;
     float editor_h = main_h - panel_total;
-
+    if (editor_h < 80.0f) editor_h = 80.0f;
     ImGui::BeginChild("editor", ImVec2(0, editor_h), false,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     draw_editor(ImGui::GetContentRegionAvail());
@@ -1997,7 +2004,9 @@ void draw_ide() {
 
     if (g_app->settings.show_panel) {
         splitter_h("s2", &g_app->settings.panel_h, 80.0f, main_h - 100.0f, mid_w);
-        ImGui::BeginChild("panel", ImVec2(0, 0), false,
+        float ph = g_app->settings.panel_h;
+        if (ph < 80.0f) ph = 80.0f;
+        ImGui::BeginChild("panel", ImVec2(0, ph), false,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         draw_bottom();
         ImGui::EndChild();

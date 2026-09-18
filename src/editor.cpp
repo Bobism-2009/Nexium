@@ -16,7 +16,8 @@ void buffer_rebuild_lines(TextBuffer& b) {
 }
 
 void buffer_mark_nexa(TextBuffer& b) {
-    b.is_nexa = b.untitled || path_is_nexa(b.path);
+    b.is_json = !b.untitled && path_is_json(b.path);
+    b.is_nexa = !b.is_json && (b.untitled || path_is_nexa(b.path));
 }
 
 void buffer_refresh(TextBuffer& b) {
@@ -25,6 +26,10 @@ void buffer_refresh(TextBuffer& b) {
     if (b.is_nexa) {
         highlight_nexa(b.text, b.spans);
         index_nexa(b.text, b.outline);
+    } else if (b.is_json) {
+        bool manifest = path_filename(b.path) == "nexapkg.json";
+        highlight_json(b.text, b.spans, manifest);
+        b.outline.clear();
     } else {
         b.spans.clear();
         b.outline.clear();
@@ -325,7 +330,7 @@ bool save_buffer(int index, bool save_as) {
     if (save_as || b.untitled || b.path.empty()) {
         std::string path;
         if (!save_file_dialog(path)) return false;
-        if (path_ext(path).empty()) path += ".nxa";
+        if (path_ext(path).empty()) path += b.is_json ? ".json" : ".nxa";
         b.path = path_norm(path);
         b.name = path_filename(b.path);
         b.untitled = false;
@@ -676,7 +681,7 @@ void draw_editor(const ImVec2& size) {
         static int complete_sel = 0;
         std::string prefix;
         std::vector<std::string> comps = completions_for(b, b.cursor, prefix);
-        bool show_comp = b.is_nexa && !comps.empty() && prefix.size() >= 1 && !ctrl;
+        bool show_comp = (b.is_nexa || b.is_json) && !comps.empty() && prefix.size() >= 1 && !ctrl;
         if (show_comp && complete_sel >= (int)comps.size()) complete_sel = 0;
 
         if (show_comp && ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
@@ -825,7 +830,7 @@ void draw_editor(const ImVec2& size) {
         dl->AddText(ImVec2(origin.x + gutter - 8.0f - nw, y + 1.0f), num_col, num);
 
         if (ls >= le) continue;
-        if (b.is_nexa && !b.spans.empty()) {
+        if (!b.spans.empty()) {
             int p = ls;
             size_t si = span_i;
             while (si < b.spans.size() && b.spans[si].end <= ls) si++;

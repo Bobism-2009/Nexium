@@ -80,6 +80,14 @@ static void pad_row(std::vector<TermCell>& row, int cols) {
     else if ((int)row.size() > cols) row.resize((size_t)cols);
 }
 
+static bool row_is_blank(const std::vector<TermCell>& row) {
+    for (const TermCell& c : row) {
+        if (c.ch != 0 && c.ch != 32) return false;
+    }
+    return true;
+}
+
+
 static std::vector<TermCell> row_copy(const TermScreen& s, int y) {
     auto b = s.cells.begin() + (size_t)y * (size_t)s.cols;
     return std::vector<TermCell>(b, b + s.cols);
@@ -426,17 +434,19 @@ static void screen_resize(TermScreen& s, int cols, int rows) {
     int copy_c = std::min(s.cols, cols);
     if (!s.cells.empty() && s.rows > 0) {
         if (rows < s.rows) {
-            int drop = s.rows - rows;
-            for (int y = 0; y < drop; y++) {
+            int src0 = 0;
+            if (s.cy >= rows) src0 = s.cy - rows + 1;
+            for (int y = 0; y < src0; y++) {
                 auto r = row_copy(s, y);
+                if (row_is_blank(r)) continue;
                 pad_row(r, cols);
                 s.scrollback.push_back(std::move(r));
             }
             for (int y = 0; y < rows; y++)
                 for (int x = 0; x < copy_c; x++)
                     next[(size_t)y * (size_t)cols + (size_t)x] =
-                        s.cells[(size_t)(y + drop) * (size_t)s.cols + (size_t)x];
-            s.cy = std::max(0, s.cy - drop);
+                        s.cells[(size_t)(y + src0) * (size_t)s.cols + (size_t)x];
+            s.cy = std::max(0, s.cy - src0);
         } else {
             int copy_r = std::min(s.rows, rows);
             for (int y = 0; y < copy_r; y++)
@@ -586,7 +596,7 @@ static std::string default_cwd() {
     return {};
 }
 
-static bool launch_pty(const std::string& cwd) {
+static bool launch_pty(const std::string& cwd, std::wstring cmdline = {}) {
     PtyApi& api = pty_api();
     if (!api.ok) return false;
     SECURITY_ATTRIBUTES sa{};
@@ -632,9 +642,10 @@ static bool launch_pty(const std::string& cwd) {
     si.StartupInfo.cb = sizeof(si);
     si.lpAttributeList = list;
     PROCESS_INFORMATION pi{};
-    wchar_t cmd[] = L"cmd.exe /d /k chcp 65001>nul";
+    const bool interactive = cmdline.empty();
+    if (interactive) cmdline = L"cmd.exe /d /k chcp 65001>nul";
     std::wstring wcwd = cwd.empty() ? std::wstring() : utf8_to_wide(cwd);
-    BOOL ok = CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE,
+    BOOL ok = CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE,
                              EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
                              nullptr, wcwd.empty() ? nullptr : wcwd.c_str(),
                              &si.StartupInfo, &pi);
@@ -652,14 +663,14 @@ static bool launch_pty(const std::string& cwd) {
     g_app->proc.stdout_rd = our_out;
     g_app->proc.pty = pty;
     g_app->proc.use_pty = true;
-    g_app->proc.is_shell = true;
+    g_app->proc.is_shell = interactive;
     g_app->proc.running = true;
     g_app->proc.cwd = cwd;
     g_app->proc.thread = CreateThread(nullptr, 0, proc_reader, nullptr, 0, nullptr);
     return true;
 }
 
-static bool launch_pipes(const std::string& cwd) {
+static bool launch_pipes(const std::string& cwd, std::wstring cmdline = {}) {
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
@@ -680,9 +691,10 @@ static bool launch_pipes(const std::string& cwd) {
     si.hStdError = out_wr;
     si.hStdInput = in_rd;
     PROCESS_INFORMATION pi{};
-    wchar_t cmd[] = L"cmd.exe /d /k chcp 65001>nul";
+    const bool interactive = cmdline.empty();
+    if (interactive) cmdline = L"cmd.exe /d /k chcp 65001>nul";
     std::wstring wcwd = cwd.empty() ? std::wstring() : utf8_to_wide(cwd);
-    BOOL ok = CreateProcessW(nullptr, cmd, nullptr, nullptr, TRUE,
+    BOOL ok = CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, TRUE,
                              CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, nullptr,
                              wcwd.empty() ? nullptr : wcwd.c_str(),
                              &si, &pi);
@@ -698,7 +710,7 @@ static bool launch_pipes(const std::string& cwd) {
     g_app->proc.stdin_wr = in_wr;
     g_app->proc.stdout_rd = out_rd;
     g_app->proc.use_pty = false;
-    g_app->proc.is_shell = true;
+    g_app->proc.is_shell = interactive;
     g_app->proc.running = true;
     g_app->proc.cwd = cwd;
     g_app->proc.thread = CreateThread(nullptr, 0, proc_reader, nullptr, 0, nullptr);
@@ -744,11 +756,10 @@ void proc_stop() {
 
 void proc_tick() {
     if (g_app->proc.running || !g_app->proc.process) return;
-    bool was_shell = g_app->proc.is_shell;
     std::string cwd = g_app->proc.cwd;
     close_handles();
     term_write_local("\n[process exited " + std::to_string((int)g_app->proc.exit_code) + "]\n");
-    if (was_shell && !g_app->proc.shutdown) term_ensure_shell(cwd);
+    if (!g_app->proc.shutdown) term_ensure_shell(cwd);
 }
 
 void proc_start(const std::string& cmdline, const std::string& cwd) {
@@ -758,6 +769,32 @@ void proc_start(const std::string& cmdline, const std::string& cwd) {
     if (!g_app->proc.use_pty) term_write_local("> " + cmdline + "\n");
     std::string line = cmdline + "\r\n";
     term_write(line.data(), line.size());
+}
+
+static void stop_proc_now() {
+    if (!g_app->proc.process && !g_app->proc.running) return;
+    g_app->proc.shutdown = true;
+    if (g_app->proc.process) TerminateProcess(g_app->proc.process, 1);
+    close_handles();
+    g_app->proc.shutdown = false;
+}
+
+static void proc_start_job(const std::string& cmdline, const std::string& cwd) {
+    g_app->bottom = BottomTab::Terminal;
+    g_app->settings.show_panel = true;
+    stop_proc_now();
+    {
+        std::lock_guard<std::mutex> lock(g_app->proc.mu);
+        screen_ensure(g_app->proc.screen);
+        screen_reset_parser(g_app->proc.screen);
+    }
+    term_write_local("> " + cmdline + "\n");
+    std::string inner = "chcp 65001>nul && " + cmdline;
+    std::wstring cl = L"cmd.exe /D /S /C \"";
+    cl += utf8_to_wide(inner);
+    cl += L"\"";
+    if (!launch_pty(cwd, cl) && !launch_pipes(cwd, cl))
+        term_write_local("Failed to start.\n");
 }
 
 bool proc_run_capture(const std::string& command, const std::string& cwd,
@@ -970,6 +1007,9 @@ void draw_terminal(const ImVec2& size) {
     float sb = ImGui::GetStyle().ScrollbarSize + 4.0f;
     int cols = std::max(20, (int)((size.x - sb) / cw));
     int rows = std::max(4, (int)(size.y / line_h));
+    int row_cap = std::max(4, (int)(g_app->settings.panel_h / line_h) + 4);
+    if (rows > row_cap) rows = row_cap;
+    if (rows > 40) rows = 40;
     term_resize(cols, rows);
 
     bool term_hov = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
@@ -1009,8 +1049,21 @@ void draw_terminal(const ImVec2& size) {
     }
 
     if (g_app->font_code) ImGui::PushFont(g_app->font_code);
-    int hist = (int)snap.scrollback.size();
-    int total = hist + snap.rows;
+    int hist_all = (int)snap.scrollback.size();
+    int hist_skip = 0;
+    while (hist_skip < hist_all && row_is_blank(snap.scrollback[(size_t)hist_skip])) hist_skip++;
+    int hist = hist_all - hist_skip;
+    int live = std::max(1, snap.cy + 1);
+    for (int y = snap.rows - 1; y >= live; y--) {
+        if (y < 0 || snap.cells.empty()) break;
+        const TermCell* row = snap.cells.data() + (size_t)y * (size_t)snap.cols;
+        bool blank = true;
+        for (int x = 0; x < snap.cols; x++) {
+            if (row[x].ch != 0 && row[x].ch != 32) { blank = false; break; }
+        }
+        if (!blank) { live = y + 1; break; }
+    }
+    int total = hist + live;
     ImVec2 origin = ImGui::GetCursorScreenPos();
     float content_h = (float)total * line_h;
     ImGui::Dummy(ImVec2(std::max(1.0f, size.x - sb), std::max(content_h, size.y)));
@@ -1018,8 +1071,13 @@ void draw_terminal(const ImVec2& size) {
     float sy = ImGui::GetScrollY();
     float max_sy = ImGui::GetScrollMaxY();
     static uint64_t last_gen = 0;
-    bool at_bottom = (max_sy <= 1.0f) || (sy >= max_sy - line_h);
-    if (snap.gen != last_gen && at_bottom) ImGui::SetScrollHereY(1.0f);
+    float cursor_y = (float)(hist + snap.cy) * line_h;
+    bool at_bottom = (max_sy <= 1.0f) || (sy >= max_sy - line_h * 2.0f);
+    if (snap.gen != last_gen && at_bottom) {
+        float want = cursor_y + line_h - size.y;
+        if (want < 0.0f) want = 0.0f;
+        ImGui::SetScrollY(want);
+    }
     last_gen = snap.gen;
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1032,13 +1090,13 @@ void draw_terminal(const ImVec2& size) {
     bool any = false;
     for (int i = first; i < last; i++) {
         const TermCell* row = nullptr;
-        if (i < hist) row = snap.scrollback[(size_t)i].data();
+        if (i < hist) row = snap.scrollback[(size_t)(hist_skip + i)].data();
         else if (!snap.cells.empty()) {
             int y = i - hist;
             row = snap.cells.data() + (size_t)y * (size_t)snap.cols;
         }
         int row_n = 0;
-        if (i < hist) row_n = (int)snap.scrollback[(size_t)i].size();
+        if (i < hist) row_n = (int)snap.scrollback[(size_t)(hist_skip + i)].size();
         else row_n = snap.cols;
         if (!row || row_n <= 0) continue;
         int limit = std::min(snap.cols, row_n);
@@ -1075,7 +1133,7 @@ void draw_terminal(const ImVec2& size) {
 
     if (!any && snap.scrollback.empty()) {
         dl->AddText(ImVec2(origin.x, origin.y), IM_COL32(0x88, 0x88, 0x88, 255),
-                    "Click here and type. F5 runs NexaC --run in this shell.");
+                    "Click here and type. F5 builds with NexaC, then runs the program.");
     }
 
     if (g_app->terminal_focused && snap.cursor_vis) {
@@ -1099,6 +1157,73 @@ static std::string project_dir() {
     return default_cwd();
 }
 
+static bool path_is_abs(const std::string& p) {
+    if (p.size() >= 2 && p[1] == ':') return true;
+    return !p.empty() && (p[0] == '/' || p[0] == '\\');
+}
+
+static std::string with_win_exe(std::string p) {
+    if (path_ext(p) == ".exe") return p;
+    return p + ".exe";
+}
+
+static bool load_nexapkg(const std::string& dir, Json& out) {
+    std::string text;
+    if (!file_read(path_join(dir, "nexapkg.json"), text)) return false;
+    return json_parse(text, out);
+}
+
+static std::string find_entry_nxa(const std::string& dir) {
+    std::string found_main;
+    std::string found_init;
+    for (const auto& e : list_dir(dir)) {
+        if (e.second) continue;
+        if (path_ext(e.first) != ".nxa") continue;
+        std::string p = path_join(dir, e.first);
+        std::string t;
+        if (!file_read(p, t)) continue;
+        const bool has_main = t.find("fn main(") != std::string::npos;
+        const bool has_init = t.find("fn __init__(") != std::string::npos;
+        if (has_main) {
+            if (e.first == "main.nxa") return p;
+            if (found_main.empty()) found_main = p;
+        }
+        if (has_init && found_init.empty()) found_init = p;
+    }
+    return !found_main.empty() ? found_main : found_init;
+}
+
+static std::string resolve_build_dir(const std::string& folder) {
+    Json manifest;
+    if (load_nexapkg(folder, manifest)) return folder;
+    const std::string src = path_join(folder, "src");
+    if (dir_exists(src) && load_nexapkg(src, manifest)) return src;
+    if (!find_entry_nxa(folder).empty()) return folder;
+    if (dir_exists(src) && !find_entry_nxa(src).empty()) return src;
+    return folder;
+}
+
+static std::string project_output_exe(const std::string& cwd) {
+    Json manifest;
+    std::string entry;
+    std::string out_base;
+    if (load_nexapkg(cwd, manifest)) {
+        const std::string rel = manifest.str("entry");
+        if (!rel.empty()) entry = path_is_abs(rel) ? rel : path_join(cwd, rel);
+        const std::string output = manifest.str("output");
+        if (!output.empty()) out_base = path_is_abs(output) ? output : path_join(cwd, output);
+    }
+    if (entry.empty()) entry = find_entry_nxa(cwd);
+    if (out_base.empty()) {
+        if (entry.empty()) return {};
+        std::string stem = path_filename(entry);
+        const std::string ext = path_ext(stem);
+        if (!ext.empty()) stem = stem.substr(0, stem.size() - ext.size());
+        out_base = path_join(cwd, stem);
+    }
+    return with_win_exe(out_base);
+}
+
 static void save_project_buffers() {
     for (int i = 0; i < (int)g_app->buffers.size(); i++) {
         TextBuffer& b = g_app->buffers[(size_t)i];
@@ -1108,25 +1233,34 @@ static void save_project_buffers() {
 
 void run_active(bool execute) {
     save_project_buffers();
-    std::string cwd = project_dir();
-    if (cwd.empty()) {
+    save_settings(g_app->settings);
+    std::string folder = project_dir();
+    if (folder.empty()) {
         term_write_local("Open a folder (or a .nxa file) so Nexa can find the project.\n");
         g_app->bottom = BottomTab::Terminal;
         g_app->settings.show_panel = true;
         return;
     }
+    const std::string cwd = resolve_build_dir(folder);
     std::string nexac = nexa_compiler();
-    std::string cmd = quote_cmd(nexac);
+    std::string cmd = quote_cmd(nexac) + " build";
     if (execute) {
-        cmd += " --run";
-        if (g_app->run_args[0]) {
-            cmd += " -- ";
-            cmd += g_app->run_args;
+        const std::string exe = project_output_exe(cwd);
+        if (exe.empty()) {
+            term_write_local("No .nxa with fn main() (or nexapkg entry) in this folder.\n");
+            g_app->bottom = BottomTab::Terminal;
+            g_app->settings.show_panel = true;
+            return;
         }
-    } else {
-        cmd += " build";
+        cmd += " && " + quote_cmd(exe);
+        const char* extra = g_app->settings.run_args;
+        while (*extra == ' ' || *extra == '\t') extra++;
+        if (*extra) {
+            cmd += " ";
+            cmd += extra;
+        }
     }
-    proc_start(cmd, cwd);
+    proc_start_job(cmd, cwd);
 }
 
 void build_folder() {
