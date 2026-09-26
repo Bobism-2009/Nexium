@@ -1279,11 +1279,7 @@ static void draw_breadcrumb(const TextBuffer& b, float h) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 origin = ImGui::GetCursorScreenPos();
     float w = ImGui::GetContentRegionAvail().x;
-    dl->AddRectFilled(origin, ImVec2(origin.x + w, origin.y + h),
-                      IM_COL32(0x0E, 0x0E, 0x0E, 0xFF));
-    dl->AddLine(ImVec2(origin.x, origin.y + h),
-                ImVec2(origin.x + w, origin.y + h),
-                IM_COL32(0x3C, 0x3C, 0x3C, 0xFF));
+    dl->AddRectFilled(origin, ImVec2(origin.x + w, origin.y + h), IM_COL32(0x1F, 0x1F, 0x1F, 255));
 
     std::string full = b.untitled ? b.name : b.path;
     std::string root = g_app && !g_app->settings.folder.empty() ? g_app->settings.folder : "";
@@ -1293,10 +1289,9 @@ static void draw_breadcrumb(const TextBuffer& b, float h) {
         std::equal(root.begin(), root.end(), full.begin())) {
         rel = full.substr(root.size() + 1);
     } else {
-        rel = full;
+        rel = b.untitled ? full : path_filename(full);
     }
     std::vector<std::string> parts;
-    if (!root.empty()) parts.push_back(path_filename(root));
     std::string cur;
     for (char ch : rel) {
         if (ch == '/' || ch == '\\') { if (!cur.empty()) parts.push_back(cur); cur.clear(); }
@@ -1316,33 +1311,26 @@ static void draw_breadcrumb(const TextBuffer& b, float h) {
         }
     }
 
-    const float chip_h = dp(22.0f);
-    float x = origin.x + 10.0f;
-    float cy = origin.y + (h - chip_h) * 0.5f;
+    const ImU32 dim = IM_COL32(0xA9, 0xA9, 0xA9, 255);
+    const float ty = origin.y + (h - ImGui::GetFontSize()) * 0.5f;
+    float x = origin.x + dp(16.0f);
     int count = (int)parts.size() + (symbol.empty() ? 0 : 1);
     for (int i = 0; i < count; i++) {
         bool is_symbol = i == (int)parts.size();
-        const std::string& label = is_symbol ? symbol : parts[(size_t)i];
-        bool last = i == count - 1;
         bool file = i == (int)parts.size() - 1;
-        const char* icon = is_symbol ? IC_OUTLINE : (file ? IC_FILE : IC_FOLDER);
-        ImU32 icon_col = is_symbol ? IM_COL32(0xC5, 0x86, 0xC0, 0xFF)
-                                   : (file ? IM_COL32(0x9C, 0xDC, 0xFE, 0xFF) : IM_COL32(0xDC, 0xB6, 0x67, 0xFF));
-        ImVec2 ts = ImGui::CalcTextSize(label.c_str());
-        float chip_w = ts.x + 28.0f;
-        ImVec2 r0(x, cy);
-        ImVec2 r1(x + chip_w, cy + chip_h);
-        dl->AddRectFilled(r0, r1, last ? IM_COL32(0x18, 0x18, 0x18, 255) : IM_COL32(0x14, 0x14, 0x14, 255), 11.0f);
-        dl->AddRect(r0, r1, last ? IM_COL32(0x2A, 0x2A, 0x2A, 255) : IM_COL32(0x22, 0x22, 0x22, 255), 11.0f);
-        dl->AddText(ImVec2(x + 8, cy + (chip_h - ImGui::GetFontSize()) * 0.5f), icon_col, icon);
-        dl->AddText(ImVec2(x + 22, cy + (chip_h - ts.y) * 0.5f),
-                    last ? IM_COL32(0xDC, 0xDC, 0xDC, 255) : IM_COL32(0x8A, 0x8A, 0x8A, 255),
-                    label.c_str());
-        x += chip_w + 4.0f;
-        if (!last) {
-            dl->AddText(ImVec2(x, cy + (chip_h - ImGui::GetFontSize()) * 0.5f),
-                        IM_COL32(0x6B, 0x6B, 0x6B, 255), IC_CHEV_R);
-            x += 16.0f;
+        const std::string& label = is_symbol ? symbol : parts[(size_t)i];
+        if (file || is_symbol) {
+            const char* icon = is_symbol ? IC_OUTLINE : IC_FILE;
+            ImU32 icol = is_symbol ? IM_COL32(0xB1, 0x80, 0xD7, 255) : IM_COL32(0x7E, 0xC4, 0xE0, 255);
+            dl->AddText(ImVec2(x, ty), icol, icon);
+            x += ImGui::CalcTextSize(icon).x + dp(5.0f);
+        }
+        dl->AddText(ImVec2(x, ty), dim, label.c_str());
+        x += ImGui::CalcTextSize(label.c_str()).x;
+        if (i + 1 < count) {
+            x += dp(4.0f);
+            dl->AddText(ImVec2(x, ty), IM_COL32(0x80, 0x80, 0x80, 255), IC_CHEV_R);
+            x += ImGui::CalcTextSize(IC_CHEV_R).x + dp(4.0f);
         }
     }
     ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + h));
@@ -1351,85 +1339,61 @@ static void draw_breadcrumb(const TextBuffer& b, float h) {
 static void draw_empty_editor(const ImVec2& size) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 c = ImGui::GetCursorScreenPos();
-    dl->AddRectFilled(c, ImVec2(c.x + size.x, c.y + size.y),
-                      IM_COL32(0x12, 0x12, 0x12, 0xFF));
+    dl->AddRectFilled(c, ImVec2(c.x + size.x, c.y + size.y), IM_COL32(0x1F, 0x1F, 0x1F, 255));
 
     struct Row { const char* label; const char* key; };
     const Row rows[] = {
-        {"New File",           "Ctrl+N"},
-        {"Open File",          "Ctrl+O"},
-        {"Open Folder",        ""},
-        {"Go to File",         "Ctrl+P"},
-        {"Command Palette",    "Ctrl+Shift+P"},
-        {"Run Nexa File",      "F5"},
-        {"Toggle AI Agent",    "Ctrl+Shift+L"},
+        {"Show All Commands", "Ctrl+Shift+P"},
+        {"Go to File",        "Ctrl+P"},
+        {"New File",          "Ctrl+N"},
+        {"Open File",         "Ctrl+O"},
+        {"Open Folder",       "Click"},
+        {"Run Nexa File",     "F5"},
+        {"Toggle Terminal",   "Ctrl+`"},
+        {"Toggle AI Agent",   "Ctrl+Shift+L"},
     };
     const int n = (int)(sizeof(rows) / sizeof(rows[0]));
+    const float row_h = dp(30.0f);
+    const float logo = std::min(dp(160.0f), size.y * 0.28f);
+    const float block_h = logo + dp(40.0f) + row_h * (float)n;
+    float cy = c.y + std::max(dp(24.0f), (size.y - block_h) * 0.5f);
+    float mid = c.x + size.x * 0.5f;
 
-    float max_label = 0, max_key = 0;
-    for (const auto& r : rows) {
-        max_label = std::max(max_label, ImGui::CalcTextSize(r.label).x);
-        max_key   = std::max(max_key,   ImGui::CalcTextSize(r.key).x);
-    }
-    const float title_h = 48.0f;
-    const float sub_h   = 24.0f;
-    const float gap     = 28.0f;
-    const float row_h   = 28.0f;
-    const float col_gap = 48.0f;
-    const float block_w = std::max(max_label + col_gap + max_key + 24.0f, 320.0f);
-    const float block_h = title_h + sub_h + gap + row_h * n;
-
-    float bx = c.x + (size.x - block_w) * 0.5f;
-    float by = c.y + (size.y - block_h) * 0.5f;
-
-    if (g_app->font_icon) ImGui::PushFont(g_app->font_icon);
-    ImVec2 ic = ImGui::CalcTextSize(IC_SPARKLE);
-    dl->AddText(ImVec2(c.x + (size.x - ic.x) * 0.5f, by - ic.y - 12.0f),
-                IM_COL32(0x6C, 0xB6, 0xFF, 180), IC_SPARKLE);
-    if (g_app->font_icon) ImGui::PopFont();
-
-    const char* title = "Nexium";
-    ImFont* title_f = g_app->font_title ? g_app->font_title : ImGui::GetFont();
-    float title_sz = title_f->FontSize;
-    ImVec2 title_ts = title_f->CalcTextSizeA(title_sz, FLT_MAX, 0.0f, title);
-    dl->AddText(title_f, title_sz,
-                ImVec2(c.x + (size.x - title_ts.x) * 0.5f, by),
-                IM_COL32(0xE6, 0xE6, 0xE6, 0xFF), title);
-
-    const char* subtitle = "Open a file or ask the agent to start.";
-    ImFont* f = ImGui::GetFont();
-    ImVec2 sub_ts = f->CalcTextSizeA(f->FontSize, FLT_MAX, 0.0f, subtitle);
-    dl->AddText(f, f->FontSize,
-                ImVec2(c.x + (size.x - sub_ts.x) * 0.5f, by + title_h + 4),
-                IM_COL32(0x72, 0x72, 0x72, 0xFF), subtitle);
-
-    float ly = by + title_h + sub_h + gap;
+    draw_app_icon(dl, ImVec2(mid - logo * 0.5f, cy), logo, 0.22f);
+    float y = cy + logo + dp(40.0f);
     for (int i = 0; i < n; i++) {
-        ImVec2 r0(bx, ly + i * row_h);
-        ImVec2 r1(bx + block_w, ly + i * row_h + 24.0f);
-        dl->AddRectFilled(r0, r1, IM_COL32(0x18, 0x18, 0x18, 255), 6.0f);
-        dl->AddRect(r0, r1, IM_COL32(0x2A, 0x2A, 0x2A, 255), 6.0f);
-        dl->AddText(ImVec2(bx + 12, ly + i * row_h + 4),
-                    IM_COL32(0xCC, 0xCC, 0xCC, 0xFF), rows[i].label);
-        if (rows[i].key[0]) {
-            ImVec2 ks = ImGui::CalcTextSize(rows[i].key);
-            float kx = bx + block_w - ks.x - 12.0f;
-            dl->AddRectFilled(ImVec2(kx - 6, ly + i * row_h + 3),
-                              ImVec2(bx + block_w - 6, ly + i * row_h + 21),
-                              IM_COL32(0x14, 0x14, 0x14, 255), 4.0f);
-            dl->AddText(ImVec2(kx, ly + i * row_h + 4),
-                        IM_COL32(0x6C, 0xB6, 0xFF, 255), rows[i].key);
+        float ry = y + row_h * (float)i;
+        ImVec2 ls = ImGui::CalcTextSize(rows[i].label);
+        dl->AddText(ImVec2(mid - dp(10.0f) - ls.x, ry + (row_h - ls.y) * 0.5f), IM_COL32(0x9D, 0x9D, 0x9D, 255), rows[i].label);
+        // Keys as keycaps, split on '+'.
+        float kx = mid + dp(10.0f);
+        std::string key = rows[i].key;
+        size_t start = 0;
+        while (start <= key.size()) {
+            size_t plus = key.find('+', start);
+            std::string part = key.substr(start, plus == std::string::npos ? std::string::npos : plus - start);
+            ImVec2 ks = ImGui::CalcTextSize(part.c_str());
+            ImVec2 k0(kx, ry + (row_h - ks.y) * 0.5f - dp(3.0f));
+            ImVec2 k1(kx + ks.x + dp(10.0f), k0.y + ks.y + dp(6.0f));
+            dl->AddRectFilled(k0, k1, IM_COL32(0x2A, 0x2A, 0x2A, 255), 3.0f);
+            dl->AddRect(k0, k1, IM_COL32(0x44, 0x44, 0x44, 255), 3.0f);
+            dl->AddLine(ImVec2(k0.x + 2.0f, k1.y), ImVec2(k1.x - 2.0f, k1.y), IM_COL32(0x55, 0x55, 0x55, 255));
+            dl->AddText(ImVec2(kx + dp(5.0f), ry + (row_h - ks.y) * 0.5f), IM_COL32(0xCC, 0xCC, 0xCC, 255), part.c_str());
+            kx = k1.x + dp(4.0f);
+            if (plus == std::string::npos) break;
+            start = plus + 1;
+        }
+        if (std::strcmp(rows[i].label, "Open Folder") == 0) {
+            ImGui::SetCursorScreenPos(ImVec2(mid - dp(10.0f) - ls.x, ry));
+            ImGui::InvisibleButton("open_folder_click", ImVec2(kx - (mid - dp(10.0f) - ls.x), row_h));
+            if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsItemClicked()) {
+                std::string folder;
+                if (open_folder_dialog(folder)) set_folder(folder);
+            }
         }
     }
-
-    ImGui::SetCursorScreenPos(ImVec2(bx, ly + 2 * row_h));
-    ImGui::InvisibleButton("open_folder_click", ImVec2(block_w, 24.0f));
-    if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-    if (ImGui::IsItemClicked()) {
-        std::string folder;
-        if (open_folder_dialog(folder)) set_folder(folder);
-    }
-
+    ImGui::SetCursorScreenPos(c);
     ImGui::Dummy(size);
 }
 
@@ -1706,7 +1670,7 @@ static bool diag_matches(const Diagnostic& d, const TextBuffer& b) {
 }
 
 void draw_editor(const ImVec2& size) {
-    float strip_h = dp(36.0f);
+    float strip_h = dp(35.0f);
     if (!g_app->buffers.empty()) draw_editor_tabs(strip_h);
     else strip_h = 0.0f;
 
@@ -1719,7 +1683,7 @@ void draw_editor(const ImVec2& size) {
 
     TextBuffer& b = g_app->buffers[(size_t)g_app->active];
     if (b.spans_dirty || b.lines.empty()) buffer_refresh(b);
-    float bc_h = dp(26.0f);
+    float bc_h = dp(22.0f);
     draw_breadcrumb(b, bc_h);
     ImVec2 remain(size.x, size.y - strip_h - bc_h);
     if (g_comp.active && g_comp.buffer != g_app->active) comp_close();
@@ -1735,6 +1699,7 @@ void draw_editor(const ImVec2& size) {
     const float marker_w = dp(14.0f);
     const float gutter = marker_w + ImGui::CalcTextSize(digits).x + dp(18.0f);
 
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0x1F / 255.0f, 0x1F / 255.0f, 0x1F / 255.0f, 1.0f));
     ImGui::BeginChild("editor_view", remain, ImGuiChildFlags_None,
                       ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoNavInputs);
     ImGuiWindow* ed_win = ImGui::GetCurrentWindow();
@@ -1759,7 +1724,9 @@ void draw_editor(const ImVec2& size) {
     const ImVec2 view = ImGui::GetContentRegionAvail();
     const ImVec2 view_min = ed_win->InnerRect.Min;
     const float content_h = (float)line_count * line_h + std::max(40.0f, view.y - line_h * 3.0f);
-    const float content_w = gutter + (float)(b.max_line_len + 8) * char_w * 1.15f + 80.0f;
+    // The minimap takes a strip on the right; text scrolls under it, so it adds to the content width.
+    const float minimap_w = (b.lang != Lang::Plain || line_count > 20) && view.x > dp(520.0f) ? dp(90.0f) : 0.0f;
+    const float content_w = gutter + (float)(b.max_line_len + 8) * char_w * 1.15f + 80.0f + minimap_w;
     ImGui::Dummy(ImVec2(content_w, content_h));
 
     // Text x of column 0; the gutter itself stays pinned while scrolling sideways.
@@ -1793,7 +1760,10 @@ void draw_editor(const ImVec2& size) {
     };
 
     ImGuiIO& io = ImGui::GetIO();
-    const bool hovered = ImGui::IsWindowHovered() && !over_scrollbar();
+    const ImVec2 mm_min(view_min.x + view.x - minimap_w, view_min.y);
+    const ImVec2 mm_max(view_min.x + view.x, view_min.y + view.y);
+    const bool over_minimap = minimap_w > 0.0f && ImGui::IsMouseHoveringRect(mm_min, mm_max, false);
+    const bool hovered = ImGui::IsWindowHovered() && !over_scrollbar() && !over_minimap;
     const bool in_gutter = io.MousePos.x < gutter_x + gutter;
     static bool drag_sel = false;
     static bool drag_lines = false;
@@ -2080,7 +2050,8 @@ void draw_editor(const ImVec2& size) {
         }
         float sx = ImGui::GetScrollX();
         if (caret_x - gutter < sx) ImGui::SetScrollX(std::max(0.0f, caret_x - gutter - char_w * 4.0f));
-        else if (caret_x + char_w * 2.0f > sx + view.x) ImGui::SetScrollX(caret_x + char_w * 6.0f - view.x);
+        else if (caret_x + char_w * 2.0f > sx + view.x - minimap_w)
+            ImGui::SetScrollX(caret_x + char_w * 6.0f - (view.x - minimap_w));
         b.last_cursor = b.cursor;
         b.reveal_center = false;
     }
@@ -2146,7 +2117,7 @@ void draw_editor(const ImVec2& size) {
         return vcol_between(t, ls, i);
     };
 
-    const ImU32 col_cur_line = IM_COL32(0x1A, 0x1C, 0x1E, 255);
+    const ImU32 col_cur_line = IM_COL32(0x28, 0x28, 0x28, 255);
     const ImU32 col_sel = focused ? IM_COL32(38, 79, 120, 255) : IM_COL32(0x3A, 0x3D, 0x41, 255);
     const ImU32 col_occ = IM_COL32(0x57, 0x57, 0x57, 0x90);
     const ImU32 col_find = IM_COL32(234, 92, 0, 90);
@@ -2159,9 +2130,12 @@ void draw_editor(const ImVec2& size) {
 
         if (line == cur_line && sel_a == sel_z) {
             if (focused) {
-                dl->AddRectFilled(ImVec2(view_min.x, y), ImVec2(view_right, y + line_h), col_cur_line);
+                // VS Code draws the current line as a 2px border rather than a fill.
+                dl->AddRect(ImVec2(view_min.x + gutter - dp(6.0f), y + 0.5f), ImVec2(view_right - 1.0f, y + line_h - 0.5f),
+                            col_cur_line, 0.0f, 0, 2.0f);
             } else {
-                dl->AddRect(ImVec2(view_min.x, y), ImVec2(view_right, y + line_h), IM_COL32(0x28, 0x28, 0x28, 255));
+                dl->AddRect(ImVec2(view_min.x + gutter - dp(6.0f), y + 0.5f), ImVec2(view_right - 1.0f, y + line_h - 0.5f),
+                            IM_COL32(0x24, 0x24, 0x24, 255));
             }
         }
 
@@ -2309,18 +2283,91 @@ void draw_editor(const ImVec2& size) {
     {
         float gy0 = view_min.y;
         float gy1 = ed_win->InnerRect.Max.y;
-        dl->AddRectFilled(ImVec2(gutter_x, gy0), ImVec2(gutter_x + gutter - dp(6.0f), gy1), IM_COL32(0x12, 0x12, 0x12, 255));
+        dl->AddRectFilled(ImVec2(gutter_x, gy0), ImVec2(gutter_x + gutter - dp(6.0f), gy1), IM_COL32(0x1F, 0x1F, 0x1F, 255));
         for (int line = first; line <= last; line++) {
             float y = origin.y + (float)line * line_h;
             char num[16];
             std::snprintf(num, sizeof(num), "%d", line + 1);
-            ImU32 num_col = (line == cur_line) ? IM_COL32(0xC6, 0xC6, 0xC6, 255) : IM_COL32(0x6E, 0x76, 0x81, 255);
+            ImU32 num_col = (line == cur_line) ? IM_COL32(0xCC, 0xCC, 0xCC, 255) : IM_COL32(0x6E, 0x76, 0x81, 255);
             float nw = ImGui::CalcTextSize(num).x;
             dl->AddText(ImVec2(gutter_x + gutter - dp(14.0f) - nw, y + 1.0f), num_col, num);
             if (std::find(err_lines.begin(), err_lines.end(), line) != err_lines.end()) {
                 dl->AddCircleFilled(ImVec2(gutter_x + marker_w * 0.5f + 2.0f, y + line_h * 0.5f), 4.0f,
                                     IM_COL32(0xF1, 0x4C, 0x4C, 0xFF), 12);
             }
+        }
+    }
+
+    // Minimap: two pixels per line, one per column, coloured by token.
+    if (minimap_w > 0.0f) {
+        static bool mm_drag = false;
+        const float mm_line = 2.0f;
+        const int mm_rows = std::max(1, (int)(view.y / mm_line));
+        const float max_scroll = std::max(1.0f, content_h - view.y);
+        int mm_first = 0;
+        if (line_count > mm_rows) {
+            mm_first = (int)((scroll_y / max_scroll) * (float)(line_count - mm_rows) + 0.5f);
+            mm_first = std::clamp(mm_first, 0, line_count - mm_rows);
+        }
+        dl->AddRectFilled(mm_min, mm_max, IM_COL32(0x1F, 0x1F, 0x1F, 255));
+        dl->AddLine(ImVec2(mm_min.x + 0.5f, mm_min.y), ImVec2(mm_min.x + 0.5f, mm_max.y), IM_COL32(0x2B, 0x2B, 0x2B, 255));
+        dl->PushClipRect(mm_min, mm_max, true);
+        const float mx0 = mm_min.x + dp(6.0f);
+        const int max_cols = (int)(minimap_w - dp(10.0f));
+        auto it = b.spans.begin();
+        for (int line = mm_first; line < std::min(line_count, mm_first + mm_rows); line++) {
+            const int ls = line_start(b, line);
+            const int le = line_end(b, line);
+            const float my0 = mm_min.y + (float)(line - mm_first) * mm_line;
+            it = std::upper_bound(it, b.spans.end(), ls, [](int p, const HighlightSpan& sp) { return p < sp.end; });
+            auto sit = it;
+            int v = 0;
+            int q = ls;
+            while (q < le && v < max_cols) {
+                char ch = t[(size_t)q];
+                if (ch == ' ' || ch == '\t') {
+                    v = ch == '\t' ? (v / 4 + 1) * 4 : v + 1;
+                    q++;
+                    continue;
+                }
+                // A run of non-space characters sharing one span colour.
+                while (sit != b.spans.end() && sit->end <= q) ++sit;
+                HighlightKind kind = (sit != b.spans.end() && sit->start <= q) ? sit->kind : HighlightKind::Text;
+                int run_end = q;
+                int run_v = v;
+                while (run_end < le && t[(size_t)run_end] != ' ' && t[(size_t)run_end] != '\t' &&
+                       !(sit != b.spans.end() && run_end >= sit->end) &&
+                       !(sit != b.spans.end() && sit->start > q && run_end >= sit->start)) {
+                    if (!is_cont_byte(t[(size_t)run_end])) run_v++;
+                    run_end++;
+                }
+                if (run_end == q) run_end = q + 1, run_v = v + 1;
+                ImU32 col = (highlight_color(kind) & 0x00FFFFFF) | 0xA0000000;
+                dl->AddRectFilled(ImVec2(mx0 + (float)v, my0), ImVec2(mx0 + (float)std::min(run_v, max_cols), my0 + 1.5f), col);
+                v = run_v;
+                q = run_end;
+            }
+        }
+        for (int el : err_lines) {
+            if (el >= mm_first && el < mm_first + mm_rows) {
+                float ey = mm_min.y + (float)(el - mm_first) * mm_line;
+                dl->AddRectFilled(ImVec2(mm_min.x + 1.0f, ey - 1.0f), ImVec2(mm_min.x + 4.0f, ey + 3.0f), IM_COL32(0xF1, 0x4C, 0x4C, 255));
+            }
+        }
+        // Viewport slider.
+        float sy0 = mm_min.y + (float)(first_vis - mm_first) * mm_line;
+        float sy1 = sy0 + std::max(4.0f, view.y / line_h * mm_line);
+        bool over_slider = over_minimap && io.MousePos.y >= sy0 && io.MousePos.y <= sy1;
+        dl->AddRectFilled(ImVec2(mm_min.x + 1.0f, sy0), ImVec2(mm_max.x, sy1),
+                          (mm_drag || over_slider) ? IM_COL32(0x79, 0x79, 0x79, 0x40) : IM_COL32(0x79, 0x79, 0x79, 0x22));
+        dl->PopClipRect();
+        if (over_minimap && ImGui::IsMouseClicked(0)) mm_drag = true;
+        if (!ImGui::IsMouseDown(0)) mm_drag = false;
+        if (mm_drag) {
+            // Centre the view on the line under the pointer.
+            int target = mm_first + (int)((io.MousePos.y - mm_min.y) / mm_line);
+            target = std::clamp(target, 0, line_count - 1);
+            ImGui::SetScrollY(std::clamp((float)target * line_h - view.y * 0.5f, 0.0f, max_scroll));
         }
     }
 
@@ -2458,8 +2505,9 @@ void draw_editor(const ImVec2& size) {
     b.scroll_y = ImGui::GetScrollY();
     const float view_w = ed_win->InnerRect.GetWidth();
     ImGui::EndChild();
+    ImGui::PopStyleColor();
     ImGui::PopFont();
 
-    draw_find_widget(b, view_min, view_w);
+    draw_find_widget(b, view_min, view_w - minimap_w);
     draw_goto_widget(b, view_min, view_w);
 }

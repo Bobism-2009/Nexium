@@ -121,14 +121,16 @@ void refresh_problems() {
 // File tree — custom drawn rows with folder/file icons and chevrons.
 // ---------------------------------------------------------------------------
 namespace vs_col {
-    static const ImU32 row_hover    = IM_COL32(0x1A, 0x1A, 0x1A, 0xFF);
-    static const ImU32 row_selected = IM_COL32(0x24, 0x24, 0x28, 0xFF);
-    static const ImU32 row_focus    = IM_COL32(0x07, 0x38, 0x58, 0xFF);
+    static const ImU32 row_hover    = IM_COL32(0x2A, 0x2D, 0x2E, 0xFF);
+    static const ImU32 row_selected = IM_COL32(0x37, 0x37, 0x3D, 0xFF);
+    static const ImU32 row_active   = IM_COL32(0x04, 0x39, 0x5E, 0xFF);
+    static const ImU32 row_border   = IM_COL32(0x00, 0x78, 0xD4, 0xFF);
+    static const ImU32 guide        = IM_COL32(0x58, 0x58, 0x58, 0x60);
     static const ImU32 folder_ic    = IM_COL32(0xC4, 0xA0, 0x58, 0xFF);
     static const ImU32 nexa_ic      = IM_COL32(0x7E, 0xC4, 0xE0, 0xFF);
     static const ImU32 file_ic      = IM_COL32(0x9A, 0x9A, 0x9A, 0xFF);
     static const ImU32 chevron      = IM_COL32(0x7A, 0x7A, 0x7A, 0xFF);
-    static const ImU32 text         = IM_COL32(0xB8, 0xB8, 0xB8, 0xFF);
+    static const ImU32 text         = IM_COL32(0xCC, 0xCC, 0xCC, 0xFF);
 }
 
 static ImU32 file_icon_color(const std::string& path) {
@@ -161,11 +163,15 @@ static void draw_fs_tree() {
     for (auto& c : g_app->root.children) collect_rows(c, 0, rows);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float row_h = 24.0f;
-    const float indent = 12.0f;
-    const float chev_w = 14.0f;
-    const float icon_w = 18.0f;
-    const float pad_l  = 8.0f;
+    const float row_h = dp(22.0f);
+    const float indent = dp(8.0f) + dp(8.0f);
+    const float chev_w = dp(16.0f);
+    const float icon_w = dp(20.0f);
+    const float pad_l  = dp(8.0f);
+    // The open editor's file is highlighted in the tree, as in VS Code.
+    std::string open_path_norm;
+    if (g_app->active >= 0 && !g_app->buffers[(size_t)g_app->active].untitled)
+        open_path_norm = path_norm(g_app->buffers[(size_t)g_app->active].path);
 
     // Clip to visible rows for perf
     ImGuiListClipper clip;
@@ -184,12 +190,21 @@ static void draw_fs_tree() {
             bool dbl = hovered && ImGui::IsMouseDoubleClicked(0);
             float row_w = ImGui::GetItemRectSize().x;
 
-            // Row background
+            // Row background: flat, full width.
+            bool is_open = !n.is_dir && !open_path_norm.empty() && path_norm(n.path) == open_path_norm;
             ImU32 bg = 0;
-            if (selected)       bg = vs_col::row_selected;
+            if (selected && g_app->editor_focused == false) bg = vs_col::row_active;
+            else if (selected || is_open) bg = vs_col::row_selected;
             else if (hovered)   bg = vs_col::row_hover;
-            if (bg) dl->AddRectFilled(ImVec2(c.x + 6, c.y + 1),
-                                      ImVec2(c.x + row_w - 6, c.y + row_h - 1), bg, 4.0f);
+            if (bg) dl->AddRectFilled(ImVec2(c.x, c.y), ImVec2(c.x + row_w, c.y + row_h), bg);
+            if (selected && !g_app->editor_focused)
+                dl->AddRect(ImVec2(c.x, c.y), ImVec2(c.x + row_w, c.y + row_h), vs_col::row_border);
+
+            // Indent guides, one per ancestor level.
+            for (int d = 0; d < r.depth; d++) {
+                float gx = (float)(int)(c.x + pad_l + d * indent + chev_w * 0.5f) + 0.5f;
+                dl->AddLine(ImVec2(gx, c.y), ImVec2(gx, c.y + row_h), vs_col::guide);
+            }
 
             // Content x
             float x = c.x + pad_l + r.depth * indent;
@@ -272,28 +287,26 @@ void draw_explorer() {
         ImGui::Unindent(16);
         return;
     }
+    // Collapsible workspace section, titled with the folder name like VS Code.
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 c = ImGui::GetCursorScreenPos();
     float w = ImGui::GetContentRegionAvail().x;
     std::string folder_name = path_filename(g_app->settings.folder);
     if (folder_name.empty()) folder_name = g_app->settings.folder;
-    const float chip_h = 22.0f;
-    ImGui::SetCursorScreenPos(ImVec2(c.x + 12, c.y + 8));
-    c = ImGui::GetCursorScreenPos();
-    ImVec2 ts = ImGui::CalcTextSize(folder_name.c_str());
-    float chip_w = ts.x + 28.0f;
-    if (chip_w > w - 24.0f) chip_w = w - 24.0f;
-    dl->AddRectFilled(c, ImVec2(c.x + chip_w, c.y + chip_h), IM_COL32(0x18, 0x18, 0x18, 255), 11.0f);
-    dl->AddRect(c, ImVec2(c.x + chip_w, c.y + chip_h), IM_COL32(0x2A, 0x2A, 0x2A, 255), 11.0f);
-    if (g_app->font_icon) ImGui::PushFont(g_app->font_icon);
-    ImVec2 ic = ImGui::CalcTextSize(IC_FOLDER);
-    dl->AddText(ImVec2(c.x + 8, c.y + (chip_h - ic.y) * 0.5f),
-                IM_COL32(0xC4, 0xA0, 0x58, 255), IC_FOLDER);
-    if (g_app->font_icon) ImGui::PopFont();
-    ImGui::RenderTextEllipsis(dl, ImVec2(c.x + 8 + ic.x + 6, c.y + (chip_h - ts.y) * 0.5f),
-                              ImVec2(c.x + chip_w - 6, c.y + chip_h),
-                              c.x + chip_w - 6, c.x + chip_w - 6, folder_name.c_str(), nullptr, nullptr);
-    ImGui::Dummy(ImVec2(w, chip_h + 10.0f));
+    for (char& ch : folder_name) ch = (char)std::toupper((unsigned char)ch);
+    static bool expanded = true;
+    const float hdr_h = dp(22.0f);
+    ImGui::InvisibleButton("##wshdr", ImVec2(w, hdr_h));
+    if (ImGui::IsItemClicked()) expanded = !expanded;
+    if (ImGui::IsItemHovered()) dl->AddRectFilled(c, ImVec2(c.x + w, c.y + hdr_h), vs_col::row_hover);
+    const char* chev = expanded ? IC_CHEV_D : IC_CHEV_R;
+    ImVec2 cs = ImGui::CalcTextSize(chev);
+    dl->AddText(ImVec2(c.x + dp(6.0f), c.y + (hdr_h - cs.y) * 0.5f), vs_col::text, chev);
+    float fsz = ImGui::GetFontSize() * 0.85f;
+    ImGui::RenderTextEllipsis(dl, ImVec2(c.x + dp(24.0f), c.y + (hdr_h - fsz) * 0.5f),
+                              ImVec2(c.x + w - dp(8.0f), c.y + hdr_h), c.x + w - dp(8.0f), c.x + w - dp(8.0f),
+                              folder_name.c_str(), nullptr, nullptr);
+    if (!expanded) return;
 
     ImGui::BeginChild("fs_tree", ImVec2(0, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_HorizontalScrollbar);

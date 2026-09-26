@@ -22,7 +22,7 @@
 #include <std/gfx>
 #include <std/time>
 
-let VERSION = "1.0.0";
+let VERSION = "1.1.0";
 let NEXA_URL = "https://github.com/Bobism-2009/Nexa-Lang/releases";
 
 let W = 840;

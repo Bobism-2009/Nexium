@@ -9,112 +9,111 @@
 #include "imgui_internal.h"
 
 // ---------------------------------------------------------------------------
-// Dark Modern palette (darker than classic Dark+)
+// VS Code "Dark Modern" palette
 // ---------------------------------------------------------------------------
 namespace vs {
-    static const ImU32 editor_bg       = IM_COL32(0x12, 0x12, 0x12, 255);
-    static const ImU32 sidebar_bg      = IM_COL32(0x0E, 0x0E, 0x0E, 255);
-    static const ImU32 panel_bg        = IM_COL32(0x12, 0x12, 0x12, 255);
-    static const ImU32 activity_bg     = IM_COL32(0x0A, 0x0A, 0x0A, 255);
-    static const ImU32 activity_active = IM_COL32(0xE8, 0xE8, 0xE8, 255);
-    static const ImU32 activity_dim    = IM_COL32(0xFF, 0xFF, 0xFF, 0x6E);
-    static const ImU32 activity_hover  = IM_COL32(0x1C, 0x1C, 0x1C, 255);
-    static const ImU32 activity_bar    = IM_COL32(0xE8, 0xE8, 0xE8, 255);
-    static const ImU32 accent          = IM_COL32(0x00, 0x5A, 0x99, 255);
-    static const ImU32 accent_hover    = IM_COL32(0x1A, 0x6F, 0xB0, 255);
-    static const ImU32 status_bg       = IM_COL32(0x00, 0x4E, 0x86, 255);
-    static const ImU32 status_text     = IM_COL32(0xE0, 0xE0, 0xE0, 255);
-    static const ImU32 tab_active_bg   = IM_COL32(0x12, 0x12, 0x12, 255);
-    static const ImU32 tab_inactive_bg = IM_COL32(0x16, 0x16, 0x16, 255);
-    static const ImU32 tab_hover_bg    = IM_COL32(0x1C, 0x1C, 0x1C, 255);
-    static const ImU32 tab_border      = IM_COL32(0x0A, 0x0A, 0x0A, 255);
-    static const ImU32 tab_active_line = IM_COL32(0x00, 0x5A, 0x99, 255);
-    static const ImU32 tab_text_active = IM_COL32(0xE8, 0xE8, 0xE8, 255);
-    static const ImU32 tab_text_dim    = IM_COL32(0x8A, 0x8A, 0x8A, 255);
-    static const ImU32 splitter        = IM_COL32(0x3C, 0x3C, 0x3C, 255);
-    static const ImU32 splitter_hover  = IM_COL32(0x00, 0x7A, 0xCC, 255);
-    static const ImU32 border          = IM_COL32(0x3C, 0x3C, 0x3C, 255);
-    static const ImU32 border_soft     = IM_COL32(0x2E, 0x2E, 0x2E, 255);
-    static const ImU32 sash            = IM_COL32(0x1C, 0x1C, 0x1C, 255);
-    static const ImU32 tabstrip_bg     = IM_COL32(0x0E, 0x0E, 0x0E, 255);
-    static const ImU32 heading         = IM_COL32(0x9A, 0x9A, 0x9A, 255);
-    static const ImU32 heading_action  = IM_COL32(0xA8, 0xA8, 0xA8, 255);
-    static const ImU32 subtle          = IM_COL32(0x6E, 0x6E, 0x6E, 255);
-    static const ImU32 text_bright     = IM_COL32(0xDC, 0xDC, 0xDC, 255);
-    static const ImU32 text_normal     = IM_COL32(0xB8, 0xB8, 0xB8, 255);
-    static const ImU32 list_hover      = IM_COL32(0x1A, 0x1A, 0x1A, 255);
-    static const ImU32 list_selected   = IM_COL32(0x24, 0x24, 0x28, 255);
-    static const ImU32 list_focus      = IM_COL32(0x07, 0x38, 0x58, 255);
-    static const ImU32 folder_icon     = IM_COL32(0xC4, 0xA0, 0x58, 255);
+    static const ImU32 editor_bg       = IM_COL32(0x1F, 0x1F, 0x1F, 255);
+    static const ImU32 sidebar_bg      = IM_COL32(0x18, 0x18, 0x18, 255);
+    static const ImU32 panel_bg        = IM_COL32(0x18, 0x18, 0x18, 255);
+    static const ImU32 activity_bg     = IM_COL32(0x18, 0x18, 0x18, 255);
+    static const ImU32 activity_active = IM_COL32(0xD7, 0xD7, 0xD7, 255);
+    static const ImU32 activity_dim    = IM_COL32(0x86, 0x86, 0x86, 255);
+    static const ImU32 activity_hover  = IM_COL32(0x2A, 0x2D, 0x2E, 255);
+    static const ImU32 activity_bar    = IM_COL32(0x00, 0x78, 0xD4, 255);
+    static const ImU32 accent          = IM_COL32(0x00, 0x78, 0xD4, 255);
+    static const ImU32 accent_hover    = IM_COL32(0x02, 0x6E, 0xC1, 255);
+    static const ImU32 status_bg       = IM_COL32(0x18, 0x18, 0x18, 255);
+    static const ImU32 status_text     = IM_COL32(0xCC, 0xCC, 0xCC, 255);
+    static const ImU32 status_hover    = IM_COL32(0x2A, 0x2A, 0x2A, 255);
+    static const ImU32 tab_active_bg   = IM_COL32(0x1F, 0x1F, 0x1F, 255);
+    static const ImU32 tab_inactive_bg = IM_COL32(0x18, 0x18, 0x18, 255);
+    static const ImU32 tab_hover_bg    = IM_COL32(0x1F, 0x1F, 0x1F, 255);
+    static const ImU32 tab_active_line = IM_COL32(0x00, 0x78, 0xD4, 255);
+    static const ImU32 tab_text_active = IM_COL32(0xFF, 0xFF, 0xFF, 255);
+    static const ImU32 tab_text_dim    = IM_COL32(0x9D, 0x9D, 0x9D, 255);
+    static const ImU32 splitter_hover  = IM_COL32(0x00, 0x78, 0xD4, 255);
+    static const ImU32 border          = IM_COL32(0x2B, 0x2B, 0x2B, 255);
+    static const ImU32 tabstrip_bg     = IM_COL32(0x18, 0x18, 0x18, 255);
+    static const ImU32 heading         = IM_COL32(0xCC, 0xCC, 0xCC, 255);
+    static const ImU32 heading_action  = IM_COL32(0xB0, 0xB0, 0xB0, 255);
+    static const ImU32 subtle          = IM_COL32(0x9D, 0x9D, 0x9D, 255);
+    static const ImU32 text_bright     = IM_COL32(0xE0, 0xE0, 0xE0, 255);
+    static const ImU32 text_normal     = IM_COL32(0xCC, 0xCC, 0xCC, 255);
+    static const ImU32 list_hover      = IM_COL32(0x2A, 0x2D, 0x2E, 255);
     static const ImU32 nexa_icon       = IM_COL32(0x7E, 0xC4, 0xE0, 255);
     static const ImU32 file_icon       = IM_COL32(0x9A, 0x9A, 0x9A, 255);
-    static const ImU32 error           = IM_COL32(0xD0, 0x3C, 0x3C, 255);
-    static const ImU32 warn            = IM_COL32(0xC8, 0xA8, 0x78, 255);
+    static const ImU32 error           = IM_COL32(0xF1, 0x4C, 0x4C, 255);
+    static const ImU32 warn            = IM_COL32(0xCC, 0xA7, 0x00, 255);
+}
+
+static ImVec4 rgb(int r, int g, int b, float a = 1.0f) {
+    return ImVec4((float)r / 255.0f, (float)g / 255.0f, (float)b / 255.0f, a);
 }
 
 void apply_vscode_theme() {
     ImGuiStyle& st = ImGui::GetStyle();
     st.WindowRounding      = 0;
     st.ChildRounding       = 0;
-    st.FrameRounding       = 8;    // agent-style inputs / dropdowns
-    st.PopupRounding       = 8;
-    st.ScrollbarRounding   = 6;
-    st.GrabRounding        = 6;
-    st.TabRounding         = 6;
+    st.FrameRounding       = 4;
+    st.PopupRounding       = 5;
+    st.ScrollbarRounding   = 0;
+    st.GrabRounding        = 3;
+    st.TabRounding         = 0;
     st.WindowBorderSize    = 0;
     st.ChildBorderSize     = 0;
     st.FrameBorderSize     = 0;
     st.PopupBorderSize     = 1;
     st.WindowPadding       = ImVec2(0, 0);
-    st.FramePadding        = ImVec2(10, 5);
+    st.FramePadding        = ImVec2(8, 4);
     st.ItemSpacing         = ImVec2(8, 6);
     st.ItemInnerSpacing    = ImVec2(6, 4);
-    st.IndentSpacing       = 14;
-    st.ScrollbarSize       = 14;
+    st.IndentSpacing       = 12;
+    st.ScrollbarSize       = 12;
 
     ImVec4* c = st.Colors;
-    c[ImGuiCol_Text]                  = ImVec4(0.72f, 0.72f, 0.72f, 1.00f); // #B8B8B8
-    c[ImGuiCol_TextDisabled]          = ImVec4(0.36f, 0.36f, 0.36f, 1.00f);
-    c[ImGuiCol_TextSelectedBg]        = ImVec4(0.10f, 0.24f, 0.36f, 1.00f);
-    c[ImGuiCol_WindowBg]              = ImVec4(0.071f, 0.071f, 0.071f, 1);   // #121212
-    c[ImGuiCol_ChildBg]               = ImVec4(0.071f, 0.071f, 0.071f, 1);
-    c[ImGuiCol_PopupBg]               = ImVec4(0.086f, 0.086f, 0.086f, 1);   // #161616
-    c[ImGuiCol_Border]                = ImVec4(0.102f, 0.102f, 0.102f, 1);   // #1A1A1A
+    c[ImGuiCol_Text]                  = rgb(0xCC, 0xCC, 0xCC);
+    c[ImGuiCol_TextDisabled]          = rgb(0x6E, 0x6E, 0x6E);
+    c[ImGuiCol_TextSelectedBg]        = rgb(0x26, 0x4F, 0x78);
+    c[ImGuiCol_WindowBg]              = rgb(0x18, 0x18, 0x18);
+    c[ImGuiCol_ChildBg]               = rgb(0x18, 0x18, 0x18);
+    c[ImGuiCol_PopupBg]               = rgb(0x1F, 0x1F, 0x1F);
+    c[ImGuiCol_Border]                = rgb(0x45, 0x45, 0x45);
     c[ImGuiCol_BorderShadow]          = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_FrameBg]               = ImVec4(0.102f, 0.102f, 0.102f, 1);   // #1A1A1A
-    c[ImGuiCol_FrameBgHovered]        = ImVec4(0.145f, 0.145f, 0.145f, 1);
-    c[ImGuiCol_FrameBgActive]         = ImVec4(0.180f, 0.180f, 0.180f, 1);
-    c[ImGuiCol_TitleBg]               = ImVec4(0.055f, 0.055f, 0.055f, 1);
-    c[ImGuiCol_TitleBgActive]         = ImVec4(0.055f, 0.055f, 0.055f, 1);
-    c[ImGuiCol_MenuBarBg]             = ImVec4(0.055f, 0.055f, 0.055f, 1);
-    c[ImGuiCol_ScrollbarBg]           = ImVec4(0.071f, 0.071f, 0.071f, 1);
-    c[ImGuiCol_ScrollbarGrab]         = ImVec4(0.22f, 0.22f, 0.22f, 1);
-    c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.30f, 0.30f, 0.30f, 1);
-    c[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.38f, 0.38f, 0.38f, 1);
-    c[ImGuiCol_CheckMark]             = ImVec4(0.00f, 0.35f, 0.60f, 1);
-    c[ImGuiCol_SliderGrab]            = ImVec4(0.00f, 0.35f, 0.60f, 1);
-    c[ImGuiCol_SliderGrabActive]      = ImVec4(0.10f, 0.44f, 0.69f, 1);
-    c[ImGuiCol_Button]                = ImVec4(0.102f, 0.102f, 0.102f, 1);
-    c[ImGuiCol_ButtonHovered]         = ImVec4(0.160f, 0.160f, 0.160f, 1);
-    c[ImGuiCol_ButtonActive]          = ImVec4(0.200f, 0.200f, 0.200f, 1);
-    c[ImGuiCol_Header]                = ImVec4(0.028f, 0.220f, 0.345f, 1);
-    c[ImGuiCol_HeaderHovered]         = ImVec4(0.102f, 0.102f, 0.102f, 1);
-    c[ImGuiCol_HeaderActive]          = ImVec4(0.020f, 0.145f, 0.220f, 1);
-    c[ImGuiCol_Separator]             = ImVec4(0.235f, 0.235f, 0.235f, 1);
-    c[ImGuiCol_SeparatorHovered]      = ImVec4(0.00f, 0.48f, 0.80f, 1);
-    c[ImGuiCol_SeparatorActive]       = ImVec4(0.00f, 0.48f, 0.80f, 1);
+    c[ImGuiCol_FrameBg]               = rgb(0x31, 0x31, 0x31);
+    c[ImGuiCol_FrameBgHovered]        = rgb(0x37, 0x37, 0x37);
+    c[ImGuiCol_FrameBgActive]         = rgb(0x3C, 0x3C, 0x3C);
+    c[ImGuiCol_TitleBg]               = rgb(0x18, 0x18, 0x18);
+    c[ImGuiCol_TitleBgActive]         = rgb(0x18, 0x18, 0x18);
+    c[ImGuiCol_MenuBarBg]             = rgb(0x18, 0x18, 0x18);
+    c[ImGuiCol_ScrollbarBg]           = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_ScrollbarGrab]         = rgb(0x79, 0x79, 0x79, 0.40f);
+    c[ImGuiCol_ScrollbarGrabHovered]  = rgb(0x64, 0x64, 0x64, 0.70f);
+    c[ImGuiCol_ScrollbarGrabActive]   = rgb(0xBF, 0xBF, 0xBF, 0.40f);
+    c[ImGuiCol_CheckMark]             = rgb(0xFF, 0xFF, 0xFF);
+    c[ImGuiCol_SliderGrab]            = rgb(0x00, 0x78, 0xD4);
+    c[ImGuiCol_SliderGrabActive]      = rgb(0x02, 0x6E, 0xC1);
+    c[ImGuiCol_Button]                = rgb(0x31, 0x31, 0x31);
+    c[ImGuiCol_ButtonHovered]         = rgb(0x3C, 0x3C, 0x3C);
+    c[ImGuiCol_ButtonActive]          = rgb(0x45, 0x45, 0x45);
+    c[ImGuiCol_Header]                = rgb(0x04, 0x39, 0x5E);
+    c[ImGuiCol_HeaderHovered]         = rgb(0x2A, 0x2D, 0x2E);
+    c[ImGuiCol_HeaderActive]          = rgb(0x04, 0x39, 0x5E);
+    c[ImGuiCol_Separator]             = rgb(0x2B, 0x2B, 0x2B);
+    c[ImGuiCol_SeparatorHovered]      = rgb(0x00, 0x78, 0xD4);
+    c[ImGuiCol_SeparatorActive]       = rgb(0x00, 0x78, 0xD4);
     c[ImGuiCol_ResizeGrip]            = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_Tab]                   = ImVec4(0.086f, 0.086f, 0.086f, 1);
-    c[ImGuiCol_TabHovered]            = ImVec4(0.110f, 0.110f, 0.110f, 1);
-    c[ImGuiCol_TabSelected]           = ImVec4(0.071f, 0.071f, 0.071f, 1);
-    c[ImGuiCol_TabDimmed]             = ImVec4(0.086f, 0.086f, 0.086f, 1);
-    c[ImGuiCol_TabDimmedSelected]     = ImVec4(0.071f, 0.071f, 0.071f, 1);
-    c[ImGuiCol_TableHeaderBg]         = ImVec4(0.08f, 0.08f, 0.08f, 1);
-    c[ImGuiCol_TableBorderStrong]     = ImVec4(0.10f, 0.10f, 0.10f, 1);
-    c[ImGuiCol_TableBorderLight]      = ImVec4(0.10f, 0.10f, 0.10f, 1);
+    c[ImGuiCol_Tab]                   = rgb(0x18, 0x18, 0x18);
+    c[ImGuiCol_TabHovered]            = rgb(0x1F, 0x1F, 0x1F);
+    c[ImGuiCol_TabSelected]           = rgb(0x1F, 0x1F, 0x1F);
+    c[ImGuiCol_TabDimmed]             = rgb(0x18, 0x18, 0x18);
+    c[ImGuiCol_TabDimmedSelected]     = rgb(0x1F, 0x1F, 0x1F);
+    c[ImGuiCol_TableHeaderBg]         = rgb(0x1F, 0x1F, 0x1F);
+    c[ImGuiCol_TableBorderStrong]     = rgb(0x2B, 0x2B, 0x2B);
+    c[ImGuiCol_TableBorderLight]      = rgb(0x2B, 0x2B, 0x2B);
     c[ImGuiCol_TableRowBg]            = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_TableRowBgAlt]         = ImVec4(1, 1, 1, 0.015f);
+    c[ImGuiCol_TableRowBgAlt]         = ImVec4(1, 1, 1, 0.02f);
     c[ImGuiCol_NavHighlight]          = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_ModalWindowDimBg]      = ImVec4(0, 0, 0, 0.45f);
 }
 
 // ---------------------------------------------------------------------------
@@ -141,11 +140,11 @@ void ui_empty_state(const char* icon, const char* title, const char* hint) {
 }
 
 bool ui_accent_button(const char* label, const ImVec2& size) {
-    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.00f, 0.31f, 0.53f, 1));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.00f, 0.38f, 0.64f, 1));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.00f, 0.26f, 0.45f, 1));
+    ImGui::PushStyleColor(ImGuiCol_Button,        rgb(0x00, 0x78, 0xD4));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, rgb(0x02, 0x6E, 0xC1));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  rgb(0x00, 0x5F, 0xA8));
     ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(1, 1, 1, 1));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
     bool hit = ImGui::Button(label, size);
     ImGui::PopStyleVar();
     ImGui::PopStyleColor(4);
@@ -153,13 +152,13 @@ bool ui_accent_button(const char* label, const ImVec2& size) {
 }
 
 void ui_push_field() {
-    ImGui::PushStyleColor(ImGuiCol_FrameBg,        ImVec4(0.078f, 0.078f, 0.078f, 1));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.094f, 0.094f, 0.094f, 1));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,  ImVec4(0.110f, 0.110f, 0.110f, 1));
-    ImGui::PushStyleColor(ImGuiCol_Border,         ImVec4(0.180f, 0.180f, 0.180f, 1));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,        rgb(0x31, 0x31, 0x31));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, rgb(0x31, 0x31, 0x31));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,  rgb(0x31, 0x31, 0x31));
+    ImGui::PushStyleColor(ImGuiCol_Border,         rgb(0x3C, 0x3C, 0x3C));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 7.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 5.0f));
 }
 
 void ui_pop_field() {
@@ -168,9 +167,9 @@ void ui_pop_field() {
 }
 
 void ui_begin_card(const char* id) {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.078f, 0.078f, 0.078f, 1));
-    ImGui::PushStyleColor(ImGuiCol_Border,  ImVec4(0.180f, 0.180f, 0.180f, 1));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, rgb(0x1F, 0x1F, 0x1F));
+    ImGui::PushStyleColor(ImGuiCol_Border,  rgb(0x2B, 0x2B, 0x2B));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 10.0f));
     ImGui::BeginChild(id, ImVec2(-FLT_MIN, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders |
@@ -189,13 +188,12 @@ bool ui_chip_row(const char* id, const char* icon, ImU32 icon_col,
     ImVec2 origin = ImGui::GetCursorScreenPos();
     float wrap = ImGui::GetContentRegionAvail().x;
     if (wrap < 40.0f) wrap = 40.0f;
-    const float row_h = dp(26.0f);
+    const float row_h = dp(22.0f);
     ImGui::InvisibleButton("##chip", ImVec2(wrap, row_h));
     bool hov = ImGui::IsItemHovered();
     bool clk = ImGui::IsItemClicked();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImU32 bg = hov ? IM_COL32(0x22, 0x22, 0x22, 255) : IM_COL32(0x18, 0x18, 0x18, 255);
-    dl->AddRectFilled(origin, ImVec2(origin.x + wrap, origin.y + row_h), bg, 4.0f);
+    if (hov) dl->AddRectFilled(origin, ImVec2(origin.x + wrap, origin.y + row_h), vs::list_hover);
     float x = origin.x + 8.0f;
     float mid = origin.y + row_h * 0.5f;
     if (icon && icon[0]) {
@@ -216,7 +214,6 @@ bool ui_chip_row(const char* id, const char* icon, ImU32 icon_col,
     ImGui::RenderTextEllipsis(dl, ImVec2(x, mid - ts.y * 0.5f),
                               ImVec2(right, origin.y + row_h),
                               right, right, title, nullptr, nullptr);
-    ImGui::Dummy(ImVec2(1, 4.0f));
     ImGui::PopID();
     return clk;
 }
@@ -226,7 +223,7 @@ bool ui_chip_row(const char* id, const char* icon, ImU32 icon_col,
 // ---------------------------------------------------------------------------
 // dir: +1 = drag right grows *size (left-anchored panel)
 //      -1 = drag left grows *size  (right-anchored panel, e.g. agent)
-static const float kSplitter = 8.0f;
+static const float kSplitter = 4.0f;
 
 static void splitter_v(const char* id, float* size, float min_v, float max_v, float height, int dir = +1) {
     ImGui::PushID(id);
@@ -237,10 +234,13 @@ static void splitter_v(const char* id, float* size, float min_v, float max_v, fl
     if (hovered || held) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
     if (held) *size = std::clamp(*size + (float)dir * ImGui::GetIO().MouseDelta.x, min_v, max_v);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(cursor, ImVec2(cursor.x + kSplitter, cursor.y + height), vs::sash);
-    ImU32 col = (held || hovered) ? vs::splitter_hover : vs::border;
-    float x = cursor.x + kSplitter * 0.5f;
-    dl->AddLine(ImVec2(x, cursor.y), ImVec2(x, cursor.y + height), col, (held || hovered) ? 2.0f : 1.0f);
+    dl->AddRectFilled(cursor, ImVec2(cursor.x + kSplitter, cursor.y + height), vs::sidebar_bg);
+    float x = (float)(int)(cursor.x + kSplitter * 0.5f) + 0.5f;
+    if (held || hovered) {
+        dl->AddRectFilled(ImVec2(cursor.x, cursor.y), ImVec2(cursor.x + kSplitter, cursor.y + height), vs::splitter_hover);
+    } else {
+        dl->AddLine(ImVec2(x, cursor.y), ImVec2(x, cursor.y + height), vs::border, 1.0f);
+    }
     ImGui::PopID();
 }
 
@@ -253,10 +253,13 @@ static void splitter_h(const char* id, float* size, float min_v, float max_v, fl
     if (hovered || held) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
     if (held) *size = std::clamp(*size - ImGui::GetIO().MouseDelta.y, min_v, max_v);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(cursor, ImVec2(cursor.x + width, cursor.y + kSplitter), vs::sash);
-    ImU32 col = (held || hovered) ? vs::splitter_hover : vs::border;
-    float y = cursor.y + kSplitter * 0.5f;
-    dl->AddLine(ImVec2(cursor.x, y), ImVec2(cursor.x + width, y), col, (held || hovered) ? 2.0f : 1.0f);
+    dl->AddRectFilled(cursor, ImVec2(cursor.x + width, cursor.y + kSplitter), vs::panel_bg);
+    float y = (float)(int)(cursor.y + kSplitter * 0.5f) + 0.5f;
+    if (held || hovered) {
+        dl->AddRectFilled(cursor, ImVec2(cursor.x + width, cursor.y + kSplitter), vs::splitter_hover);
+    } else {
+        dl->AddLine(ImVec2(cursor.x, y), ImVec2(cursor.x + width, y), vs::border, 1.0f);
+    }
     ImGui::PopID();
 }
 
@@ -286,11 +289,14 @@ static void draw_activity() {
                 ImVec2(pos.x + size.x - 0.5f, pos.y + size.y), vs::border);
 
     ImFont* f = g_app->font_icon ? g_app->font_icon : ImGui::GetFont();
-    const float item_h = dp(46.0f);
+    const float item_h = dp(48.0f);
     const int n_items = (int)(sizeof(kActivityItems) / sizeof(kActivityItems[0]));
     for (int i = 0; i < n_items; i++) {
         const ActivityItem& it = kActivityItems[i];
         bool active = g_app->activity == it.view && g_app->settings.show_sidebar;
+        if (it.view == ActivityView::Settings) {
+            ImGui::SetCursorScreenPos(ImVec2(pos.x, pos.y + size.y - item_h - dp(4.0f)));
+        }
         ImVec2 c = ImGui::GetCursorScreenPos();
         ImVec2 rmin = c;
         ImVec2 rmax = ImVec2(c.x + size.x, c.y + item_h);
@@ -307,21 +313,15 @@ static void draw_activity() {
                 g_app->settings.show_sidebar = true;
             }
         }
-        if (hovered && !active) {
-            dl->AddRectFilled(ImVec2(rmin.x + 6, rmin.y + 6),
-                              ImVec2(rmax.x - 6, rmax.y - 6), vs::activity_hover, 6.0f);
-        }
         if (active) {
-            dl->AddRectFilled(ImVec2(rmin.x + 6, rmin.y + 6),
-                              ImVec2(rmax.x - 6, rmax.y - 6), vs::activity_hover, 6.0f);
-            dl->AddLine(ImVec2(rmin.x + 1.5f, rmin.y + 10),
-                        ImVec2(rmin.x + 1.5f, rmax.y - 10), vs::activity_bar, 2.0f);
+            dl->AddRectFilled(ImVec2(rmin.x, rmin.y), ImVec2(rmin.x + 2.0f, rmax.y), vs::activity_bar);
         }
         ImU32 col = (active || hovered) ? vs::activity_active : vs::activity_dim;
-        ImVec2 ts = f->CalcTextSizeA(f->FontSize, FLT_MAX, 0.0f, it.icon);
-        dl->AddText(f, f->FontSize,
-                    ImVec2(rmin.x + (size.x - ts.x) * 0.5f,
-                           rmin.y + (item_h - f->FontSize) * 0.5f - 1.0f),
+        const float isz = f->FontSize * 1.3f;
+        ImVec2 ts = f->CalcTextSizeA(isz, FLT_MAX, 0.0f, it.icon);
+        dl->AddText(f, isz,
+                    ImVec2((float)(int)(rmin.x + (size.x - ts.x) * 0.5f),
+                           (float)(int)(rmin.y + (item_h - isz) * 0.5f)),
                     col, it.icon);
         ImGui::PopID();
     }
@@ -334,28 +334,22 @@ struct HeaderAction { const char* icon; const char* tip; std::function<void()> r
 
 static void section_header(const char* icon, const char* text,
                            const std::vector<HeaderAction>& actions = {}) {
+    (void)icon;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 c = ImGui::GetCursorScreenPos();
     float w = ImGui::GetContentRegionAvail().x;
-    const float h = dp(44.0f);
+    const float h = dp(35.0f);
     dl->AddRectFilled(c, ImVec2(c.x + w, c.y + h), vs::sidebar_bg);
-    dl->AddLine(ImVec2(c.x, c.y + h), ImVec2(c.x + w, c.y + h), vs::border);
 
-    float title_x = c.x + 12.0f;
-    if (icon && icon[0]) {
-        if (g_app->font_icon) ImGui::PushFont(g_app->font_icon);
-        ImVec2 spark = ImGui::CalcTextSize(icon);
-        dl->AddText(ImVec2(c.x + 12, c.y + (h - spark.y) * 0.5f),
-                    IM_COL32(0x6C, 0xB6, 0xFF, 255), icon);
-        title_x = c.x + 12.0f + spark.x + 8.0f;
-        if (g_app->font_icon) ImGui::PopFont();
-    }
-    float title_y = c.y + (h - ImGui::GetFontSize()) * 0.5f;
-    dl->AddText(ImVec2(title_x, title_y), vs::text_bright, text);
+    std::string title = text;
+    for (char& ch : title) ch = (char)std::toupper((unsigned char)ch);
+    ImFont* small = g_app->font_ui_small ? g_app->font_ui_small : ImGui::GetFont();
+    dl->AddText(small, small->FontSize, ImVec2(c.x + dp(20.0f), c.y + (h - small->FontSize) * 0.5f),
+                vs::heading, title.c_str());
 
     ImGui::PushID(text);
-    const float bw = dp(26.0f);
-    float bx = c.x + w - 8.0f;
+    const float bw = dp(22.0f);
+    float bx = c.x + w - dp(8.0f);
     for (int i = (int)actions.size() - 1; i >= 0; i--) {
         bx -= bw + 2.0f;
         ImGui::SetCursorScreenPos(ImVec2(bx, c.y + (h - bw) * 0.5f));
@@ -364,9 +358,9 @@ static void section_header(const char* icon, const char* text,
         bool hov = ImGui::IsItemHovered();
         bool clk = ImGui::IsItemClicked();
         if (hov) {
-            dl->AddRectFilled(ImVec2(bx + 1, c.y + (h - bw) * 0.5f + 1),
-                              ImVec2(bx + bw - 1, c.y + (h + bw) * 0.5f - 1),
-                              vs::activity_hover, 4.0f);
+            dl->AddRectFilled(ImVec2(bx, c.y + (h - bw) * 0.5f),
+                              ImVec2(bx + bw, c.y + (h + bw) * 0.5f),
+                              IM_COL32(0x5A, 0x5D, 0x5E, 0x50), 4.0f);
             ImGui::SetTooltip("%s", actions[(size_t)i].tip);
         }
         if (g_app->font_icon) ImGui::PushFont(g_app->font_icon);
@@ -389,8 +383,6 @@ static void draw_sidebar() {
     ImVec2 pos = ImGui::GetWindowPos();
     ImVec2 size = ImGui::GetWindowSize();
     dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), vs::sidebar_bg);
-    dl->AddLine(ImVec2(pos.x + size.x - 0.5f, pos.y),
-                ImVec2(pos.x + size.x - 0.5f, pos.y + size.y), vs::border);
 
     switch (g_app->activity) {
     case ActivityView::Explorer: {
@@ -441,67 +433,78 @@ static void draw_sidebar() {
 // ---------------------------------------------------------------------------
 // Editor tab strip (custom drawn, VS Code style)
 // ---------------------------------------------------------------------------
+static ImU32 lang_icon_color(Lang lang) {
+    switch (lang) {
+    case Lang::Nexa: return vs::nexa_icon;
+    case Lang::Json:
+    case Lang::Ini: return IM_COL32(0xE2, 0xC0, 0x8D, 255);
+    case Lang::Cpp: return IM_COL32(0xC5, 0x93, 0xE7, 255);
+    case Lang::Markdown: return IM_COL32(0x9C, 0xDC, 0xFE, 255);
+    case Lang::Shell: return IM_COL32(0x89, 0xD1, 0x85, 255);
+    default: return vs::file_icon;
+    }
+}
+
 void draw_editor_tabs(float strip_h) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 origin = ImGui::GetCursorScreenPos();
     float avail_w = ImGui::GetContentRegionAvail().x;
     dl->AddRectFilled(origin, ImVec2(origin.x + avail_w, origin.y + strip_h), vs::tabstrip_bg);
-    dl->AddLine(ImVec2(origin.x, origin.y + strip_h),
-                ImVec2(origin.x + avail_w, origin.y + strip_h), vs::border);
+    // The strip's bottom border; the active tab paints over it to join the editor.
+    dl->AddLine(ImVec2(origin.x, origin.y + strip_h - 0.5f),
+                ImVec2(origin.x + avail_w, origin.y + strip_h - 0.5f), vs::border);
 
-    const float chip_h = dp(26.0f);
-    const float chip_y = origin.y + (strip_h - chip_h) * 0.5f;
     int close_i = -1;
-    const float pad_x  = 10.0f;
-    const float icon_w = 16.0f;
-    const float gap    = 6.0f;
-    const float close_w = 18.0f;
-    const float text_h = ImGui::GetFontSize();
-    const float pad_y  = (chip_h - text_h) * 0.5f;
+    const float pad_x   = dp(10.0f);
+    const float icon_w  = dp(16.0f);
+    const float gap     = dp(6.0f);
+    const float close_w = dp(20.0f);
+    const float min_w   = dp(80.0f);
+    const float text_y  = origin.y + (strip_h - ImGui::GetFontSize()) * 0.5f;
 
     // Tabs that do not fit scroll sideways (mouse wheel), keeping the active one in view.
     static float tab_scroll = 0.0f;
     static int tab_scroll_active = -1;
     std::vector<float> widths;
-    float total_w = 8.0f;
+    float total_w = 0.0f;
     for (const auto& tb : g_app->buffers) {
-        float tw = pad_x + icon_w + gap + ImGui::CalcTextSize(tb.name.c_str()).x + 8.0f + close_w + 4.0f;
+        float tw = pad_x + icon_w + gap + ImGui::CalcTextSize(tb.name.c_str()).x + gap + close_w + dp(6.0f);
+        tw = std::max(tw, min_w);
         widths.push_back(tw);
-        total_w += tw + 6.0f;
+        total_w += tw;
     }
-    float max_scroll = std::max(0.0f, total_w - avail_w + 8.0f);
+    float max_scroll = std::max(0.0f, total_w - avail_w);
     if (ImGui::IsMouseHoveringRect(origin, ImVec2(origin.x + avail_w, origin.y + strip_h))) {
         float wheel = ImGui::GetIO().MouseWheel + ImGui::GetIO().MouseWheelH;
         tab_scroll -= wheel * 60.0f;
     }
     if (tab_scroll_active != g_app->active && g_app->active >= 0 && g_app->active < (int)widths.size()) {
-        float ax = 8.0f;
-        for (int i = 0; i < g_app->active; i++) ax += widths[(size_t)i] + 6.0f;
+        float ax = 0.0f;
+        for (int i = 0; i < g_app->active; i++) ax += widths[(size_t)i];
         float aw = widths[(size_t)g_app->active];
-        if (ax < tab_scroll) tab_scroll = ax - 8.0f;
-        if (ax + aw > tab_scroll + avail_w) tab_scroll = ax + aw - avail_w + 8.0f;
+        if (ax < tab_scroll) tab_scroll = ax;
+        if (ax + aw > tab_scroll + avail_w) tab_scroll = ax + aw - avail_w;
         tab_scroll_active = g_app->active;
     }
     tab_scroll = std::clamp(tab_scroll, 0.0f, max_scroll);
     dl->PushClipRect(origin, ImVec2(origin.x + avail_w, origin.y + strip_h), true);
-    float x = origin.x + 8.0f - tab_scroll;
+    float x = origin.x - tab_scroll;
 
     for (int i = 0; i < (int)g_app->buffers.size(); i++) {
         TextBuffer& b = g_app->buffers[(size_t)i];
         bool active = i == g_app->active;
-        std::string label = b.name;
         float tab_w = widths[(size_t)i];
-        ImVec2 rmin(x, chip_y);
-        ImVec2 rmax(x + tab_w, chip_y + chip_h);
+        ImVec2 rmin(x, origin.y);
+        ImVec2 rmax(x + tab_w, origin.y + strip_h);
 
         ImGui::PushID(i);
         ImGui::SetCursorScreenPos(rmin);
-        ImGui::InvisibleButton("tab", ImVec2(tab_w, chip_h));
+        ImGui::InvisibleButton("tab", ImVec2(tab_w, strip_h));
         bool hovered = ImGui::IsItemHovered();
         bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
         bool middle = ImGui::IsItemClicked(ImGuiMouseButton_Middle);
         if (ImGui::BeginPopupContextItem("tabctx")) {
-            if (ImGui::MenuItem("Close")) close_i = i;
+            if (ImGui::MenuItem("Close", "Ctrl+W")) close_i = i;
             // Tabs with unsaved changes stay open rather than losing their edits.
             if (ImGui::MenuItem("Close Others")) {
                 for (int j = (int)g_app->buffers.size() - 1; j >= 0; j--) {
@@ -513,66 +516,55 @@ void draw_editor_tabs(float strip_h) {
                     if (!g_app->buffers[(size_t)j].dirty) close_buffer(j, true);
                 }
             }
+            ImGui::Separator();
             if (!b.untitled && ImGui::MenuItem("Copy Path")) ImGui::SetClipboardText(b.path.c_str());
-            if (!b.untitled && ImGui::MenuItem("Reveal in Explorer")) reveal_in_explorer(b.path);
+            if (!b.untitled && ImGui::MenuItem("Reveal in File Explorer")) reveal_in_explorer(b.path);
             ImGui::EndPopup();
         }
         if (clicked) {
             g_app->active = i;
-            g_app->preview_tab = -1;
+            if (g_app->preview_tab == i && ImGui::IsMouseDoubleClicked(0)) g_app->preview_tab = -1;
             g_app->editor_focused = true;
             g_app->terminal_focused = false;
         }
         if (middle) close_i = i;
 
-        ImU32 bg = active ? IM_COL32(0x18, 0x18, 0x18, 255)
-                          : (hovered ? IM_COL32(0x1C, 0x1C, 0x1C, 255)
-                                     : IM_COL32(0x14, 0x14, 0x14, 255));
-        dl->AddRectFilled(rmin, rmax, bg, 8.0f);
-        dl->AddRect(rmin, rmax,
-                    active ? IM_COL32(0x00, 0x5A, 0x99, 255) : IM_COL32(0x2A, 0x2A, 0x2A, 255),
-                    8.0f);
-        ImU32 tcol = active ? vs::tab_text_active : vs::tab_text_dim;
-        if (g_app->preview_tab == i && !active) tcol = IM_COL32(0xC5, 0xC5, 0xC5, 0xFF);
-
-        ImU32 ficol = vs::file_icon;
-        switch (b.lang) {
-        case Lang::Nexa: ficol = vs::nexa_icon; break;
-        case Lang::Json:
-        case Lang::Ini: ficol = IM_COL32(0xE2, 0xC0, 0x8D, 255); break;
-        case Lang::Cpp: ficol = IM_COL32(0xC5, 0x93, 0xE7, 255); break;
-        case Lang::Markdown: ficol = IM_COL32(0x9C, 0xDC, 0xFE, 255); break;
-        case Lang::Shell: ficol = IM_COL32(0x89, 0xD1, 0x85, 255); break;
-        default: break;
+        ImU32 bg = active ? vs::tab_active_bg : (hovered ? vs::tab_hover_bg : vs::tab_inactive_bg);
+        dl->AddRectFilled(rmin, rmax, bg);
+        dl->AddLine(ImVec2(rmax.x - 0.5f, rmin.y), ImVec2(rmax.x - 0.5f, rmax.y), vs::border);
+        if (active) {
+            dl->AddRectFilled(rmin, ImVec2(rmax.x - 1.0f, rmin.y + 1.0f), vs::tab_active_line);
+        } else {
+            dl->AddLine(ImVec2(rmin.x, rmax.y - 0.5f), ImVec2(rmax.x, rmax.y - 0.5f), vs::border);
         }
-        if (!active) ficol = (ficol & 0x00FFFFFF) | 0xB0000000;
+
+        ImU32 tcol = active ? vs::tab_text_active : vs::tab_text_dim;
+        ImU32 ficol = lang_icon_color(b.lang);
         float ix = rmin.x + pad_x;
-        dl->AddText(ImVec2(ix, rmin.y + pad_y), ficol, IC_FILE);
-
+        dl->AddText(ImVec2(ix, text_y), ficol, IC_FILE);
         float tx = ix + icon_w + gap;
-        dl->AddText(ImVec2(tx, rmin.y + pad_y), tcol, label.c_str());
+        // A preview tab (single-click open) is shown dimmer until it is kept.
+        if (g_app->preview_tab == i) tcol = active ? IM_COL32(0xD0, 0xD0, 0xD0, 255) : IM_COL32(0x80, 0x80, 0x80, 255);
+        dl->AddText(ImVec2(tx, text_y), tcol, b.name.c_str());
 
-        float cx = rmax.x - close_w * 0.5f - 4.0f;
-        float cy = rmin.y + chip_h * 0.5f;
-        ImVec2 close_min(cx - 8, cy - 8);
-        ImVec2 close_max(cx + 8, cy + 8);
-        bool over_close = ImGui::GetIO().MousePos.x >= close_min.x &&
-                          ImGui::GetIO().MousePos.x <= close_max.x &&
-                          ImGui::GetIO().MousePos.y >= close_min.y &&
-                          ImGui::GetIO().MousePos.y <= close_max.y;
-        if (over_close) dl->AddRectFilled(close_min, close_max, IM_COL32(0x3A, 0x3A, 0x3A, 0xFF), 4.0f);
+        float cx = rmax.x - close_w * 0.5f - dp(6.0f);
+        float cy = rmin.y + strip_h * 0.5f;
+        ImVec2 close_min(cx - dp(9.0f), cy - dp(9.0f));
+        ImVec2 close_max(cx + dp(9.0f), cy + dp(9.0f));
+        bool over_close = ImGui::IsMouseHoveringRect(close_min, close_max);
+        if (over_close) dl->AddRectFilled(close_min, close_max, IM_COL32(0x5A, 0x5D, 0x5E, 0x60), 4.0f);
         if (over_close && ImGui::IsMouseClicked(0)) close_i = i;
 
+        const float xs = dp(4.0f);
         if (b.dirty && !over_close) {
-            dl->AddCircleFilled(ImVec2(cx, cy), 3.5f,
-                                active ? vs::tab_text_active : vs::tab_text_dim, 12);
+            dl->AddCircleFilled(ImVec2(cx, cy), dp(4.0f), active ? vs::tab_text_active : vs::tab_text_dim, 16);
         } else if (hovered || active || over_close) {
-            ImU32 xcol = over_close ? vs::text_bright : IM_COL32(0xC5, 0xC5, 0xC5, 0xC0);
-            dl->AddLine(ImVec2(cx - 3.5f, cy - 3.5f), ImVec2(cx + 3.5f, cy + 3.5f), xcol, 1.2f);
-            dl->AddLine(ImVec2(cx - 3.5f, cy + 3.5f), ImVec2(cx + 3.5f, cy - 3.5f), xcol, 1.2f);
+            ImU32 xcol = over_close ? vs::text_bright : (active ? IM_COL32(0xCC, 0xCC, 0xCC, 255) : vs::tab_text_dim);
+            dl->AddLine(ImVec2(cx - xs, cy - xs), ImVec2(cx + xs, cy + xs), xcol, 1.2f);
+            dl->AddLine(ImVec2(cx - xs, cy + xs), ImVec2(cx + xs, cy - xs), xcol, 1.2f);
         }
         ImGui::PopID();
-        x += tab_w + 6.0f;
+        x += tab_w;
     }
     dl->PopClipRect();
     if (close_i >= 0) close_buffer(close_i);
@@ -1169,23 +1161,16 @@ static void draw_agent_panel() {
     dl->AddLine(ImVec2(pos.x + 0.5f, pos.y), ImVec2(pos.x + 0.5f, pos.y + size.y), vs::border);
 
     AgentSettings& a = g_app->settings.agent;
-    const float hdr_h = dp(44.0f);
+    // Same 35px uppercase header as the sidebar sections.
+    const float hdr_h = dp(35.0f);
     dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + hdr_h), vs::sidebar_bg);
-    dl->AddLine(ImVec2(pos.x, pos.y + hdr_h), ImVec2(pos.x + size.x, pos.y + hdr_h), vs::border);
-
-    if (g_app->font_icon) ImGui::PushFont(g_app->font_icon);
-    ImVec2 spark = ImGui::CalcTextSize(IC_SPARKLE);
-    if (g_app->font_icon) ImGui::PopFont();
-    float title_y = pos.y + (hdr_h - ImGui::GetFontSize()) * 0.5f;
-    if (g_app->font_icon) {
-        ImGui::PushFont(g_app->font_icon);
-        dl->AddText(ImVec2(pos.x + 12, pos.y + (hdr_h - spark.y) * 0.5f),
-                    IM_COL32(0x6C, 0xB6, 0xFF, 255), IC_SPARKLE);
-        ImGui::PopFont();
+    {
+        ImFont* small = g_app->font_ui_small ? g_app->font_ui_small : ImGui::GetFont();
+        dl->AddText(small, small->FontSize, ImVec2(pos.x + dp(20.0f), pos.y + (hdr_h - small->FontSize) * 0.5f),
+                    vs::heading, "AGENT");
     }
-    dl->AddText(ImVec2(pos.x + 12 + spark.x + 8, title_y), vs::text_bright, "Agent");
 
-    const float bw = dp(26.0f);
+    const float bw = dp(22.0f);
     float bx = pos.x + size.x - 8.0f - bw;
     if (agent_icon_hit("agnew", IC_ADD, "New chat", ImVec2(bx, pos.y + (hdr_h - bw) * 0.5f), bw, dl))
         agent_new_chat();
@@ -1213,8 +1198,8 @@ static void draw_agent_panel() {
                 save_settings(g_app->settings);
             }
             bool hov = ImGui::IsItemHovered();
-            ImU32 bg = on ? IM_COL32(0x00, 0x5A, 0x99, 255)
-                          : (hov ? IM_COL32(0x22, 0x22, 0x22, 255) : IM_COL32(0x16, 0x16, 0x16, 255));
+            ImU32 bg = on ? vs::accent
+                          : (hov ? IM_COL32(0x2A, 0x2A, 0x2A, 255) : IM_COL32(0x1F, 0x1F, 0x1F, 255));
             float rnd = (i == 0) ? 4.0f : 4.0f;
             dl->AddRectFilled(r0, r1, bg, rnd);
             ImVec2 ts = ImGui::CalcTextSize(modes[i]);
@@ -1222,7 +1207,7 @@ static void draw_agent_panel() {
                         on ? IM_COL32(0xF0, 0xF0, 0xF0, 255) : vs::subtle, modes[i]);
         }
         dl->AddRect(ImVec2(px0, py0), ImVec2(px0 + pill_w * 2.0f, py0 + pill_h),
-                    IM_COL32(0x2E, 0x2E, 0x2E, 255), 4.0f);
+                    IM_COL32(0x3C, 0x3C, 0x3C, 255), 4.0f);
     }
 
     ImGui::SetCursorScreenPos(ImVec2(pos.x + 12, pos.y + hdr_h + 8));
@@ -1384,116 +1369,108 @@ static void draw_bottom() {
     ImVec2 pos = ImGui::GetWindowPos();
     ImVec2 size = ImGui::GetWindowSize();
     dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y), vs::panel_bg);
-    dl->AddLine(ImVec2(pos.x, pos.y + 0.5f), ImVec2(pos.x + size.x, pos.y + 0.5f), vs::border);
 
-    const float hdr_h = dp(44.0f);
-    dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + hdr_h), vs::sidebar_bg);
-    dl->AddLine(ImVec2(pos.x, pos.y + hdr_h), ImVec2(pos.x + size.x, pos.y + hdr_h), vs::border);
-
-    if (g_app->font_icon) ImGui::PushFont(g_app->font_icon);
-    ImVec2 spark = ImGui::CalcTextSize(IC_TERMINAL);
-    if (g_app->font_icon) ImGui::PopFont();
-    if (g_app->font_icon) {
-        ImGui::PushFont(g_app->font_icon);
-        dl->AddText(ImVec2(pos.x + 12, pos.y + (hdr_h - spark.y) * 0.5f),
-                    IM_COL32(0x6C, 0xB6, 0xFF, 255), IC_TERMINAL);
-        ImGui::PopFont();
-    }
-    float title_y = pos.y + (hdr_h - ImGui::GetFontSize()) * 0.5f;
-    dl->AddText(ImVec2(pos.x + 12 + spark.x + 8, title_y), vs::text_bright, "Panel");
-
+    const float hdr_h = dp(35.0f);
     struct Tab { const char* label; BottomTab id; };
-    Tab tabs[] = {
-        {"Terminal", BottomTab::Terminal},
-        {"Problems", BottomTab::Problems},
-        {"Output",   BottomTab::Output},
+    const Tab tabs[] = {
+        {"PROBLEMS", BottomTab::Problems},
+        {"OUTPUT",   BottomTab::Output},
+        {"TERMINAL", BottomTab::Terminal},
     };
-    const float pill_w = dp(88.0f);
-    const float pill_h = dp(22.0f);
-    float px0 = pos.x + 12 + spark.x + 8 + ImGui::CalcTextSize("Panel").x + 16.0f;
-    float py0 = pos.y + (hdr_h - pill_h) * 0.5f;
-    for (int i = 0; i < 3; i++) {
-        bool on = g_app->bottom == tabs[i].id;
-        ImVec2 r0(px0 + pill_w * (float)i, py0);
-        ImVec2 r1(r0.x + pill_w, r0.y + pill_h);
-        ImGui::PushID(tabs[i].label);
-        ImGui::SetCursorScreenPos(r0);
-        ImGui::InvisibleButton("##btab", ImVec2(pill_w, pill_h));
-        if (ImGui::IsItemClicked()) g_app->bottom = tabs[i].id;
+    ImFont* small = g_app->font_ui_small ? g_app->font_ui_small : ImGui::GetFont();
+    float tx = pos.x + dp(10.0f);
+    for (const Tab& t : tabs) {
+        bool on = g_app->bottom == t.id;
+        std::string badge;
+        if (t.id == BottomTab::Problems && !g_app->problems.empty()) badge = std::to_string(g_app->problems.size());
+        ImVec2 ls = small->CalcTextSizeA(small->FontSize, FLT_MAX, 0.0f, t.label);
+        float bw = badge.empty() ? 0.0f : small->CalcTextSizeA(small->FontSize, FLT_MAX, 0.0f, badge.c_str()).x + dp(12.0f);
+        float w = ls.x + (badge.empty() ? 0.0f : bw + dp(6.0f)) + dp(20.0f);
+        ImGui::PushID(t.label);
+        ImGui::SetCursorScreenPos(ImVec2(tx, pos.y));
+        ImGui::InvisibleButton("##btab", ImVec2(w, hdr_h));
+        if (ImGui::IsItemClicked()) g_app->bottom = t.id;
         bool hov = ImGui::IsItemHovered();
-        ImU32 bg = on ? IM_COL32(0x00, 0x5A, 0x99, 255)
-                      : (hov ? IM_COL32(0x22, 0x22, 0x22, 255) : IM_COL32(0x16, 0x16, 0x16, 255));
-        dl->AddRectFilled(r0, r1, bg, 4.0f);
-        std::string label = tabs[i].label;
-        if (tabs[i].id == BottomTab::Problems && !g_app->problems.empty())
-            label += "  " + std::to_string(g_app->problems.size());
-        ImVec2 ts = ImGui::CalcTextSize(label.c_str());
-        dl->AddText(ImVec2(r0.x + (pill_w - ts.x) * 0.5f, r0.y + (pill_h - ts.y) * 0.5f),
-                    on ? IM_COL32(0xF0, 0xF0, 0xF0, 255) : vs::subtle, label.c_str());
         ImGui::PopID();
+        float lx = tx + dp(10.0f);
+        float ly = pos.y + (hdr_h - small->FontSize) * 0.5f;
+        dl->AddText(small, small->FontSize, ImVec2(lx, ly),
+                    on ? vs::tab_text_active : (hov ? vs::text_normal : vs::tab_text_dim), t.label);
+        if (!badge.empty()) {
+            float bx = lx + ls.x + dp(6.0f);
+            float bh = small->FontSize + dp(2.0f);
+            dl->AddRectFilled(ImVec2(bx, ly - dp(1.0f)), ImVec2(bx + bw, ly - dp(1.0f) + bh),
+                              IM_COL32(0x61, 0x61, 0x61, 255), bh * 0.5f);
+            dl->AddText(small, small->FontSize, ImVec2(bx + dp(6.0f), ly), IM_COL32(0xFF, 0xFF, 0xFF, 255), badge.c_str());
+        }
+        if (on) {
+            dl->AddRectFilled(ImVec2(lx, pos.y + hdr_h - dp(6.0f)), ImVec2(tx + w - dp(10.0f), pos.y + hdr_h - dp(5.0f)),
+                              vs::tab_text_active);
+        }
+        tx += w;
     }
-    dl->AddRect(ImVec2(px0, py0), ImVec2(px0 + pill_w * 3.0f, py0 + pill_h),
-                IM_COL32(0x2E, 0x2E, 0x2E, 255), 4.0f);
 
-    const float bw = dp(26.0f);
-    float bx = pos.x + size.x - 8.0f - bw;
+    const float bw = dp(22.0f);
+    float bx = pos.x + size.x - dp(8.0f) - bw;
     auto icon_hit = [&](const char* id, const char* icon, const char* tip) -> bool {
-        ImGui::SetCursorScreenPos(ImVec2(bx, pos.y + (hdr_h - bw) * 0.5f));
+        float by = pos.y + (hdr_h - bw) * 0.5f;
+        ImGui::SetCursorScreenPos(ImVec2(bx, by));
         ImGui::InvisibleButton(id, ImVec2(bw, bw));
         bool hov = ImGui::IsItemHovered();
         bool clk = ImGui::IsItemClicked();
         if (hov) {
-            dl->AddRectFilled(ImVec2(bx + 1, pos.y + (hdr_h - bw) * 0.5f + 1),
-                              ImVec2(bx + bw - 1, pos.y + (hdr_h + bw) * 0.5f - 1),
-                              vs::activity_hover, 4.0f);
+            dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bw), IM_COL32(0x5A, 0x5D, 0x5E, 0x50), 4.0f);
             ImGui::SetTooltip("%s", tip);
         }
         if (g_app->font_icon) ImGui::PushFont(g_app->font_icon);
         ImVec2 ts = ImGui::CalcTextSize(icon);
-        dl->AddText(ImVec2(bx + (bw - ts.x) * 0.5f, pos.y + (hdr_h - ts.y) * 0.5f),
+        dl->AddText(ImVec2(bx + (bw - ts.x) * 0.5f, by + (bw - ts.y) * 0.5f),
                     hov ? vs::text_bright : vs::heading_action, icon);
         if (g_app->font_icon) ImGui::PopFont();
+        bx -= bw + dp(4.0f);
         return clk;
     };
-    if (g_app->proc.running) {
-        if (icon_hit("##kill", IC_STOP, "Stop")) proc_stop();
+    if (icon_hit("##hide", IC_CLOSE_SMALL, "Close Panel (Ctrl+J)")) g_app->settings.show_panel = false;
+    if (g_app->proc.running && !g_app->proc.is_shell) {
+        if (icon_hit("##kill", IC_STOP, "Stop (Shift+F5)")) proc_stop();
     } else if (g_app->bottom == BottomTab::Terminal) {
-        if (icon_hit("##clear", IC_DELETE, "Clear")) term_clear();
+        if (icon_hit("##clear", IC_DELETE, "Clear Terminal")) term_clear();
     }
 
-    ImGui::SetCursorScreenPos(ImVec2(pos.x + 12, pos.y + hdr_h + 8));
-    ImVec2 body = ImVec2(size.x - 24, size.y - hdr_h - 16);
-    ImVec2 box0 = ImGui::GetCursorScreenPos();
-    dl->AddRectFilled(box0, ImVec2(box0.x + body.x, box0.y + body.y),
-                      IM_COL32(0x14, 0x14, 0x14, 255), 8.0f);
-    dl->AddRect(box0, ImVec2(box0.x + body.x, box0.y + body.y),
-                IM_COL32(0x2E, 0x2E, 0x2E, 255), 8.0f);
-    ImGui::SetCursorScreenPos(ImVec2(box0.x + 8, box0.y + 6));
-    body.x -= 16.0f;
-    body.y -= 12.0f;
+    ImGui::SetCursorScreenPos(ImVec2(pos.x + dp(12.0f), pos.y + hdr_h));
+    ImVec2 body = ImVec2(size.x - dp(16.0f), size.y - hdr_h - dp(4.0f));
     ImGui::BeginChild("bottom_body", body, ImGuiChildFlags_None);
     if (g_app->bottom == BottomTab::Terminal) {
         draw_terminal(body);
     } else if (g_app->bottom == BottomTab::Problems) {
         draw_problems();
     } else {
-        ImGui::Dummy(ImVec2(1, 8));
-        ImGui::Indent(8);
-        ui_begin_card("out_card");
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.82f, 0.82f, 1));
-        ImGui::TextUnformatted("Nexium");
-        ImGui::PopStyleColor();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.45f, 0.45f, 1));
-        ImGui::TextWrapped("Nexa on PATH  ·  Dear ImGui");
-        ImGui::PopStyleColor();
+        // Output: environment facts in the log style of VS Code's output channel.
+        static std::string compiler;
+        static double checked = -100.0;
+        if (ImGui::GetTime() - checked > 5.0) {
+            compiler = nexa_compiler();
+            checked = ImGui::GetTime();
+        }
+        if (g_app->font_code) ImGui::PushFont(g_app->font_code);
+        ImGui::Dummy(ImVec2(1, 4));
+        auto row = [](const char* key, const std::string& value) {
+            ImGui::TextColored(ImVec4(0.34f, 0.61f, 0.84f, 1), "[info]");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.61f, 0.61f, 0.61f, 1), "%-10s", key);
+            ImGui::SameLine();
+            ImGui::TextUnformatted(value.c_str());
+        };
+        row("compiler", which_exe(compiler).empty() ? compiler + "  (not found on PATH)" : which_exe(compiler));
+        row("folder", g_app->settings.folder.empty() ? std::string("(none)") : g_app->settings.folder);
+        row("settings", settings_path());
         if (g_app->active >= 0) {
             const TextBuffer& b = g_app->buffers[(size_t)g_app->active];
-            ImGui::Dummy(ImVec2(1, 8));
-            ImGui::Text("File  ·  %s", b.untitled ? b.name.c_str() : b.path.c_str());
-            ImGui::Text("Lines  ·  %d    Bytes  ·  %d", (int)b.lines.size(), (int)b.text.size());
+            row("file", b.untitled ? b.name : b.path);
+            row("size", std::to_string((int)b.lines.size()) + " lines, " + std::to_string((int)b.text.size()) + " bytes, " +
+                            lang_name(b.lang) + (b.crlf ? ", CRLF" : ", LF"));
         }
-        ui_end_card();
-        ImGui::Unindent(8);
+        if (g_app->font_code) ImGui::PopFont();
     }
     ImGui::EndChild();
 }
@@ -1502,15 +1479,14 @@ static void draw_bottom() {
 // Status bar
 // ---------------------------------------------------------------------------
 static void draw_status(float y, float w) {
-    if (g_app->font_ui) ImGui::PushFont(g_app->font_ui);
+    ImFont* font = g_app->font_ui_small ? g_app->font_ui_small : ImGui::GetFont();
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     ImVec2 pos = ImGui::GetMainViewport()->WorkPos;
-    const float h = dp(28.0f);
+    const float h = dp(22.0f);
     ImVec2 rmin(pos.x, pos.y + y);
     ImVec2 rmax(pos.x + w, pos.y + y + h);
     dl->AddRectFilled(rmin, rmax, vs::status_bg);
-    dl->AddLine(ImVec2(rmin.x, rmin.y + 0.5f), ImVec2(rmax.x, rmin.y + 0.5f),
-                IM_COL32(0x00, 0x3A, 0x64, 255));
+    dl->AddLine(ImVec2(rmin.x, rmin.y + 0.5f), ImVec2(rmax.x, rmin.y + 0.5f), vs::border);
 
     const char* lang = "Plain Text";
     int line = 1, col = 1;
@@ -1530,40 +1506,53 @@ static void draw_status(float y, float w) {
         }
         crlf = b.crlf;
     }
-
-    ImU32 txt = vs::status_text;
-    float x = rmin.x + 10.0f;
-    float ty = rmin.y + (h - ImGui::GetFontSize()) * 0.5f;
-
-    // Error / warning counts (grouped)
     int n_err = 0, n_warn = 0;
     for (const auto& d : g_app->problems) {
         if (d.error) n_err++;
         else n_warn++;
     }
-    // Error icon + count
-    {
-        std::string s = IC_ERROR_S "  " + std::to_string(n_err);
-        dl->AddText(ImVec2(x, ty), txt, s.c_str());
-        x += ImGui::CalcTextSize(s.c_str()).x + 12.0f;
-    }
-    // Warning icon + count
-    {
-        std::string s = IC_WARN_S "  " + std::to_string(n_warn);
-        dl->AddText(ImVec2(x, ty), txt, s.c_str());
-        x += ImGui::CalcTextSize(s.c_str()).x + 16.0f;
-    }
-    // Folder / branch-style pill
-    if (!g_app->settings.folder.empty()) {
-        std::string s = std::string(IC_FOLDER) + "  " + path_filename(g_app->settings.folder);
-        dl->AddText(ImVec2(x, ty), txt, s.c_str());
-        x += ImGui::CalcTextSize(s.c_str()).x + 16.0f;
-    }
 
-    // Right side (encoding, language, model)
-    struct RItem { std::string s; };
-    std::vector<RItem> right_items;
+    const float pad = dp(8.0f);
+    const float ty = rmin.y + (h - font->FontSize) * 0.5f;
+    ImFont* icons = g_app->font_icon ? g_app->font_icon : font;
+    const float isz = font->FontSize;
+    // One status item: optional icon + text, hover highlight, returns clicked.
+    auto item = [&](float x, const char* icon, const std::string& text, bool right, ImU32 bg) -> float {
+        float iw = icon ? icons->CalcTextSizeA(isz, FLT_MAX, 0.0f, icon).x + dp(4.0f) : 0.0f;
+        float tw = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, text.c_str()).x;
+        float wdt = iw + tw + pad * 2.0f;
+        float x0 = right ? x - wdt : x;
+        ImVec2 a(x0, rmin.y + 1.0f), z(x0 + wdt, rmax.y);
+        bool hov = ImGui::IsMouseHoveringRect(a, z, false);
+        if (bg) dl->AddRectFilled(a, z, bg);
+        else if (hov) dl->AddRectFilled(a, z, vs::status_hover);
+        float cx = x0 + pad;
+        if (icon) {
+            dl->AddText(icons, isz, ImVec2(cx, rmin.y + (h - isz) * 0.5f), bg ? IM_COL32_WHITE : vs::status_text, icon);
+            cx += iw;
+        }
+        dl->AddText(font, font->FontSize, ImVec2(cx, ty), bg ? IM_COL32_WHITE : vs::status_text, text.c_str());
+        return right ? x0 : x0 + wdt;
+    };
+
+    float x = rmin.x;
+    x = item(x, IC_TERMINAL, "Nexium", false, vs::accent);
+    if (!g_app->settings.folder.empty()) x = item(x, IC_FOLDER, path_filename(g_app->settings.folder), false, 0);
+    x = item(x, IC_ERROR_S, std::to_string(n_err), false, 0);
+    x = item(x - pad, IC_WARN_S, std::to_string(n_warn), false, 0);
+    if (g_app->proc.running && !g_app->proc.is_shell) x = item(x, IC_RUN, "Running", false, 0);
+
+    float rx = rmax.x - dp(4.0f);
+    {
+        const AgentSettings& a = g_app->settings.agent;
+        std::string model = a.current().custom_model.empty() ? a.current().model : a.current().custom_model;
+        rx = item(rx, IC_SPARKLE, model, true, 0);
+    }
+    rx = item(rx, nullptr, lang, true, 0);
     if (has_buffer) {
+        rx = item(rx, nullptr, crlf ? "CRLF" : "LF", true, 0);
+        rx = item(rx, nullptr, "UTF-8", true, 0);
+        rx = item(rx, nullptr, "Spaces: 4", true, 0);
         char b[128];
         if (selected && selected_lines > 1)
             std::snprintf(b, sizeof(b), "Ln %d, Col %d (%d selected, %d lines)", line, col, selected, selected_lines);
@@ -1571,27 +1560,8 @@ static void draw_status(float y, float w) {
             std::snprintf(b, sizeof(b), "Ln %d, Col %d (%d selected)", line, col, selected);
         else
             std::snprintf(b, sizeof(b), "Ln %d, Col %d", line, col);
-        right_items.push_back({b});
-        right_items.push_back({"Spaces: 4"});
-        right_items.push_back({"UTF-8"});
-        right_items.push_back({crlf ? "CRLF" : "LF"});
+        rx = item(rx, nullptr, b, true, 0);
     }
-    right_items.push_back({lang});
-    {
-        const AgentSettings& a = g_app->settings.agent;
-        std::string label = std::string(IC_SPARKLE "  ") +
-                            (a.current().custom_model.empty() ? a.current().model : a.current().custom_model);
-        right_items.push_back({label});
-    }
-    // Draw right-aligned
-    float rx = rmax.x - 10.0f;
-    for (int i = (int)right_items.size() - 1; i >= 0; i--) {
-        float tw = ImGui::CalcTextSize(right_items[(size_t)i].s.c_str()).x;
-        rx -= tw;
-        dl->AddText(ImVec2(rx, ty), txt, right_items[(size_t)i].s.c_str());
-        rx -= 16.0f;
-    }
-    if (g_app->font_ui) ImGui::PopFont();
 }
 
 // ---------------------------------------------------------------------------
@@ -1739,8 +1709,7 @@ static float draw_title_bar(float w) {
     ImVec2 rmin = origin;
     ImVec2 rmax = ImVec2(origin.x + w, origin.y + h);
 
-    // Background — same as menu area (#181818, slightly darker than editor)
-    dl->AddRectFilled(rmin, rmax, IM_COL32(0x0E, 0x0E, 0x0E, 0xFF));
+    dl->AddRectFilled(rmin, rmax, vs::sidebar_bg);
 
     const float ic_pad = 8.0f;
     const float ic_sz  = 16.0f;
@@ -1769,9 +1738,9 @@ static float draw_title_bar(float w) {
         // If a menu is already open, hovering another opens it (VS Code-like behavior)
         if (g_app->open_menu >= 0 && hov && !is_open) clicked_menu = i;
         if (hov || is_open) {
-            dl->AddRectFilled(ImVec2(mx + 2, rmin.y + 4),
-                              ImVec2(mx + mw - 2, rmax.y - 4),
-                              IM_COL32(0xFF, 0xFF, 0xFF, is_open ? 0x18 : 0x0F), 3.0f);
+            dl->AddRectFilled(ImVec2(mx + 1, rmin.y + dp(5.0f)),
+                              ImVec2(mx + mw - 1, rmax.y - dp(5.0f)),
+                              IM_COL32(0x5A, 0x5D, 0x5E, is_open ? 0x70 : 0x50), 4.0f);
         }
         ImU32 col = IM_COL32(0xCC, 0xCC, 0xCC, 0xFF);
         dl->AddText(ImVec2(mx + 8, rmin.y + (h - ImGui::GetFontSize()) * 0.5f),
@@ -1781,18 +1750,36 @@ static float draw_title_bar(float w) {
     }
     if (clicked_menu >= 0) g_app->want_open_menu = clicked_menu;
 
-    // ---- Center: window title ----
-    std::string title = "Nexium";
-    if (g_app->active >= 0) {
-        const TextBuffer& b = g_app->buffers[(size_t)g_app->active];
-        title = std::string(b.dirty ? "\xE2\x97\x8F " : "") + b.name + "  -  Nexium";
-    } else if (!g_app->settings.folder.empty()) {
-        title = path_filename(g_app->settings.folder) + "  -  Nexium";
+    // ---- Center: command center (opens quick open, like VS Code) ----
+    {
+        std::string label = "Nexium";
+        if (!g_app->settings.folder.empty()) label = path_filename(g_app->settings.folder);
+        if (g_app->active >= 0 && g_app->buffers[(size_t)g_app->active].dirty) label = "\xE2\x97\x8F " + label;
+        const float cw = std::min(dp(520.0f), w * 0.38f);
+        const float ch = h - dp(10.0f);
+        ImVec2 c0(rmin.x + (w - cw) * 0.5f, rmin.y + (h - ch) * 0.5f);
+        ImVec2 c1(c0.x + cw, c0.y + ch);
+        // Only when it clears the menus on the left.
+        if (c0.x > mx + dp(12.0f)) {
+            ImGui::SetCursorScreenPos(c0);
+            ImGui::InvisibleButton("##cmdcenter", ImVec2(cw, ch));
+            bool hov = ImGui::IsItemHovered();
+            if (hov) {
+                g_app->title_hover_blocks_drag = true;
+                ImGui::SetTooltip("Search files by name (Ctrl+P)");
+            }
+            if (ImGui::IsItemClicked()) open_quick("");
+            dl->AddRectFilled(c0, c1, hov ? IM_COL32(0x2A, 0x2A, 0x2A, 255) : IM_COL32(0x22, 0x22, 0x22, 255), 6.0f);
+            dl->AddRect(c0, c1, IM_COL32(0x3C, 0x3C, 0x3C, 255), 6.0f);
+            ImVec2 ls = ImGui::CalcTextSize(label.c_str());
+            float lx = c0.x + (cw - ls.x) * 0.5f;
+            if (g_app->font_icon) ImGui::PushFont(g_app->font_icon);
+            ImVec2 is = ImGui::CalcTextSize(IC_SEARCH);
+            dl->AddText(ImVec2(lx - is.x - dp(8.0f), c0.y + (ch - is.y) * 0.5f), IM_COL32(0x9D, 0x9D, 0x9D, 255), IC_SEARCH);
+            if (g_app->font_icon) ImGui::PopFont();
+            dl->AddText(ImVec2(lx, c0.y + (ch - ls.y) * 0.5f), IM_COL32(0xCC, 0xCC, 0xCC, 255), label.c_str());
+        }
     }
-    float tw = ImGui::CalcTextSize(title.c_str()).x;
-    float tx = rmin.x + (w - tw) * 0.5f;
-    dl->AddText(ImVec2(tx, rmin.y + (h - ImGui::GetFontSize()) * 0.5f),
-                IM_COL32(0xCC, 0xCC, 0xCC, 0xFF), title.c_str());
 
     // ---- Window buttons (min / max / close) ----
     const float btn_w = dp(46.0f);
@@ -2425,7 +2412,7 @@ void draw_ide() {
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
     float title_h = draw_title_bar(avail.x);
-    float status_h = dp(28.0f);
+    float status_h = dp(22.0f);
     float main_h = avail.y - title_h - status_h;
 
     // Activity bar
