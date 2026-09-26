@@ -39,6 +39,29 @@ mingw32-make NEXA_LANG=D:/Projects/Nexa-Lang
 
 `NEXA_LANG` points at your Nexa-Lang checkout; the build uses its `include/` folder. The result is `Nexium.exe` in the repository root.
 
+### Installer
+
+`NexiumSetup.exe` is a single-file graphical installer written in Nexa (`installer/setup.nxa`). Build it with:
+
+```sh
+mingw32-make installer
+```
+
+This compiles the setup with NexaC and uses `installer/pack.nxa` to append `Nexium.exe`, the MinGW runtime DLLs it needs (`libstdc++-6.dll`, `libgcc_s_seh-1.dll` and the thread runtime), its icon, the README and the license to the setup executable. Only `Nexium.exe` and `NexiumSetup.exe` are left afterwards. Set `MINGW_BIN` if the runtime DLLs are not in your compiler's `bin` folder.
+
+The installer can:
+- install for the current user (no admin rights needed) or for all users (asks for administrator permission)
+- create Start menu and desktop shortcuts, open `.nxa` files with Nexium, and add Nexium to PATH
+- if the Nexa compiler is not installed, offer to download the latest NexaC release and run its installer
+- register Nexium in Apps & features, with an uninstaller that reverses all of this and restores the previous `.nxa` handler
+
+For unattended installs:
+
+```sh
+NexiumSetup.exe --silent [--scope User|Machine] [--dir <path>] [--desktop 0|1] [--startmenu 0|1] [--assoc 0|1] [--path 0|1] [--nexa 0|1]
+"<install dir>\Uninstall.exe" --uninstall --silent
+```
+
 You can open files or a folder from the command line:
 
 ```sh
@@ -83,6 +106,7 @@ src/
   terminal.cpp    ConPTY terminal, VT screen buffer, run/build
   agent.cpp       AI agent: providers, streaming, tools
   util.cpp        Paths, file IO, JSON, settings, HTTP
+installer/        Nexa setup wizard (setup.nxa) and payload packer (pack.nxa)
 res/              Icon and resource script
 third_party/      Dear ImGui
 ```

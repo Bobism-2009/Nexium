@@ -10,3 +10,5 @@ Thumbs.db
 *.suo
 .env
 .env.*
+NexiumSetup.exe
+installer/*.exe

@@ -1,0 +1,1146 @@
+// Nexium Setup -- a graphical installer and uninstaller for Nexium, written in Nexa.
+//
+// This file builds the setup *stub*. installer/pack.nxa appends the payload
+// (Nexium.exe, nexium.ico, README.md, LICENSE) and a manifest to the stub, so
+// the finished NexiumSetup.exe is one self-contained file. At run time the
+// stub reads its own executable and extracts what it needs.
+//
+// The payload also carries the MinGW runtime DLLs Nexium.exe links against;
+// they are installed next to it.
+//
+// Build everything with:  mingw32-make installer   (see the Makefile)
+//
+// Command line:
+//   NexiumSetup.exe                     interactive install
+//   NexiumSetup.exe --silent [options]  unattended install (exit code 0 on success)
+//   Uninstall.exe --uninstall [--silent] [--scope User|Machine]
+// Options: --scope User|Machine  --dir <path>  --desktop 0|1  --startmenu 0|1
+//          --assoc 0|1  --path 0|1  --nexa 0|1 (install the Nexa compiler if missing)
+#include <std/io>
+#include <std/os>
+#include <std/file>
+#include <std/gfx>
+#include <std/time>
+
+let VERSION = "1.0.0";
+let NEXA_URL = "https://github.com/Bobism-2009/Nexa-Lang/releases";
+
+let W = 840;
+let H = 540;
+let SIDEBAR = 240;
+let CX = 272;           // left edge of the page content
+let FOOT = 472;         // top of the button bar
+
+// Pages
+let P_WELCOME = 0;
+let P_OPTIONS = 1;
+let P_PROGRESS = 2;
+let P_FINISH = 3;
+let P_ERROR = 4;
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let uninstall_mode = false;
+let silent = false;
+let elevated = false;
+let page = 0;
+let quit = false;
+let exit_code = 0;
+
+let scope = "User";
+let install_dir = "";
+let dir_edited = false;
+let opt_desktop = true;
+let opt_startmenu = true;
+let opt_assoc = true;
+let opt_path = false;
+let opt_launch = true;
+let opt_remove_settings = false;
+let opt_nexa = true;        // install NexaC when it is missing
+
+let nexa_path = "";
+let notice = "";            // inline message on the options / confirm page
+let error_msg = "";
+let warnings: []string;
+let steps: []string;
+let step_i = 0;
+
+let helper_ps = "";
+let helper_out = "";
+let elevate_target = "none";
+let elevate_args = "none";
+
+// Payload read back from this executable.
+let self_data = "";
+let pk_names: []string;
+let pk_offs: []int;
+let pk_sizes: []int;
+let logo = 0;
+
+// Input for the current frame.
+let mx = 0;
+let my = 0;
+let mouse_prev = false;
+let press_x = -1;
+let press_y = -1;
+let released = false;
+let key_enter = false;
+let key_escape = false;
+let field_focus = false;
+
+// ---------------------------------------------------------------------------
+// PowerShell helper: registry, shortcuts, PATH, elevation and the folder
+// picker are all easier and safer from PowerShell than from cmd quoting.
+// Parameters that would otherwise be empty are passed as "none" (a bare "-"
+// or "" does not survive powershell -File argument binding).
+// ---------------------------------------------------------------------------
+let HELPER_SCRIPT: string = R"PS(
+param(
+  [string]$Action = '',
+  [string]$Dir = '',
+  [string]$Scope = 'User',
+  [string]$Version = '',
+  [int]$Desktop = 0,
+  [int]$StartMenu = 0,
+  [string]$Out = 'none',
+  [string]$Target = 'none',
+  [string]$ArgList = 'none'
+)
+$ErrorActionPreference = 'Stop'
+$machine = $Scope -eq 'Machine'
+$hive = if ($machine) { 'HKLM:' } else { 'HKCU:' }
+$exe = Join-Path $Dir 'Nexium.exe'
+$uninstaller = Join-Path $Dir 'Uninstall.exe'
+$uninstKey = "$hive\Software\Microsoft\Windows\CurrentVersion\Uninstall\Nexium"
+$appPathKey = "$hive\Software\Microsoft\Windows\CurrentVersion\App Paths\Nexium.exe"
+$classes = "$hive\Software\Classes"
+
+function Set-Value([string]$key, [string]$name, $value, [string]$kind = 'String') {
+  if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force | Out-Null }
+  if ($name -eq '') { Set-Item -LiteralPath $key -Value $value }
+  else { New-ItemProperty -LiteralPath $key -Name $name -Value $value -PropertyType $kind -Force | Out-Null }
+}
+function Remove-Key([string]$key) {
+  if (Test-Path -LiteralPath $key) { Remove-Item -LiteralPath $key -Recurse -Force }
+}
+function Get-Default([string]$key) {
+  if (-not (Test-Path -LiteralPath $key)) { return $null }
+  return (Get-Item -LiteralPath $key).GetValue('')
+}
+function Shortcut-Paths {
+  $programs = if ($machine) { [Environment]::GetFolderPath('CommonPrograms') } else { [Environment]::GetFolderPath('Programs') }
+  $desktop = if ($machine) { [Environment]::GetFolderPath('CommonDesktopDirectory') } else { [Environment]::GetFolderPath('DesktopDirectory') }
+  return @((Join-Path $programs 'Nexium.lnk'), (Join-Path $desktop 'Nexium.lnk'))
+}
+function Notify-Shell {
+  Add-Type -Namespace Nexium -Name Shell -MemberDefinition '[DllImport("shell32.dll")] public static extern void SHChangeNotify(int e, uint f, IntPtr a, IntPtr b);'
+  [Nexium.Shell]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+}
+function Edit-Path([bool]$add) {
+  $target = if ($machine) { 'Machine' } else { 'User' }
+  $cur = [Environment]::GetEnvironmentVariable('Path', $target)
+  if (-not $cur) { $cur = '' }
+  $norm = $Dir.TrimEnd('\')
+  $parts = @($cur -split ';' | Where-Object { $_ -and ($_.TrimEnd('\') -ine $norm) })
+  if ($add) { $parts += $Dir }
+  [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), $target)
+}
+
+try {
+  switch ($Action) {
+    'is-admin' {
+      $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+      if ($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 0 } else { exit 1 }
+    }
+    'running' {
+      $hit = Get-Process -Name 'Nexium' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and ($_.Path -ieq $exe) }
+      if ($hit) { exit 1 } else { exit 0 }
+    }
+    'register' {
+      $kb = [int]((Get-ChildItem -LiteralPath $Dir -File | Measure-Object -Property Length -Sum).Sum / 1KB)
+      Set-Value $uninstKey 'DisplayName' 'Nexium'
+      Set-Value $uninstKey 'DisplayVersion' $Version
+      Set-Value $uninstKey 'Publisher' 'Nexium'
+      Set-Value $uninstKey 'DisplayIcon' "$exe,0"
+      Set-Value $uninstKey 'InstallLocation' $Dir
+      Set-Value $uninstKey 'UninstallString' "`"$uninstaller`" --uninstall --scope $Scope"
+      Set-Value $uninstKey 'QuietUninstallString' "`"$uninstaller`" --uninstall --silent --scope $Scope"
+      Set-Value $uninstKey 'URLInfoAbout' 'https://github.com/Bobism-2009/Nexium'
+      Set-Value $uninstKey 'NoModify' 1 'DWord'
+      Set-Value $uninstKey 'NoRepair' 1 'DWord'
+      Set-Value $uninstKey 'EstimatedSize' $kb 'DWord'
+      Set-Value $appPathKey '' $exe
+      Set-Value $appPathKey 'Path' $Dir
+    }
+    'associate' {
+      Set-Value "$classes\Nexium.nxa" '' 'Nexa Source File'
+      Set-Value "$classes\Nexium.nxa\DefaultIcon" '' "`"$exe`",0"
+      Set-Value "$classes\Nexium.nxa\shell\open\command" '' "`"$exe`" `"%1`""
+      Set-Value "$classes\.nxa\OpenWithProgids" 'Nexium.nxa' ''
+      Set-Value "$classes\Applications\Nexium.exe\shell\open\command" '' "`"$exe`" `"%1`""
+      Set-Value "$classes\Applications\Nexium.exe\SupportedTypes" '.nxa' ''
+      # Remember what .nxa pointed at (NexaC registers NexaC.SourceFile) so uninstall can put it back.
+      $prev = Get-Default "$classes\.nxa"
+      if ($prev -and $prev -ne 'Nexium.nxa') { Set-Value $uninstKey 'PreviousNxaHandler' $prev }
+      Set-Value "$classes\.nxa" '' 'Nexium.nxa'
+      Notify-Shell
+    }
+    'shortcuts' {
+      $shell = New-Object -ComObject WScript.Shell
+      $paths = Shortcut-Paths
+      $want = @($StartMenu, $Desktop)
+      for ($i = 0; $i -lt 2; $i++) {
+        if ($want[$i] -ne 1) { continue }
+        $lnk = $shell.CreateShortcut($paths[$i])
+        $lnk.TargetPath = $exe
+        $lnk.WorkingDirectory = $Dir
+        $lnk.IconLocation = "$exe,0"
+        $lnk.Description = 'Nexium - IDE for the Nexa language'
+        $lnk.Save()
+      }
+    }
+    'path-add' { Edit-Path $true }
+    'path-remove' { Edit-Path $false }
+    'unshortcuts' {
+      foreach ($p in (Shortcut-Paths)) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force } }
+    }
+    'unregister' {
+      $prev = $null
+      if (Test-Path -LiteralPath $uninstKey) { $prev = (Get-Item -LiteralPath $uninstKey).GetValue('PreviousNxaHandler') }
+      if ((Get-Default "$classes\.nxa") -eq 'Nexium.nxa') {
+        if ($prev -and (Test-Path -LiteralPath "$classes\$prev")) { Set-Value "$classes\.nxa" '' $prev }
+        else { Set-Item -LiteralPath "$classes\.nxa" -Value '' }
+      }
+      $owp = "$classes\.nxa\OpenWithProgids"
+      if (Test-Path -LiteralPath $owp) { Remove-ItemProperty -LiteralPath $owp -Name 'Nexium.nxa' -ErrorAction SilentlyContinue }
+      Remove-Key "$classes\Nexium.nxa"
+      Remove-Key "$classes\Applications\Nexium.exe"
+      Remove-Key $appPathKey
+      Remove-Key $uninstKey
+      Notify-Shell
+    }
+    'browse' {
+      Add-Type -AssemblyName System.Windows.Forms
+      $owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true }
+      $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+      $dlg.Description = 'Choose where to install Nexium'
+      $dlg.ShowNewFolderButton = $true
+      if ($Dir -and (Test-Path -LiteralPath (Split-Path $Dir))) { $dlg.SelectedPath = Split-Path $Dir }
+      if ($dlg.ShowDialog($owner) -eq 'OK') { [IO.File]::WriteAllText($Out, $dlg.SelectedPath); exit 0 }
+      exit 1
+    }
+    'elevate' {
+      Start-Process -FilePath $Target -ArgumentList $ArgList -Verb RunAs
+    }
+    'install-nexa' {
+      # Latest NexaC release from GitHub, installed with NexaC's own installer
+      # (which also sets up the C++ toolchain NexaC needs). It runs in its own
+      # console window so its progress is visible.
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+      $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/Bobism-2009/Nexa-Lang/releases/latest' -Headers @{ 'User-Agent' = 'NexiumSetup' }
+      $asset = $rel.assets | Where-Object { $_.name -like '*Windows.zip' } | Select-Object -First 1
+      if (-not $asset) { exit 4 }
+      $work = Join-Path $env:TEMP ("nexium-nexa-" + $PID)
+      New-Item -ItemType Directory -Path $work -Force | Out-Null
+      $zip = Join-Path $work $asset.name
+      Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip -UseBasicParsing
+      Expand-Archive -LiteralPath $zip -DestinationPath $work -Force
+      $inst = Get-ChildItem -LiteralPath $work -Recurse -Filter 'Installer.exe' | Select-Object -First 1
+      if (-not $inst) { exit 4 }
+      # Menu choice 2 is the per-user install; --system is the all-users one.
+      # The trailing blank line answers the closing "Press Enter" prompt.
+      $answers = Join-Path $work 'answers.txt'
+      [IO.File]::WriteAllText($answers, "2`r`n`r`n")
+      $argsList = if ($machine) { @('--system') } else { @() }
+      $p = Start-Process -FilePath $inst.FullName -ArgumentList $argsList -WorkingDirectory $inst.DirectoryName -RedirectStandardInput $answers -Wait -PassThru
+      Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+      $want = if ($machine) { Join-Path $env:ProgramFiles 'NexaC\NexaC.exe' } else { Join-Path $env:LOCALAPPDATA 'NexaC\NexaC.exe' }
+      if (Test-Path -LiteralPath $want) { exit 0 } else { exit 1 }
+    }
+    default { exit 3 }
+  }
+  exit 0
+} catch {
+  exit 2
+}
+)PS";
+
+fn b01(v: bool): string {
+    if (v) return "1";
+    return "0";
+}
+
+fn helper(action: string): int {
+    return os.spawn_wait("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                         "-File", helper_ps, "-Action", action, "-Dir", install_dir, "-Scope", scope,
+                         "-Version", VERSION, "-Desktop", b01(opt_desktop), "-StartMenu", b01(opt_startmenu),
+                         "-Out", helper_out, "-Target", elevate_target, "-ArgList", elevate_args);
+}
+
+fn join(a: string, b: string): string {
+    if (a.ends_with("\\") || a.ends_with("/")) return a + b;
+    return a + "\\" + b;
+}
+
+// Trailing backslashes would escape the closing quote of a spawned argument.
+fn clean_dir(d: string): string {
+    let s = d.trim().replace("/", "\\");
+    while (len(s) > 3 && s.ends_with("\\")) {
+        s = s.substring(0, len(s) - 1);
+    }
+    return s;
+}
+
+fn default_dir(): string {
+    if (scope == "Machine") {
+        let pf = os.getenv("ProgramFiles");
+        if (pf == "") pf = "C:\\Program Files";
+        return join(pf, "Nexium");
+    }
+    return join(join(os.getenv("LOCALAPPDATA"), "Programs"), "Nexium");
+}
+
+// ---------------------------------------------------------------------------
+// Payload: <stub><file>...<manifest><12-char manifest length>NXPK1
+// Manifest lines are "name|offset|size".
+// ---------------------------------------------------------------------------
+fn load_payload(): bool {
+    self_data = os.load(os.executable());
+    let n = len(self_data);
+    if (n < 17) return false;
+    if (self_data.substring(n - 5, 5) != "NXPK1") return false;
+    let mlen = (int)self_data.substring(n - 17, 12).trim();
+    if (mlen <= 0 || mlen > n - 17) return false;
+    let manifest = self_data.substring(n - 17 - mlen, mlen);
+    for (line in manifest.split("\n")) {
+        if (line.trim() == "") continue;
+        let parts = line.split("|");
+        if (len(parts) != 3) continue;
+        pk_names.push(parts[0]);
+        pk_offs.push((int)parts[1]);
+        pk_sizes.push((int)parts[2]);
+    }
+    return len(pk_names) > 0;
+}
+
+fn has_file(name: string): bool {
+    for (i, len(pk_names)) {
+        if (pk_names[i] == name) return true;
+    }
+    return false;
+}
+
+fn payload(name: string): string {
+    for (i, len(pk_names)) {
+        if (pk_names[i] == name) return self_data.substring(pk_offs[i], pk_sizes[i]);
+    }
+    return "";
+}
+
+fn pad12(n: int): string {
+    let s = (string)n;
+    while (len(s) < 12) s = " " + s;
+    return s;
+}
+
+// The uninstaller is the stub plus the icon: everything but the payload it no longer needs.
+fn uninstaller_image(): string {
+    let data = payload("stub");
+    let manifest = "stub|0|" + (string)len(data) + "\n";
+    if (has_file("nexium.ico")) {
+        let ico = payload("nexium.ico");
+        manifest += "nexium.ico|" + (string)len(data) + "|" + (string)len(ico) + "\n";
+        data += ico;
+    }
+    return data + manifest + pad12(len(manifest)) + "NXPK1";
+}
+
+fn byte_at(s: string, i: int): int {
+    return (int)(unsigned char)s[i];
+}
+
+fn u32_at(s: string, i: int): int {
+    return byte_at(s, i) + byte_at(s, i + 1) * 256 + byte_at(s, i + 2) * 65536 + byte_at(s, i + 3) * 16777216;
+}
+
+// Picks the 128px PNG out of nexium.ico (or the largest one under it).
+fn load_logo() {
+    let ico = payload("nexium.ico");
+    if (len(ico) < 6) return;
+    let count = byte_at(ico, 4) + byte_at(ico, 5) * 256;
+    let best = -1;
+    let best_w = 0;
+    for (i, count) {
+        let e = 6 + i * 16;
+        if (e + 16 > len(ico)) break;
+        let w = byte_at(ico, e);
+        if (w == 0) w = 256;
+        if (w <= 128 && w > best_w) {
+            best_w = w;
+            best = e;
+        }
+    }
+    if (best < 0) return;
+    let size = u32_at(ico, best + 8);
+    let off = u32_at(ico, best + 12);
+    if (off + size > len(ico)) return;
+    logo = gfx.decode(ico.substring(off, size));
+}
+
+// ---------------------------------------------------------------------------
+// Drawing helpers
+// ---------------------------------------------------------------------------
+fn fill(x: int, y: int, w: int, h: int, c: int) {
+    gfx.fill(x, y, w, h, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+}
+
+fn fill_round(x: int, y: int, w: int, h: int, r: int, c: int) {
+    gfx.fill_round_rect(x, y, w, h, r, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+}
+
+fn outline_round(x: int, y: int, w: int, h: int, r: int, c: int) {
+    gfx.round_rect(x, y, w, h, r, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+}
+
+fn line(x1: int, y1: int, x2: int, y2: int, c: int, t: int) {
+    gfx.line(x1, y1, x2, y2, (c >> 16) & 255, (c >> 8) & 255, c & 255, t);
+}
+
+fn text(x: int, y: int, s: string, c: int, scale: int) {
+    gfx.text(x, y, s, (c >> 16) & 255, (c >> 8) & 255, c & 255, scale);
+}
+
+fn dot(cx: int, cy: int, r: int, c: int) {
+    gfx.fill_circle(cx, cy, r, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+}
+
+fn ring(cx: int, cy: int, r: int, c: int) {
+    gfx.circle(cx, cy, r, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+}
+
+fn check_mark(x: int, y: int, c: int) {
+    line(x, y + 5, x + 4, y + 9, c, 2);
+    line(x + 4, y + 9, x + 11, y, c, 2);
+}
+
+fn cross_mark(x: int, y: int, c: int) {
+    line(x, y, x + 9, y + 9, c, 2);
+    line(x, y + 9, x + 9, y, c, 2);
+}
+
+// Text that no longer fits keeps its end, which is the informative part of a path.
+fn fit(s: string, max_chars: int): string {
+    if (len(s) <= max_chars) return s;
+    return "..." + s.substring(len(s) - (max_chars - 3), max_chars - 3);
+}
+
+// Word-wrapped paragraph at scale 2; returns the height it took.
+fn para(x: int, y: int, s: string, max_chars: int, c: int): int {
+    let lines = 0;
+    let cur = "";
+    for (w in s.split(" ")) {
+        if (cur == "") {
+            cur = w;
+        } else if (len(cur) + 1 + len(w) <= max_chars) {
+            cur += " " + w;
+        } else {
+            text(x, y + lines * 22, cur, c, 2);
+            lines++;
+            cur = w;
+        }
+    }
+    if (cur != "") {
+        text(x, y + lines * 22, cur, c, 2);
+        lines++;
+    }
+    return lines * 22;
+}
+
+// ---------------------------------------------------------------------------
+// Widgets (immediate mode)
+// ---------------------------------------------------------------------------
+fn inside(x: int, y: int, w: int, h: int): bool {
+    return mx >= x && mx < x + w && my >= y && my < y + h;
+}
+
+fn clicked(x: int, y: int, w: int, h: int): bool {
+    return released && inside(x, y, w, h) && press_x >= x && press_x < x + w && press_y >= y && press_y < y + h;
+}
+
+fn button(x: int, y: int, w: int, h: int, label: string, primary: bool, enabled: bool): bool {
+    let hov = enabled && inside(x, y, w, h);
+    let bg = 0x2D2D2D;
+    let fg = 0xE0E0E0;
+    if (primary) {
+        bg = 0x0E639C;
+        if (hov) bg = 0x1177BB;
+        fg = 0xFFFFFF;
+    } else if (hov) {
+        bg = 0x3C3C3C;
+    }
+    if (!enabled) {
+        bg = 0x252525;
+        fg = 0x6A6A6A;
+    }
+    fill_round(x, y, w, h, 5, bg);
+    if (!primary) outline_round(x, y, w, h, 5, 0x454545);
+    let tw = gfx.text_width(label, 2);
+    text(x + (w - tw) / 2, y + (h - 14) / 2, label, fg, 2);
+    return enabled && clicked(x, y, w, h);
+}
+
+fn checkbox(x: int, y: int, label: string, v: bool): bool {
+    let tw = gfx.text_width(label, 2);
+    let hov = inside(x, y - 2, 30 + tw, 24);
+    if (v) {
+        fill_round(x, y, 20, 20, 4, 0x0E639C);
+        check_mark(x + 4, y + 5, 0xFFFFFF);
+    } else {
+        fill_round(x, y, 20, 20, 4, 0x252526);
+        outline_round(x, y, 20, 20, 4, hov ? 0x0E8CE8 : 0x5A5A5A);
+    }
+    text(x + 32, y + 3, label, hov ? 0xFFFFFF : 0xD4D4D4, 2);
+    if (clicked(x, y - 2, 30 + tw, 24)) return !v;
+    return v;
+}
+
+fn radio(x: int, y: int, label: string, detail: string, selected: bool): bool {
+    let tw = gfx.text_width(label, 2);
+    let hov = inside(x, y - 2, 30 + tw + 12 + gfx.text_width(detail, 2), 24);
+    ring(x + 10, y + 10, 10, (selected || hov) ? 0x0E8CE8 : 0x5A5A5A);
+    if (selected) dot(x + 10, y + 10, 5, 0x0E8CE8);
+    text(x + 32, y + 3, label, hov ? 0xFFFFFF : 0xD4D4D4, 2);
+    text(x + 32 + tw + 12, y + 3, detail, 0x7A7A7A, 2);
+    return clicked(x, y - 2, 30 + tw + 12 + gfx.text_width(detail, 2), 24);
+}
+
+// Single-line editor for the install folder.
+fn dir_field(x: int, y: int, w: int, h: int) {
+    if (released) field_focus = clicked(x, y, w, h);
+    if (field_focus) {
+        let typed = gfx.typed();
+        if (typed != "") {
+            install_dir += typed;
+            dir_edited = true;
+        }
+        if (gfx.pressed("backspace") == 1 && len(install_dir) > 0) {
+            install_dir = install_dir.substring(0, len(install_dir) - 1);
+            dir_edited = true;
+        }
+    }
+    fill_round(x, y, w, h, 4, 0x252526);
+    outline_round(x, y, w, h, 4, field_focus ? 0x0E8CE8 : 0x454545);
+    let shown = fit(install_dir, (w - 24) / 12);
+    text(x + 10, y + (h - 14) / 2, shown, 0xE0E0E0, 2);
+    if (field_focus && ((int)(time.now_ms() / 500.0)) % 2 == 0) {
+        let cx = x + 10 + gfx.text_width(shown, 2) + 1;
+        fill(cx, y + 8, 2, h - 16, 0xE0E0E0);
+    }
+}
+
+fn progress_bar(x: int, y: int, w: int, done: int, total: int) {
+    fill_round(x, y, w, 12, 6, 0x2A2A2A);
+    if (total > 0 && done > 0) {
+        let fw = w * done / total;
+        if (fw < 12) fw = 12;
+        fill_round(x, y, fw, 12, 6, 0x0E8CE8);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chrome
+// ---------------------------------------------------------------------------
+fn draw_sidebar() {
+    fill(0, 0, SIDEBAR, H, 0x181818);
+    fill(SIDEBAR - 1, 0, 1, H, 0x2B2B2B);
+    let lx = SIDEBAR / 2 - 48;
+    if (logo != 0) {
+        gfx.blit(lx, 34, logo, 96, 96);
+    } else {
+        fill_round(lx, 34, 96, 96, 18, 0x0E639C);
+        text(lx + 30, 58, "N", 0xFFFFFF, 7);
+    }
+    let title = "Nexium";
+    text((SIDEBAR - gfx.text_width(title, 3)) / 2, 146, title, 0xF0F0F0, 3);
+    let sub = (uninstall_mode ? "Uninstall " : "Setup ") + VERSION;
+    text((SIDEBAR - gfx.text_width(sub, 2)) / 2, 178, sub, 0x8A8A8A, 2);
+
+    let labels = ["Welcome", "Options", "Install", "Finish"];
+    let current = page;
+    if (page == P_ERROR) current = P_PROGRESS;
+    if (uninstall_mode) {
+        labels = ["Confirm", "Remove", "Done"];
+        if (page == P_WELCOME) current = 0;
+        else if (page == P_PROGRESS) current = 1;
+        else current = 2;
+    }
+    for (i, len(labels)) {
+        let y = 244 + i * 44;
+        let cx = 44;
+        let cy = y + 8;
+        if (i < current) {
+            dot(cx, cy, 11, 0x0E639C);
+            check_mark(cx - 6, cy - 5, 0xFFFFFF);
+        } else if (i == current) {
+            dot(cx, cy, 11, page == P_ERROR ? 0xB33A3A : 0x0E8CE8);
+            text(cx - 5, cy - 7, (string)(i + 1), 0xFFFFFF, 2);
+        } else {
+            ring(cx, cy, 11, 0x4A4A4A);
+            text(cx - 5, cy - 7, (string)(i + 1), 0x6A6A6A, 2);
+        }
+        if (i + 1 < len(labels)) fill(cx, cy + 14, 1, 18, i < current ? 0x0E639C : 0x333333);
+        text(cx + 24, cy - 7, labels[i], i == current ? 0xF0F0F0 : 0x8A8A8A, 2);
+    }
+}
+
+fn draw_footer() {
+    fill(SIDEBAR, FOOT, W - SIDEBAR, H - FOOT, 0x181818);
+    fill(SIDEBAR, FOOT, W - SIDEBAR, 1, 0x2B2B2B);
+}
+
+fn page_title(s: string) {
+    text(CX, 40, s, 0xF0F0F0, 3);
+}
+
+// Status of the Nexa compiler Nexium drives for Run / Build.
+fn draw_nexa_status(y: int) {
+    fill_round(CX, y, W - CX - 32, 64, 6, 0x1B1B1C);
+    outline_round(CX, y, W - CX - 32, 64, 6, 0x2E2E2E);
+    if (nexa_path != "") {
+        dot(CX + 20, y + 20, 6, 0x4EC96B);
+        text(CX + 36, y + 13, "Nexa compiler found", 0xE0E0E0, 2);
+        text(CX + 36, y + 37, fit(nexa_path, 40), 0x8A8A8A, 2);
+    } else {
+        dot(CX + 20, y + 20, 6, 0xE0A040);
+        text(CX + 36, y + 13, "Nexa is not installed", 0xE0E0E0, 2);
+        opt_nexa = checkbox(CX + 36, y + 36, "Install the Nexa compiler too", opt_nexa);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Install steps
+// ---------------------------------------------------------------------------
+fn step_label(s: string): string {
+    switch (s) {
+        case "folder": return "Creating the install folder";
+        case "app": return "Copying Nexium.exe";
+        case "docs": return "Copying README and license";
+        case "uninstaller": return "Writing the uninstaller";
+        case "register": return "Registering with Windows";
+        case "associate": return "Associating .nxa files";
+        case "shortcuts": return "Creating shortcuts";
+        case "path": return "Adding Nexium to PATH";
+        case "nexa": return "Installing Nexa (see its window)";
+        case "refresh": return "Finishing up";
+        case "check": return "Checking that Nexium is closed";
+        case "unshortcuts": return "Removing shortcuts";
+        case "unregister": return "Removing registry entries";
+        case "unpath": return "Removing Nexium from PATH";
+        case "files": return "Removing program files";
+        case "settings": return "Removing your settings";
+        case "cleanup": return "Removing the uninstaller";
+        default: return s;
+    }
+}
+
+fn fail(msg: string) {
+    error_msg = msg;
+    page = P_ERROR;
+    exit_code = 1;
+}
+
+fn warn(msg: string) {
+    warnings.push(msg);
+}
+
+fn plan_install() {
+    steps = ["folder", "app", "docs", "uninstaller", "register"];
+    if (opt_assoc) steps.push("associate");
+    if (opt_desktop || opt_startmenu) steps.push("shortcuts");
+    if (opt_path) steps.push("path");
+    if (nexa_path == "" && opt_nexa) steps.push("nexa");
+    steps.push("refresh");
+    step_i = 0;
+    warnings = [];
+}
+
+fn plan_uninstall() {
+    steps = ["check", "unshortcuts", "unregister", "unpath", "files"];
+    if (opt_remove_settings) steps.push("settings");
+    steps.push("cleanup");
+    step_i = 0;
+    warnings = [];
+}
+
+fn write_file(name: string, data: string): bool {
+    return os.save(join(install_dir, name), data) == 1;
+}
+
+fn run_step(s: string) {
+    switch (s) {
+        case "folder":
+            if (file.isdir(install_dir) == 0) file.mkdir(install_dir);
+            if (file.isdir(install_dir) == 0) {
+                fail("Could not create " + install_dir + ". Choose another folder, or install for all users as administrator.");
+            }
+            break;
+        case "app":
+            if (!write_file("Nexium.exe", payload("Nexium.exe"))) {
+                fail("Could not write Nexium.exe to " + install_dir + ". If Nexium is running, close it and try again.");
+                break;
+            }
+            // The runtime DLLs Nexium.exe links against go next to it.
+            for (name in pk_names) {
+                if (name.lower().ends_with(".dll") && !write_file(name, payload(name))) {
+                    fail("Could not write " + name + " to " + install_dir + ". If Nexium is running, close it and try again.");
+                    break;
+                }
+            }
+            break;
+        case "docs":
+            if (has_file("README.md") && !write_file("README.md", payload("README.md"))) warn("README.md was not copied.");
+            if (has_file("LICENSE") && !write_file("LICENSE.txt", payload("LICENSE"))) warn("LICENSE was not copied.");
+            break;
+        case "uninstaller":
+            if (!write_file("Uninstall.exe", uninstaller_image())) warn("The uninstaller could not be written.");
+            break;
+        case "register":
+            if (helper("register") != 0) warn("Nexium could not be added to Apps & features.");
+            break;
+        case "associate":
+            if (helper("associate") != 0) warn(".nxa files could not be associated with Nexium.");
+            break;
+        case "shortcuts":
+            if (helper("shortcuts") != 0) warn("Some shortcuts could not be created.");
+            break;
+        case "path":
+            if (helper("path-add") != 0) warn("Nexium could not be added to PATH.");
+            break;
+        case "nexa":
+            if (helper("install-nexa") == 0) {
+                nexa_path = "installed";
+            } else {
+                warn("The Nexa compiler could not be installed. Get it from github.com/Bobism-2009/Nexa-Lang.");
+            }
+            break;
+        case "refresh":
+            os.spawn_wait("ie4uinit.exe", "-show");
+            break;
+
+        case "check":
+            if (helper("running") == 1) fail("Nexium is still running. Close it, then run the uninstaller again.");
+            break;
+        case "unshortcuts":
+            if (helper("unshortcuts") != 0) warn("Some shortcuts could not be removed.");
+            break;
+        case "unregister":
+            if (helper("unregister") != 0) warn("Some registry entries could not be removed.");
+            break;
+        case "unpath":
+            if (helper("path-remove") != 0) warn("PATH could not be updated.");
+            break;
+        case "files":
+            // Only what setup installed: a custom folder may hold the user's own files.
+            for (name in ["Nexium.exe", "README.md", "LICENSE.txt", "imgui.ini", "libstdc++-6.dll",
+                          "libgcc_s_seh-1.dll", "libmcfgthread-2.dll", "libwinpthread-1.dll"]) {
+                let p = join(install_dir, name);
+                if (file.exists(p) == 1 && file.remove(p) == 0) warn("Could not remove " + p);
+            }
+            break;
+        case "settings":
+            let cfg = join(os.getenv("APPDATA"), "Nexium");
+            if (file.exists(cfg) == 1 && file.remove_all(cfg) == 0) warn("Could not remove " + cfg);
+            break;
+        case "cleanup":
+            schedule_self_delete();
+            break;
+    }
+}
+
+// A running program cannot delete itself, so a detached cmd script waits for
+// this process to exit, removes Uninstall.exe and the folder if it is empty,
+// then deletes itself.
+fn schedule_self_delete() {
+    let tmp = join(os.tempdir(), "nexium-uninstall-" + (string)os.getpid() + ".cmd");
+    let un = join(install_dir, "Uninstall.exe");
+    let script = "@echo off\r\n" +
+                 "for /l %%i in (1,1,30) do (\r\n" +
+                 "  del /f /q \"" + un + "\" >nul 2>&1\r\n" +
+                 "  if not exist \"" + un + "\" goto gone\r\n" +
+                 "  ping -n 2 127.0.0.1 >nul\r\n" +
+                 ")\r\n" +
+                 ":gone\r\n" +
+                 "rmdir \"" + install_dir + "\" >nul 2>&1\r\n" +
+                 "del /f /q \"%~f0\" >nul 2>&1\r\n";
+    if (os.save(tmp, script) == 1) {
+        os.spawn("cmd.exe", "/c", tmp);
+    } else {
+        warn("Delete " + install_dir + " yourself to finish.");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Elevation for all-users installs
+// ---------------------------------------------------------------------------
+fn is_admin(): bool {
+    return helper("is-admin") == 0;
+}
+
+// Spaces become '|' so the path survives Start-Process without nested
+// quoting; '|' cannot occur in a Windows path.
+fn relaunch_elevated(): bool {
+    elevate_target = os.executable();
+    let a = "--elevated --scope " + scope + " --dir " + install_dir.replace(" ", "|");
+    if (uninstall_mode) {
+        a = "--uninstall " + a + " --settings " + b01(opt_remove_settings);
+    } else {
+        a += " --desktop " + b01(opt_desktop) + " --startmenu " + b01(opt_startmenu) +
+             " --assoc " + b01(opt_assoc) + " --path " + b01(opt_path) + " --nexa " + b01(opt_nexa);
+    }
+    elevate_args = a;
+    let ok = helper("elevate") == 0;
+    elevate_target = "none";
+    elevate_args = "none";
+    return ok;
+}
+
+// Checks run when Install / Uninstall is pressed. Returns true to go ahead
+// in this process.
+fn preflight(): bool {
+    install_dir = clean_dir(install_dir);
+    if (!uninstall_mode) {
+        let absolute = len(install_dir) >= 3 && install_dir[1] == ':' && install_dir[2] == '\\';
+        if (!absolute) {
+            notice = "Enter a full folder path, like C:\\Tools\\Nexium.";
+            return false;
+        }
+        if (len(install_dir) <= 3) {
+            notice = "Choose a folder, not the root of a drive.";
+            return false;
+        }
+    }
+    if (helper("running") == 1) {
+        notice = "Nexium is running from this folder. Close it first.";
+        return false;
+    }
+    if (scope == "Machine" && !elevated && !is_admin()) {
+        if (relaunch_elevated()) {
+            quit = true;
+        } else {
+            notice = "Administrator permission was not granted.";
+        }
+        return false;
+    }
+    notice = "";
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Pages
+// ---------------------------------------------------------------------------
+fn page_welcome() {
+    page_title("Welcome to Nexium");
+    let y = 96;
+    y += para(CX, y, "This will install Nexium " + VERSION + ", a fast native IDE for the Nexa programming language.", 44, 0xC8C8C8);
+    y += 18;
+    let bullets = ["Nexa highlighting and live errors", "Terminal with one-key Run and Build", "Quick open, outline and search", "A built-in AI coding agent"];
+    for (bl in bullets) {
+        dot(CX + 6, y + 7, 3, 0x0E8CE8);
+        text(CX + 20, y, bl, 0xD4D4D4, 2);
+        y += 28;
+    }
+    draw_nexa_status(360);
+
+    let next = button(W - 32 - 120 - 12 - 120, FOOT + 18, 120, 36, "Next", true, true);
+    let cancel = button(W - 32 - 120, FOOT + 18, 120, 36, "Cancel", false, true);
+    if (next || key_enter) page = P_OPTIONS;
+    if (cancel || key_escape) quit = true;
+}
+
+fn page_options() {
+    page_title("Install options");
+    text(CX, 92, "Install for", 0x8A8A8A, 2);
+    let prev_scope = scope;
+    if (radio(CX, 118, "Just me", "no admin needed", scope == "User")) scope = "User";
+    if (radio(CX, 150, "All users", "needs admin", scope == "Machine")) scope = "Machine";
+    if (scope != prev_scope && !dir_edited) install_dir = default_dir();
+
+    text(CX, 196, "Location", 0x8A8A8A, 2);
+    let fw = W - CX - 32 - 120 - 12;
+    dir_field(CX, 220, fw, 38);
+    if (button(W - 32 - 120, 221, 120, 36, "Browse", false, true)) {
+        if (helper("browse") == 0) {
+            let picked = clean_dir(file.read(helper_out));
+            if (picked != "") {
+                if (!picked.lower().ends_with("nexium")) picked = join(picked, "Nexium");
+                install_dir = picked;
+                dir_edited = true;
+            }
+        }
+    }
+    let y = 270;
+    if (notice != "") {
+        text(CX, y, fit(notice, 44), 0xF48771, 2);
+    } else if (file.exists(join(install_dir, "Nexium.exe")) == 1) {
+        text(CX, y, "Nexium is installed here; it will be updated.", 0x6CB6FF, 2);
+    }
+
+    opt_startmenu = checkbox(CX, 306, "Add to the Start menu", opt_startmenu);
+    opt_desktop = checkbox(CX, 338, "Create a desktop shortcut", opt_desktop);
+    opt_assoc = checkbox(CX, 370, "Open .nxa files with Nexium", opt_assoc);
+    opt_path = checkbox(CX, 402, "Add Nexium to PATH", opt_path);
+
+    let bx = W - 32 - 120;
+    let back = button(bx - 2 * 132, FOOT + 18, 120, 36, "Back", false, true);
+    let install = button(bx - 132, FOOT + 18, 120, 36, "Install", true, install_dir.trim() != "");
+    let cancel = button(bx, FOOT + 18, 120, 36, "Cancel", false, true);
+    if (back) {
+        notice = "";
+        page = P_WELCOME;
+    }
+    if (cancel || key_escape) quit = true;
+    if ((install || (key_enter && !field_focus)) && install_dir.trim() != "") {
+        if (preflight()) {
+            plan_install();
+            page = P_PROGRESS;
+        }
+    }
+}
+
+fn page_progress() {
+    page_title(uninstall_mode ? "Removing Nexium" : "Installing Nexium");
+    let total = len(steps);
+    let label = step_i < total ? step_label(steps[step_i]) + "..." : "Done";
+    text(CX, 100, label, 0xD4D4D4, 2);
+    progress_bar(CX, 132, W - CX - 32, step_i, total);
+    for (i, step_i) {
+        let y = 172 + i * 26;
+        check_mark(CX + 2, y + 2, 0x4EC96B);
+        text(CX + 24, y, step_label(steps[i]), 0x8A8A8A, 2);
+    }
+    button(W - 32 - 120, FOOT + 18, 120, 36, "Cancel", false, false);
+}
+
+fn draw_warnings(y: int): int {
+    for (w in warnings) {
+        cross_mark(CX + 2, y + 3, 0xE0A040);
+        y += para(CX + 22, y, w, 42, 0xE0A040);
+    }
+    return y;
+}
+
+fn page_finish() {
+    let bx = W - 32 - 120;
+    if (uninstall_mode) {
+        page_title("Nexium was removed");
+        let y = 96;
+        y += para(CX, y, "Nexium has been uninstalled from this computer.", 44, 0xC8C8C8);
+        y += 12;
+        draw_warnings(y);
+        if (button(bx, FOOT + 18, 120, 36, "Close", true, true) || key_enter || key_escape) quit = true;
+        return;
+    }
+    page_title("Nexium is ready");
+    let y = 96;
+    y += para(CX, y, "Nexium " + VERSION + " was installed to:", 44, 0xC8C8C8);
+    text(CX, y + 4, fit(install_dir, 44), 0x6CB6FF, 2);
+    y += 40;
+    y = draw_warnings(y);
+    if (nexa_path == "") {
+        y += 8;
+        y += para(CX, y, "Install the Nexa compiler to run and build programs from Nexium.", 44, 0xC8C8C8);
+        if (button(CX, y + 8, 140, 36, "Get Nexa", false, true)) os.open(NEXA_URL);
+    }
+    opt_launch = checkbox(CX, FOOT - 44, "Launch Nexium now", opt_launch);
+    if (button(bx, FOOT + 18, 120, 36, "Finish", true, true) || key_enter) {
+        // Through Explorer so Nexium does not inherit this process's elevation.
+        if (opt_launch) os.spawn("explorer.exe", join(install_dir, "Nexium.exe"));
+        quit = true;
+    }
+}
+
+fn page_error() {
+    page_title(uninstall_mode ? "Uninstall stopped" : "Setup could not finish");
+    let y = 96;
+    y += para(CX, y, error_msg, 44, 0xE0E0E0);
+    draw_warnings(y + 12);
+    let bx = W - 32 - 120;
+    let back = button(bx - 132, FOOT + 18, 120, 36, uninstall_mode ? "Retry" : "Back", false, true);
+    let close = button(bx, FOOT + 18, 120, 36, "Close", true, true);
+    if (back) {
+        exit_code = 0;
+        if (uninstall_mode) page = P_WELCOME;
+        else page = P_OPTIONS;
+    }
+    if (close || key_escape) quit = true;
+}
+
+fn page_confirm_uninstall() {
+    page_title("Uninstall Nexium");
+    let y = 96;
+    y += para(CX, y, "This removes Nexium, its shortcuts, its .nxa file association and its PATH entry from:", 44, 0xC8C8C8);
+    text(CX, y + 4, fit(install_dir, 44), 0x6CB6FF, 2);
+    y += 44;
+    y += para(CX, y, "Your Nexa projects are not touched.", 44, 0x8A8A8A);
+    opt_remove_settings = checkbox(CX, y + 20, "Also remove my Nexium settings", opt_remove_settings);
+    if (notice != "") text(CX, y + 64, fit(notice, 44), 0xF48771, 2);
+
+    let bx = W - 32 - 120;
+    let go = button(bx - 132, FOOT + 18, 120, 36, "Uninstall", true, true);
+    let cancel = button(bx, FOOT + 18, 120, 36, "Cancel", false, true);
+    if (cancel || key_escape) quit = true;
+    if (go || key_enter) {
+        if (preflight()) {
+            plan_uninstall();
+            page = P_PROGRESS;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+fn parse_args(args: []string) {
+    let i = 1;
+    while (i < len(args)) {
+        let a = args[i];
+        let v = i + 1 < len(args) ? args[i + 1] : "";
+        if (a == "--uninstall") uninstall_mode = true;
+        else if (a == "--silent" || a == "/S") silent = true;
+        else if (a == "--elevated") elevated = true;
+        else if (a == "--scope") {
+            scope = "User";
+            if (v == "Machine") scope = "Machine";
+            i++;
+        }
+        else if (a == "--dir") { install_dir = v.replace("|", " "); dir_edited = true; i++; }
+        else if (a == "--desktop") { opt_desktop = (v == "1"); i++; }
+        else if (a == "--startmenu") { opt_startmenu = (v == "1"); i++; }
+        else if (a == "--assoc") { opt_assoc = (v == "1"); i++; }
+        else if (a == "--path") { opt_path = (v == "1"); i++; }
+        else if (a == "--settings") { opt_remove_settings = (v == "1"); i++; }
+        else if (a == "--nexa") { opt_nexa = (v == "1"); i++; }
+        i++;
+    }
+}
+
+fn nexa_flag_given(args: []string): bool {
+    for (a in args) {
+        if (a == "--nexa") return true;
+    }
+    return false;
+}
+
+fn run_all_steps() {
+    while (step_i < len(steps) && page == P_PROGRESS) {
+        run_step(steps[step_i]);
+        step_i++;
+    }
+    if (page == P_PROGRESS) page = P_FINISH;
+}
+
+fn main(args: []string) {
+    parse_args(args);
+    if (!load_payload()) {
+        os.messagebox("This setup file is damaged or incomplete. Download NexiumSetup.exe again.", "Nexium Setup");
+        os.exit(1);
+    }
+    if (!uninstall_mode && !has_file("Nexium.exe")) {
+        os.messagebox("This setup file does not contain Nexium.exe.", "Nexium Setup");
+        os.exit(1);
+    }
+    helper_ps = join(os.tempdir(), "nexium-setup-" + (string)os.getpid() + ".ps1");
+    helper_out = join(os.tempdir(), "nexium-setup-" + (string)os.getpid() + ".txt");
+    if (os.save(helper_ps, HELPER_SCRIPT) == 0) {
+        os.messagebox("Could not write to the temp folder.", "Nexium Setup");
+        os.exit(1);
+    }
+    if (install_dir == "") {
+        if (uninstall_mode) install_dir = clean_dir(os.exe_dir());
+        else install_dir = default_dir();
+    }
+    install_dir = clean_dir(install_dir);
+    nexa_path = os.which("NexaC");
+    if (nexa_path == "") nexa_path = os.which("Nexa");
+
+    if (silent) {
+        if (!nexa_flag_given(args)) opt_nexa = false;
+        if (scope == "Machine" && !is_admin()) {
+            file.remove(helper_ps);
+            os.exit(5);
+        }
+        if (uninstall_mode) plan_uninstall();
+        else plan_install();
+        page = P_PROGRESS;
+        run_all_steps();
+        file.remove(helper_ps);
+        file.remove(helper_out);
+        os.exit(exit_code);
+    }
+
+    // An elevated relaunch starts straight at the progress page.
+    if (elevated) {
+        if (uninstall_mode) plan_uninstall();
+        else plan_install();
+        page = P_PROGRESS;
+    }
+
+    let window_title: string = uninstall_mode ? "Uninstall Nexium" : "Nexium Setup";
+    gfx.open(window_title, W, H, 1);
+    gfx.maxfps(60);
+    load_logo();
+    if (logo != 0) gfx.icon(logo);
+
+    while (!quit) {
+        gfx.poll();
+        if (gfx.closed() == 1) {
+            // Closing mid-install finishes the remaining steps rather than
+            // leaving a half-registered install behind.
+            if (page == P_PROGRESS) run_all_steps();
+            break;
+        }
+        mx = gfx.mouse_x();
+        my = gfx.mouse_y();
+        let down = gfx.mouse("left") == 1;
+        if (down && !mouse_prev) {
+            press_x = mx;
+            press_y = my;
+        }
+        released = (!down && mouse_prev);
+        mouse_prev = down;
+        key_enter = (gfx.pressed("enter") == 1);
+        key_escape = (gfx.pressed("escape") == 1);
+
+        fill(0, 0, W, H, 0x1E1E1E);
+        draw_sidebar();
+        draw_footer();
+        if (page == P_WELCOME) {
+            if (uninstall_mode) page_confirm_uninstall();
+            else page_welcome();
+        } else if (page == P_OPTIONS) {
+            page_options();
+        } else if (page == P_PROGRESS) {
+            page_progress();
+        } else if (page == P_FINISH) {
+            page_finish();
+        } else {
+            page_error();
+        }
+        gfx.present();
+
+        // One step per frame, after the frame showing it has been presented.
+        if (page == P_PROGRESS) {
+            if (step_i < len(steps)) {
+                run_step(steps[step_i]);
+                if (page == P_PROGRESS) step_i++;
+            } else {
+                page = P_FINISH;
+            }
+        }
+    }
+    file.remove(helper_ps);
+    file.remove(helper_out);
+    os.exit(exit_code);
+}

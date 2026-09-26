@@ -1,0 +1,49 @@
+// Packs the Nexium setup: appends files to the compiled setup stub so the
+// result is one self-extracting NexiumSetup.exe.
+//
+//   pack <output.exe> <setup-stub.exe> <file>...
+//
+// Layout: <stub><file>...<manifest><12-char manifest length>NXPK1
+// Each manifest line is "name|offset|size"; the first names the stub itself.
+// setup.nxa reads the same layout back from its own executable.
+#include <std/io>
+#include <std/os>
+#include <std/file>
+
+fn pad12(n: int): string {
+    let s = (string)n;
+    while (len(s) < 12) s = " " + s;
+    return s;
+}
+
+fn main(args: []string) {
+    if (len(args) < 4) {
+        io.println("usage: pack <output.exe> <setup-stub.exe> <file>...");
+        os.exit(2);
+    }
+    let out = args[1];
+    let data = os.load(args[2]);
+    if (len(data) == 0) {
+        io.println("pack: cannot read setup stub " + args[2]);
+        os.exit(1);
+    }
+    let manifest = "stub|0|" + (string)len(data) + "\n";
+    let i = 3;
+    while (i < len(args)) {
+        let path = args[i];
+        let bytes = os.load(path);
+        if (len(bytes) == 0) {
+            io.println("pack: cannot read " + path);
+            os.exit(1);
+        }
+        manifest += file.basename(path) + "|" + (string)len(data) + "|" + (string)len(bytes) + "\n";
+        data += bytes;
+        i++;
+    }
+    data += manifest + pad12(len(manifest)) + "NXPK1";
+    if (os.save(out, data) == 0) {
+        io.println("pack: cannot write " + out);
+        os.exit(1);
+    }
+    io.println("pack: wrote " + out + " (" + (string)len(data) + " bytes)");
+}
