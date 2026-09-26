@@ -80,6 +80,28 @@ enum class HighlightKind {
     Punct,
     Builtin,
     TypeName,
+    Property,
+    EnumMember,
+    Invalid,
+    Todo,
+    Interp,
+    Bracket1,
+    Bracket2,
+    Bracket3,
+    Heading,
+    Strong,
+    Emphasis,
+    Link,
+};
+
+enum class Lang {
+    Plain,
+    Nexa,
+    Json,
+    Cpp,
+    Markdown,
+    Ini,
+    Shell,
 };
 
 enum class ActivityView {
@@ -110,6 +132,35 @@ enum class BottomTab {
     Output,
 };
 
+enum class EdCmd {
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+    SelectLine,
+    ToggleComment,
+    DuplicateLine,
+    DeleteLine,
+    MoveLineUp,
+    MoveLineDown,
+    CopyLineUp,
+    CopyLineDown,
+    InsertLineBelow,
+    InsertLineAbove,
+    Indent,
+    Outdent,
+    GotoDefinition,
+    JumpToBracket,
+    FindNext,
+    FindPrev,
+    TrimTrailingWhitespace,
+    UpperCase,
+    LowerCase,
+    TriggerSuggest,
+};
+
 enum class DefKind {
     Function,
     Struct,
@@ -127,6 +178,9 @@ struct UndoRec {
     int pos = 0;
     std::string removed;
     std::string inserted;
+    int group = 0;          // records sharing a non-zero group undo as one step
+    int cursor_before = 0;
+    int anchor_before = 0;
 };
 
 struct IndexedDef {
@@ -141,6 +195,7 @@ struct Diagnostic {
     std::string path;
     int line = 1;
     std::string message;
+    bool error = true;
 };
 
 struct SearchHit {
@@ -164,10 +219,15 @@ struct TextBuffer {
     std::string name;
     std::string text;
     std::vector<int> lines;
+    int max_line_len = 0;
+    uint64_t version = 0;    // bumped on every text change
     std::vector<HighlightSpan> spans;
     std::vector<IndexedDef> outline;
     std::vector<UndoRec> undo;
     int undo_pos = 0;
+    int undo_group = 0;      // open group id while a compound edit is running
+    int undo_group_seq = 0;
+    int saved_undo_pos = 0;  // undo position that matches the file on disk
     int cursor = 0;
     int sel_anchor = 0;
     int preferred_col = 0;
@@ -179,6 +239,10 @@ struct TextBuffer {
     bool outline_dirty = true;
     bool is_nexa = false;
     bool is_json = false;
+    bool crlf = false;       // file used CRLF line endings; restored on save
+    Lang lang = Lang::Plain;
+    int last_cursor = 0;     // cursor as of last frame, to scroll it into view on jumps
+    bool reveal_center = false;
     double last_edit = 0.0;
     double last_type = 0.0;
 };
@@ -336,6 +400,14 @@ struct App {
     bool goto_open = false;
     bool palette_open = false;
     bool settings_modal = false;
+    bool find_case = false;
+    bool find_word = false;
+    bool find_focus = false;
+    bool quick_open = false;
+    int palette_sel = 0;
+    char quick_text[256] = {};
+    double pending_chord = 0.0;  // time of a Ctrl+K chord prefix
+    std::vector<std::string> quick_files;
     char find_text[256] = {};
     char replace_text[256] = {};
     char goto_text[64] = {};
@@ -381,7 +453,8 @@ std::string path_ext(const std::string& p);
 std::string path_norm(const std::string& p);
 bool path_is_nexa(const std::string& p);
 bool path_is_json(const std::string& p);
-bool file_read(const std::string& path, std::string& out, std::string* err = nullptr);
+bool file_read(const std::string& path, std::string& out, std::string* err = nullptr,
+               bool* had_crlf = nullptr);
 bool file_write(const std::string& path, const std::string& data, std::string* err = nullptr);
 bool file_exists(const std::string& path);
 bool dir_exists(const std::string& path);
@@ -406,9 +479,22 @@ ImU32 highlight_color(HighlightKind k);
 const char* highlight_name(HighlightKind k);
 void highlight_nexa(const std::string& src, std::vector<HighlightSpan>& out);
 void highlight_json(const std::string& src, std::vector<HighlightSpan>& out, bool nexa_manifest);
+void highlight_cpp(const std::string& src, std::vector<HighlightSpan>& out);
+void highlight_markdown(const std::string& src, std::vector<HighlightSpan>& out);
+void highlight_ini(const std::string& src, std::vector<HighlightSpan>& out);
+void highlight_shell(const std::string& src, const std::string& path, std::vector<HighlightSpan>& out);
+void highlight_source(Lang lang, const std::string& path, const std::string& src,
+                      std::vector<HighlightSpan>& out);
+Lang lang_for_path(const std::string& path);
+const char* lang_name(Lang l);
+const char* lang_line_comment(Lang l, const std::string& path);
 void index_nexa(const std::string& src, std::vector<IndexedDef>& out);
 void diagnose_nexa(const std::string& src, const std::string& path, std::vector<Diagnostic>& out);
-std::vector<std::string> completions_for(const TextBuffer& buf, int cursor, std::string& prefix);
+struct Completion {
+    std::string text;
+    HighlightKind kind = HighlightKind::Text;
+};
+std::vector<Completion> completions_for(const TextBuffer& buf, int cursor, std::string& prefix);
 
 void buffer_rebuild_lines(TextBuffer& b);
 void buffer_mark_nexa(TextBuffer& b);
@@ -416,7 +502,11 @@ void buffer_refresh(TextBuffer& b);
 int buffer_line_at(const TextBuffer& b, int pos);
 int buffer_col_at(const TextBuffer& b, int pos);
 int buffer_pos_at(const TextBuffer& b, int line, int col);
+int buffer_vcol_at(const TextBuffer& b, int pos);
+int buffer_pos_at_vcol(const TextBuffer& b, int line, int vcol);
 void buffer_apply(TextBuffer& b, int pos, int remove, const std::string& insert, bool coalesce);
+void buffer_begin_group(TextBuffer& b);
+void buffer_end_group(TextBuffer& b);
 void buffer_undo(TextBuffer& b);
 void buffer_redo(TextBuffer& b);
 void buffer_ensure_sel(TextBuffer& b);
@@ -425,9 +515,16 @@ void buffer_replace_sel(TextBuffer& b, const std::string& text);
 void buffer_move(TextBuffer& b, int pos, bool select);
 void buffer_move_line_col(TextBuffer& b, int line, int col, bool select);
 void buffer_delete_sel(TextBuffer& b);
+void buffer_set_text(TextBuffer& b, const std::string& text);
+void editor_exec(EdCmd cmd);
 void buffer_indent(TextBuffer& b, bool back);
 void buffer_toggle_comment(TextBuffer& b);
 void buffer_find_next(TextBuffer& b, const char* query, bool reverse);
+bool buffer_match_at(const TextBuffer& b, int pos, const std::string& q, bool match_case, bool whole_word);
+int buffer_replace_all(TextBuffer& b, const std::string& q, const std::string& r,
+                       bool match_case, bool whole_word);
+void buffer_reveal(TextBuffer& b, bool center);
+void workspace_files(std::vector<std::string>& out);
 bool open_path(const std::string& path, bool preview = false);
 bool save_buffer(int index, bool save_as = false);
 bool save_all();

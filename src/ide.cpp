@@ -451,7 +451,6 @@ void draw_editor_tabs(float strip_h) {
 
     const float chip_h = dp(26.0f);
     const float chip_y = origin.y + (strip_h - chip_h) * 0.5f;
-    float x = origin.x + 8.0f;
     int close_i = -1;
     const float pad_x  = 10.0f;
     const float icon_w = 16.0f;
@@ -460,12 +459,38 @@ void draw_editor_tabs(float strip_h) {
     const float text_h = ImGui::GetFontSize();
     const float pad_y  = (chip_h - text_h) * 0.5f;
 
+    // Tabs that do not fit scroll sideways (mouse wheel), keeping the active one in view.
+    static float tab_scroll = 0.0f;
+    static int tab_scroll_active = -1;
+    std::vector<float> widths;
+    float total_w = 8.0f;
+    for (const auto& tb : g_app->buffers) {
+        float tw = pad_x + icon_w + gap + ImGui::CalcTextSize(tb.name.c_str()).x + 8.0f + close_w + 4.0f;
+        widths.push_back(tw);
+        total_w += tw + 6.0f;
+    }
+    float max_scroll = std::max(0.0f, total_w - avail_w + 8.0f);
+    if (ImGui::IsMouseHoveringRect(origin, ImVec2(origin.x + avail_w, origin.y + strip_h))) {
+        float wheel = ImGui::GetIO().MouseWheel + ImGui::GetIO().MouseWheelH;
+        tab_scroll -= wheel * 60.0f;
+    }
+    if (tab_scroll_active != g_app->active && g_app->active >= 0 && g_app->active < (int)widths.size()) {
+        float ax = 8.0f;
+        for (int i = 0; i < g_app->active; i++) ax += widths[(size_t)i] + 6.0f;
+        float aw = widths[(size_t)g_app->active];
+        if (ax < tab_scroll) tab_scroll = ax - 8.0f;
+        if (ax + aw > tab_scroll + avail_w) tab_scroll = ax + aw - avail_w + 8.0f;
+        tab_scroll_active = g_app->active;
+    }
+    tab_scroll = std::clamp(tab_scroll, 0.0f, max_scroll);
+    dl->PushClipRect(origin, ImVec2(origin.x + avail_w, origin.y + strip_h), true);
+    float x = origin.x + 8.0f - tab_scroll;
+
     for (int i = 0; i < (int)g_app->buffers.size(); i++) {
         TextBuffer& b = g_app->buffers[(size_t)i];
         bool active = i == g_app->active;
         std::string label = b.name;
-        float text_w = ImGui::CalcTextSize(label.c_str()).x;
-        float tab_w = pad_x + icon_w + gap + text_w + 8.0f + close_w + 4.0f;
+        float tab_w = widths[(size_t)i];
         ImVec2 rmin(x, chip_y);
         ImVec2 rmax(x + tab_w, chip_y + chip_h);
 
@@ -477,14 +502,18 @@ void draw_editor_tabs(float strip_h) {
         bool middle = ImGui::IsItemClicked(ImGuiMouseButton_Middle);
         if (ImGui::BeginPopupContextItem("tabctx")) {
             if (ImGui::MenuItem("Close")) close_i = i;
+            // Tabs with unsaved changes stay open rather than losing their edits.
             if (ImGui::MenuItem("Close Others")) {
                 for (int j = (int)g_app->buffers.size() - 1; j >= 0; j--) {
-                    if (j != i) close_buffer(j, true);
+                    if (j != i && !g_app->buffers[(size_t)j].dirty) close_buffer(j, true);
                 }
             }
             if (ImGui::MenuItem("Close All")) {
-                for (int j = (int)g_app->buffers.size() - 1; j >= 0; j--) close_buffer(j, true);
+                for (int j = (int)g_app->buffers.size() - 1; j >= 0; j--) {
+                    if (!g_app->buffers[(size_t)j].dirty) close_buffer(j, true);
+                }
             }
+            if (!b.untitled && ImGui::MenuItem("Copy Path")) ImGui::SetClipboardText(b.path.c_str());
             if (!b.untitled && ImGui::MenuItem("Reveal in Explorer")) reveal_in_explorer(b.path);
             ImGui::EndPopup();
         }
@@ -506,8 +535,16 @@ void draw_editor_tabs(float strip_h) {
         ImU32 tcol = active ? vs::tab_text_active : vs::tab_text_dim;
         if (g_app->preview_tab == i && !active) tcol = IM_COL32(0xC5, 0xC5, 0xC5, 0xFF);
 
-        ImU32 ficol = b.is_nexa ? vs::nexa_icon
-                    : (b.is_json ? IM_COL32(0xE2, 0xC0, 0x8D, 255) : vs::file_icon);
+        ImU32 ficol = vs::file_icon;
+        switch (b.lang) {
+        case Lang::Nexa: ficol = vs::nexa_icon; break;
+        case Lang::Json:
+        case Lang::Ini: ficol = IM_COL32(0xE2, 0xC0, 0x8D, 255); break;
+        case Lang::Cpp: ficol = IM_COL32(0xC5, 0x93, 0xE7, 255); break;
+        case Lang::Markdown: ficol = IM_COL32(0x9C, 0xDC, 0xFE, 255); break;
+        case Lang::Shell: ficol = IM_COL32(0x89, 0xD1, 0x85, 255); break;
+        default: break;
+        }
         if (!active) ficol = (ficol & 0x00FFFFFF) | 0xB0000000;
         float ix = rmin.x + pad_x;
         dl->AddText(ImVec2(ix, rmin.y + pad_y), ficol, IC_FILE);
@@ -537,6 +574,7 @@ void draw_editor_tabs(float strip_h) {
         ImGui::PopID();
         x += tab_w + 6.0f;
     }
+    dl->PopClipRect();
     if (close_i >= 0) close_buffer(close_i);
 
     ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + strip_h));
@@ -1476,12 +1514,21 @@ static void draw_status(float y, float w) {
 
     const char* lang = "Plain Text";
     int line = 1, col = 1;
-    if (g_app->active >= 0) {
+    int selected = 0;
+    int selected_lines = 0;
+    bool crlf = false;
+    bool has_buffer = g_app->active >= 0 && g_app->active < (int)g_app->buffers.size();
+    if (has_buffer) {
         const TextBuffer& b = g_app->buffers[(size_t)g_app->active];
-        if (b.is_nexa) lang = "Nexa";
-        else if (b.is_json) lang = (b.name == "nexapkg.json") ? "Nexa JSON" : "JSON";
+        lang = lang_name(b.lang);
+        if (b.is_json && b.name == "nexapkg.json") lang = "Nexa Package";
         line = buffer_line_at(b, b.cursor) + 1;
-        col = buffer_col_at(b, b.cursor) + 1;
+        col = buffer_vcol_at(b, b.cursor) + 1;
+        selected = std::abs(b.cursor - b.sel_anchor);
+        if (selected) {
+            selected_lines = std::abs(buffer_line_at(b, b.cursor) - buffer_line_at(b, b.sel_anchor)) + 1;
+        }
+        crlf = b.crlf;
     }
 
     ImU32 txt = vs::status_text;
@@ -1491,7 +1538,7 @@ static void draw_status(float y, float w) {
     // Error / warning counts (grouped)
     int n_err = 0, n_warn = 0;
     for (const auto& d : g_app->problems) {
-        if (d.message.find("error") != std::string::npos) n_err++;
+        if (d.error) n_err++;
         else n_warn++;
     }
     // Error icon + count
@@ -1516,12 +1563,19 @@ static void draw_status(float y, float w) {
     // Right side (encoding, language, model)
     struct RItem { std::string s; };
     std::vector<RItem> right_items;
-    {
+    if (has_buffer) {
         char b[128];
-        std::snprintf(b, sizeof(b), "Ln %d, Col %d", line, col);
+        if (selected && selected_lines > 1)
+            std::snprintf(b, sizeof(b), "Ln %d, Col %d (%d selected, %d lines)", line, col, selected, selected_lines);
+        else if (selected)
+            std::snprintf(b, sizeof(b), "Ln %d, Col %d (%d selected)", line, col, selected);
+        else
+            std::snprintf(b, sizeof(b), "Ln %d, Col %d", line, col);
         right_items.push_back({b});
+        right_items.push_back({"Spaces: 4"});
+        right_items.push_back({"UTF-8"});
+        right_items.push_back({crlf ? "CRLF" : "LF"});
     }
-    right_items.push_back({"UTF-8"});
     right_items.push_back({lang});
     {
         const AgentSettings& a = g_app->settings.agent;
@@ -1545,6 +1599,8 @@ static void draw_status(float y, float w) {
 // ---------------------------------------------------------------------------
 static void menu_file();
 static void menu_edit();
+static void menu_selection();
+static void menu_go();
 static void menu_view();
 static void menu_run();
 static void menu_agent();
@@ -1556,7 +1612,9 @@ struct TitleMenu {
 static const TitleMenu kTitleMenus[] = {
     {"File",  &menu_file},
     {"Edit",  &menu_edit},
+    {"Selection", &menu_selection},
     {"View",  &menu_view},
+    {"Go",    &menu_go},
     {"Run",   &menu_run},
     {"Agent", &menu_agent},
 };
@@ -1587,23 +1645,64 @@ static void menu_file() {
 }
 
 static void menu_edit() {
-    if (ImGui::MenuItem("Undo", "Ctrl+Z") && g_app->active >= 0)
-        buffer_undo(g_app->buffers[(size_t)g_app->active]);
-    if (ImGui::MenuItem("Redo", "Ctrl+Y") && g_app->active >= 0)
-        buffer_redo(g_app->buffers[(size_t)g_app->active]);
+    const bool has = g_app->active >= 0;
+    if (ImGui::MenuItem("Undo", "Ctrl+Z", false, has)) editor_exec(EdCmd::Undo);
+    if (ImGui::MenuItem("Redo", "Ctrl+Y", false, has)) editor_exec(EdCmd::Redo);
     ImGui::Separator();
-    if (ImGui::MenuItem("Find", "Ctrl+F")) g_app->find_open = true;
-    if (ImGui::MenuItem("Replace", "Ctrl+H")) {
+    if (ImGui::MenuItem("Cut", "Ctrl+X", false, has)) editor_exec(EdCmd::Cut);
+    if (ImGui::MenuItem("Copy", "Ctrl+C", false, has)) editor_exec(EdCmd::Copy);
+    if (ImGui::MenuItem("Paste", "Ctrl+V", false, has)) editor_exec(EdCmd::Paste);
+    ImGui::Separator();
+    if (ImGui::MenuItem("Find", "Ctrl+F", false, has)) g_app->find_open = g_app->find_focus = true;
+    if (ImGui::MenuItem("Replace", "Ctrl+H", false, has)) {
         g_app->find_open = true;
         g_app->replace_open = true;
+        g_app->find_focus = true;
     }
-    if (ImGui::MenuItem("Go to Line", "Ctrl+G")) g_app->goto_open = true;
-    if (ImGui::MenuItem("Toggle Comment", "Ctrl+/") && g_app->active >= 0)
-        buffer_toggle_comment(g_app->buffers[(size_t)g_app->active]);
+    if (ImGui::MenuItem("Find Next", "F3", false, has)) editor_exec(EdCmd::FindNext);
+    if (ImGui::MenuItem("Find Previous", "Shift+F3", false, has)) editor_exec(EdCmd::FindPrev);
+    ImGui::Separator();
+    if (ImGui::MenuItem("Toggle Line Comment", "Ctrl+/", false, has)) editor_exec(EdCmd::ToggleComment);
+    if (ImGui::MenuItem("Trim Trailing Whitespace", nullptr, false, has)) editor_exec(EdCmd::TrimTrailingWhitespace);
+}
+
+static void menu_selection() {
+    const bool has = g_app->active >= 0;
+    if (ImGui::MenuItem("Select All", "Ctrl+A", false, has)) editor_exec(EdCmd::SelectAll);
+    if (ImGui::MenuItem("Select Line", "Ctrl+L", false, has)) editor_exec(EdCmd::SelectLine);
+    ImGui::Separator();
+    if (ImGui::MenuItem("Copy Line Up", "Shift+Alt+Up", false, has)) editor_exec(EdCmd::CopyLineUp);
+    if (ImGui::MenuItem("Copy Line Down", "Shift+Alt+Down", false, has)) editor_exec(EdCmd::CopyLineDown);
+    if (ImGui::MenuItem("Move Line Up", "Alt+Up", false, has)) editor_exec(EdCmd::MoveLineUp);
+    if (ImGui::MenuItem("Move Line Down", "Alt+Down", false, has)) editor_exec(EdCmd::MoveLineDown);
+    if (ImGui::MenuItem("Duplicate Line", "Ctrl+D", false, has)) editor_exec(EdCmd::DuplicateLine);
+    if (ImGui::MenuItem("Delete Line", "Ctrl+Shift+K", false, has)) editor_exec(EdCmd::DeleteLine);
+    ImGui::Separator();
+    if (ImGui::MenuItem("Indent", "Ctrl+]", false, has)) editor_exec(EdCmd::Indent);
+    if (ImGui::MenuItem("Outdent", "Ctrl+[", false, has)) editor_exec(EdCmd::Outdent);
+    if (ImGui::MenuItem("Transform to Uppercase", nullptr, false, has)) editor_exec(EdCmd::UpperCase);
+    if (ImGui::MenuItem("Transform to Lowercase", nullptr, false, has)) editor_exec(EdCmd::LowerCase);
+}
+
+static void open_quick(const char* prefix);
+
+static void menu_go() {
+    const bool has = g_app->active >= 0;
+    if (ImGui::MenuItem("Go to File...", "Ctrl+P")) open_quick("");
+    if (ImGui::MenuItem("Go to Symbol in Editor...", "Ctrl+Shift+O", false, has)) open_quick("@");
+    if (ImGui::MenuItem("Go to Line...", "Ctrl+G", false, has)) g_app->goto_open = true;
+    ImGui::Separator();
+    if (ImGui::MenuItem("Go to Definition", "F12", false, has)) editor_exec(EdCmd::GotoDefinition);
+    if (ImGui::MenuItem("Go to Bracket", "Ctrl+Shift+\\", false, has)) editor_exec(EdCmd::JumpToBracket);
+    ImGui::Separator();
+    int n = (int)g_app->buffers.size();
+    if (ImGui::MenuItem("Next Editor", "Ctrl+Tab", false, n > 1)) g_app->active = (g_app->active + 1) % n;
+    if (ImGui::MenuItem("Previous Editor", "Ctrl+Shift+Tab", false, n > 1)) g_app->active = (g_app->active - 1 + n) % n;
 }
 
 static void menu_view() {
     if (ImGui::MenuItem("Command Palette", "Ctrl+Shift+P")) g_app->palette_open = true;
+    if (ImGui::MenuItem("Go to File", "Ctrl+P")) open_quick("");
     ImGui::Separator();
     ImGui::MenuItem("Sidebar", "Ctrl+B", &g_app->settings.show_sidebar);
     ImGui::MenuItem("Panel", "Ctrl+J", &g_app->settings.show_panel);
@@ -1611,8 +1710,8 @@ static void menu_view() {
 }
 
 static void menu_run() {
-            if (ImGui::MenuItem("Run", "F5")) run_active(true);
-            if (ImGui::MenuItem("Build", "Ctrl+Alt+B")) run_active(false);
+    if (ImGui::MenuItem("Run", "F5")) run_active(true);
+    if (ImGui::MenuItem("Build", "Ctrl+Alt+B")) run_active(false);
     if (ImGui::MenuItem("Stop") && g_app->proc.running) proc_stop();
 }
 
@@ -1753,6 +1852,375 @@ static float draw_title_bar(float w) {
     return h;
 }
 
+// ---------------------------------------------------------------------------
+// Quick open: files (default), ">" commands, "@" symbols, ":" line
+// ---------------------------------------------------------------------------
+struct QuickItem {
+    std::string label;
+    std::string detail;
+    const char* icon = IC_FILE;
+    ImU32 icon_col = IM_COL32(0x9A, 0x9A, 0x9A, 255);
+    int score = 0;
+    std::function<void()> run;
+};
+
+static bool g_quick_just_opened = false;
+
+static void open_quick(const char* prefix) {
+    g_app->quick_open = true;
+    g_app->palette_open = false;
+    std::snprintf(g_app->quick_text, sizeof(g_app->quick_text), "%s", prefix);
+    g_app->palette_sel = 0;
+    g_quick_just_opened = true;
+    if (!prefix[0]) workspace_files(g_app->quick_files);
+}
+
+// Subsequence match, case-insensitive. Rewards consecutive runs and matches at
+// word starts; -1 means no match.
+static int fuzzy_score(const std::string& pat, const std::string& text) {
+    if (pat.empty()) return 0;
+    int score = 0;
+    size_t ti = 0;
+    int run = 0;
+    for (size_t pi = 0; pi < pat.size(); pi++) {
+        char pc = (char)std::tolower((unsigned char)pat[pi]);
+        if (pc == ' ') continue;
+        bool found = false;
+        while (ti < text.size()) {
+            char tc = (char)std::tolower((unsigned char)text[ti]);
+            if (tc == pc) {
+                bool boundary = ti == 0 || text[ti - 1] == '/' || text[ti - 1] == '\\' ||
+                                text[ti - 1] == '_' || text[ti - 1] == '.' || text[ti - 1] == ' ' ||
+                                text[ti - 1] == ':' ||
+                                (std::isupper((unsigned char)text[ti]) && std::islower((unsigned char)text[ti - 1]));
+                run++;
+                score += 1 + run * 2 + (boundary ? 6 : 0);
+                ti++;
+                found = true;
+                break;
+            }
+            run = 0;
+            ti++;
+        }
+        if (!found) return -1;
+    }
+    return score - (int)text.size() / 16;
+}
+
+static std::string trim_copy(const std::string& v) {
+    size_t a = v.find_first_not_of(" \t");
+    if (a == std::string::npos) return {};
+    size_t z = v.find_last_not_of(" \t");
+    return v.substr(a, z - a + 1);
+}
+
+static void quick_commands(std::vector<QuickItem>& out) {
+    struct Cmd { const char* label; const char* key; std::function<void()> run; };
+    const Cmd cmds[] = {
+        {"File: New File", "Ctrl+N", [] { new_untitled(); }},
+        {"File: Open File...", "Ctrl+O", [] { std::string p; if (open_file_dialog(p)) open_path(p, false); }},
+        {"File: Open Folder...", "", [] { std::string f; if (open_folder_dialog(f)) set_folder(f); }},
+        {"File: Save", "Ctrl+S", [] { if (g_app->active >= 0) save_buffer(g_app->active); }},
+        {"File: Save As...", "Ctrl+Shift+S", [] { if (g_app->active >= 0) save_buffer(g_app->active, true); }},
+        {"File: Save All", "", [] { save_all(); }},
+        {"File: Close Editor", "Ctrl+W", [] { if (g_app->active >= 0) close_buffer(g_app->active); }},
+        {"File: Reveal Active File in Explorer", "", [] {
+            if (g_app->active >= 0 && !g_app->buffers[(size_t)g_app->active].untitled)
+                reveal_in_explorer(g_app->buffers[(size_t)g_app->active].path);
+        }},
+        {"Go to File...", "Ctrl+P", [] { open_quick(""); }},
+        {"Go to Symbol in Editor...", "Ctrl+Shift+O", [] { open_quick("@"); }},
+        {"Go to Line...", "Ctrl+G", [] { g_app->goto_open = true; }},
+        {"Go to Definition", "F12", [] { editor_exec(EdCmd::GotoDefinition); }},
+        {"Go to Bracket", "Ctrl+Shift+\\", [] { editor_exec(EdCmd::JumpToBracket); }},
+        {"Edit: Undo", "Ctrl+Z", [] { editor_exec(EdCmd::Undo); }},
+        {"Edit: Redo", "Ctrl+Y", [] { editor_exec(EdCmd::Redo); }},
+        {"Edit: Find", "Ctrl+F", [] { g_app->find_open = g_app->find_focus = true; }},
+        {"Edit: Replace", "Ctrl+H", [] { g_app->find_open = g_app->replace_open = g_app->find_focus = true; }},
+        {"Edit: Toggle Line Comment", "Ctrl+/", [] { editor_exec(EdCmd::ToggleComment); }},
+        {"Edit: Trim Trailing Whitespace", "", [] { editor_exec(EdCmd::TrimTrailingWhitespace); }},
+        {"Edit: Trigger Suggest", "Ctrl+Space", [] { editor_exec(EdCmd::TriggerSuggest); }},
+        {"Selection: Select Line", "Ctrl+L", [] { editor_exec(EdCmd::SelectLine); }},
+        {"Selection: Duplicate Line", "Ctrl+D", [] { editor_exec(EdCmd::DuplicateLine); }},
+        {"Selection: Delete Line", "Ctrl+Shift+K", [] { editor_exec(EdCmd::DeleteLine); }},
+        {"Selection: Move Line Up", "Alt+Up", [] { editor_exec(EdCmd::MoveLineUp); }},
+        {"Selection: Move Line Down", "Alt+Down", [] { editor_exec(EdCmd::MoveLineDown); }},
+        {"Selection: Copy Line Up", "Shift+Alt+Up", [] { editor_exec(EdCmd::CopyLineUp); }},
+        {"Selection: Copy Line Down", "Shift+Alt+Down", [] { editor_exec(EdCmd::CopyLineDown); }},
+        {"Selection: Indent", "Ctrl+]", [] { editor_exec(EdCmd::Indent); }},
+        {"Selection: Outdent", "Ctrl+[", [] { editor_exec(EdCmd::Outdent); }},
+        {"Selection: Transform to Uppercase", "", [] { editor_exec(EdCmd::UpperCase); }},
+        {"Selection: Transform to Lowercase", "", [] { editor_exec(EdCmd::LowerCase); }},
+        {"View: Toggle Agent", "Ctrl+Shift+L", [] { g_app->settings.show_agent = !g_app->settings.show_agent; }},
+        {"View: Toggle Sidebar", "Ctrl+B", [] { g_app->settings.show_sidebar = !g_app->settings.show_sidebar; }},
+        {"View: Toggle Panel", "Ctrl+J", [] { g_app->settings.show_panel = !g_app->settings.show_panel; }},
+        {"View: Show Explorer", "Ctrl+Shift+E", [] { g_app->activity = ActivityView::Explorer; g_app->settings.show_sidebar = true; }},
+        {"View: Show Search", "Ctrl+Shift+F", [] { g_app->activity = ActivityView::Search; g_app->settings.show_sidebar = true; }},
+        {"View: Show Outline", "", [] { g_app->activity = ActivityView::Outline; g_app->settings.show_sidebar = true; }},
+        {"View: Show Problems", "Ctrl+Shift+M", [] { g_app->bottom = BottomTab::Problems; g_app->settings.show_panel = true; }},
+        {"View: Show Terminal", "Ctrl+`", [] { g_app->bottom = BottomTab::Terminal; g_app->settings.show_panel = true; }},
+        {"Run: Run", "F5", [] { run_active(true); }},
+        {"Run: Build", "Ctrl+Alt+B", [] { run_active(false); }},
+        {"Run: Stop", "Shift+F5", [] { if (g_app->proc.running) proc_stop(); }},
+        {"Agent: New Chat", "", [] { agent_new_chat(); }},
+    };
+    for (const auto& c : cmds) {
+        QuickItem it;
+        it.label = c.label;
+        it.detail = c.key;
+        it.icon = IC_SPARKLE;
+        it.icon_col = IM_COL32(0x6C, 0xB6, 0xFF, 200);
+        it.run = c.run;
+        out.push_back(std::move(it));
+    }
+}
+
+static void quick_build(std::vector<QuickItem>& items) {
+    items.clear();
+    std::string q = g_app->quick_text;
+    if (!q.empty() && q[0] == '>') {
+        std::string pat = trim_copy(q.substr(1));
+        std::vector<QuickItem> all;
+        quick_commands(all);
+        for (auto& it : all) {
+            it.score = fuzzy_score(pat, it.label);
+            if (it.score >= 0) items.push_back(std::move(it));
+        }
+        if (!pat.empty()) {
+            std::stable_sort(items.begin(), items.end(), [](const QuickItem& a, const QuickItem& b) {
+                return a.score > b.score;
+            });
+        }
+        return;
+    }
+    if (!q.empty() && q[0] == ':') {
+        if (g_app->active < 0) return;
+        const TextBuffer& b = g_app->buffers[(size_t)g_app->active];
+        int line = std::atoi(q.c_str() + 1);
+        QuickItem it;
+        it.icon = IC_OUTLINE;
+        if (line > 0) {
+            int col = 1;
+            size_t c2 = q.find(':', 1);
+            if (c2 != std::string::npos) col = std::max(1, std::atoi(q.c_str() + c2 + 1));
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "Go to line %d, column %d", line, col);
+            it.label = buf;
+            it.run = [line, col] {
+                if (g_app->active < 0) return;
+                TextBuffer& tb = g_app->buffers[(size_t)g_app->active];
+                tb.cursor = tb.sel_anchor = buffer_pos_at_vcol(tb, line - 1, col - 1);
+                tb.preferred_col = buffer_vcol_at(tb, tb.cursor);
+                buffer_reveal(tb, true);
+                g_app->editor_focused = true;
+            };
+        } else {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "Current line: %d. Type a line number between 1 and %d.",
+                          buffer_line_at(b, b.cursor) + 1, (int)b.lines.size());
+            it.label = buf;
+        }
+        items.push_back(std::move(it));
+        return;
+    }
+    if (!q.empty() && q[0] == '@') {
+        if (g_app->active < 0) return;
+        TextBuffer& b = g_app->buffers[(size_t)g_app->active];
+        if (b.outline_dirty && b.is_nexa) {
+            index_nexa(b.text, b.outline);
+            b.outline_dirty = false;
+        }
+        std::string pat = trim_copy(q.substr(1));
+        for (const auto& d : b.outline) {
+            QuickItem it;
+            it.label = d.name;
+            it.score = fuzzy_score(pat, d.name);
+            if (it.score < 0) continue;
+            switch (d.kind) {
+            case DefKind::Function: it.detail = "fn"; it.icon = IC_RUN; it.icon_col = IM_COL32(0xDC, 0xDC, 0xAA, 255); break;
+            case DefKind::Struct: it.detail = "struct"; it.icon = IC_FOLDER; it.icon_col = IM_COL32(0x4E, 0xC9, 0xB0, 255); break;
+            case DefKind::Enum: it.detail = "enum"; it.icon = IC_OUTLINE; it.icon_col = IM_COL32(0x4E, 0xC9, 0xB0, 255); break;
+            default: it.detail = "let"; it.icon = IC_FILE; it.icon_col = IM_COL32(0x9C, 0xDC, 0xFE, 255); break;
+            }
+            it.detail += "  :" + std::to_string(d.line + 1);
+            int s0 = d.name_start, s1 = d.name_end;
+            it.run = [s0, s1] {
+                if (g_app->active < 0) return;
+                TextBuffer& tb = g_app->buffers[(size_t)g_app->active];
+                tb.sel_anchor = s0;
+                tb.cursor = s1;
+                buffer_reveal(tb, true);
+                g_app->editor_focused = true;
+            };
+            items.push_back(std::move(it));
+        }
+        if (!pat.empty()) {
+            std::stable_sort(items.begin(), items.end(), [](const QuickItem& a, const QuickItem& b) {
+                return a.score > b.score;
+            });
+        }
+        return;
+    }
+    // Files: open editors first when nothing is typed, then the workspace.
+    std::string pat = trim_copy(q);
+    std::string root = g_app->settings.folder;
+    auto rel_of = [&](const std::string& path) {
+        if (!root.empty() && path.size() > root.size() + 1 && path.compare(0, root.size(), root) == 0)
+            return path.substr(root.size() + 1);
+        return path;
+    };
+    std::vector<std::string> seen;
+    auto add_file = [&](const std::string& path, bool open_editor) {
+        std::string rel = rel_of(path);
+        std::string name = path_filename(path);
+        int score = fuzzy_score(pat, rel);
+        int name_score = fuzzy_score(pat, name);
+        if (score < 0) return;
+        if (name_score >= 0) score += name_score * 2;
+        if (open_editor) score += 4;
+        QuickItem it;
+        it.label = name;
+        std::string dir = path_parent(rel);
+        it.detail = dir == rel ? "" : dir;
+        if (open_editor) it.detail = it.detail.empty() ? "open" : it.detail + "  -  open";
+        it.score = score;
+        switch (lang_for_path(path)) {
+        case Lang::Nexa: it.icon_col = IM_COL32(0x7E, 0xC4, 0xE0, 255); break;
+        case Lang::Json:
+        case Lang::Ini: it.icon_col = IM_COL32(0xE2, 0xC0, 0x8D, 255); break;
+        case Lang::Cpp: it.icon_col = IM_COL32(0xC5, 0x93, 0xE7, 255); break;
+        case Lang::Markdown: it.icon_col = IM_COL32(0x9C, 0xDC, 0xFE, 255); break;
+        case Lang::Shell: it.icon_col = IM_COL32(0x89, 0xD1, 0x85, 255); break;
+        default: break;
+        }
+        it.run = [path] {
+            open_path(path, false);
+            g_app->editor_focused = true;
+        };
+        items.push_back(std::move(it));
+        seen.push_back(path_norm(path));
+    };
+    for (const auto& b : g_app->buffers) {
+        if (!b.untitled) add_file(b.path, true);
+    }
+    for (const auto& f : g_app->quick_files) {
+        if (std::find(seen.begin(), seen.end(), path_norm(f)) != seen.end()) continue;
+        add_file(f, false);
+        if (items.size() > 4000) break;
+    }
+    if (!pat.empty()) {
+        std::stable_sort(items.begin(), items.end(), [](const QuickItem& a, const QuickItem& b) {
+            return a.score > b.score;
+        });
+    }
+    if (items.size() > 200) items.resize(200);
+}
+
+static void draw_quick_open() {
+    if (g_app->palette_open) open_quick(">");
+    if (!g_app->quick_open) return;
+    ImGuiIO& io = ImGui::GetIO();
+    ImVec2 ds = io.DisplaySize;
+    const float w = std::min(dp(640.0f), ds.x - dp(40.0f));
+    ImGui::SetNextWindowPos(ImVec2(ds.x * 0.5f, dp(48.0f)), ImGuiCond_Always, ImVec2(0.5f, 0));
+    ImGui::SetNextWindowSize(ImVec2(w, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 8));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.098f, 0.098f, 0.098f, 1));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.22f, 0.22f, 0.22f, 1));
+    ImGui::Begin("##quick_open", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+    bool just_opened = g_quick_just_opened;
+    if (just_opened) {
+        ImGui::SetWindowFocus();
+        ImGui::SetKeyboardFocusHere();
+        g_quick_just_opened = false;
+    }
+    ui_push_field();
+    ImGui::SetNextItemWidth(-1);
+    std::string before = g_app->quick_text;
+    ImGui::InputTextWithHint("##quick", "Search files by name  ( > commands   @ symbols   : line )",
+                             g_app->quick_text, sizeof(g_app->quick_text));
+    bool input_active = ImGui::IsItemActive();
+    ui_pop_field();
+    if (before != g_app->quick_text) g_app->palette_sel = 0;
+
+    static std::vector<QuickItem> items;
+    quick_build(items);
+    int n = (int)items.size();
+    bool run_sel = false;
+    bool close = false;
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && n > 0) g_app->palette_sel = (g_app->palette_sel + 1) % n;
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) && n > 0) g_app->palette_sel = (g_app->palette_sel - 1 + n) % n;
+    if (ImGui::IsKeyPressed(ImGuiKey_PageDown) && n > 0) g_app->palette_sel = std::min(n - 1, g_app->palette_sel + 10);
+    if (ImGui::IsKeyPressed(ImGuiKey_PageUp) && n > 0) g_app->palette_sel = std::max(0, g_app->palette_sel - 10);
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) run_sel = true;
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) close = true;
+    g_app->palette_sel = n > 0 ? std::clamp(g_app->palette_sel, 0, n - 1) : 0;
+
+    const float row_h = dp(26.0f);
+    const int rows = std::min(n, 12);
+    if (n == 0) {
+        ImGui::Dummy(ImVec2(1, 4));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 1));
+        ImGui::TextUnformatted(g_app->quick_text[0] == '>' ? "  No matching commands"
+                               : g_app->quick_text[0] == '@' ? "  No matching symbols"
+                               : g_app->settings.folder.empty() ? "  Open a folder to search its files"
+                                                                : "  No matching files");
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::Dummy(ImVec2(1, 2));
+        ImGui::BeginChild("##quick_list", ImVec2(0, row_h * (float)rows + 4.0f), ImGuiChildFlags_None);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        static int last_sel = -1;
+        for (int i = 0; i < n; i++) {
+            const QuickItem& it = items[(size_t)i];
+            ImVec2 p0 = ImGui::GetCursorScreenPos();
+            float rw = ImGui::GetContentRegionAvail().x;
+            ImGui::PushID(i);
+            if (ImGui::InvisibleButton("##row", ImVec2(rw, row_h))) {
+                g_app->palette_sel = i;
+                run_sel = true;
+            }
+            bool hov = ImGui::IsItemHovered();
+            ImGui::PopID();
+            bool sel = i == g_app->palette_sel;
+            if (sel || hov) {
+                dl->AddRectFilled(p0, ImVec2(p0.x + rw, p0.y + row_h),
+                                  sel ? IM_COL32(0x04, 0x39, 0x5E, 255) : IM_COL32(0x22, 0x22, 0x22, 255), 4.0f);
+            }
+            float ty = p0.y + (row_h - ImGui::GetFontSize()) * 0.5f;
+            if (g_app->font_icon) ImGui::PushFont(g_app->font_icon);
+            dl->AddText(ImVec2(p0.x + 8.0f, ty), it.icon_col, it.icon);
+            if (g_app->font_icon) ImGui::PopFont();
+            dl->AddText(ImVec2(p0.x + 32.0f, ty), IM_COL32(0xE0, 0xE0, 0xE0, 255), it.label.c_str());
+            if (!it.detail.empty()) {
+                bool right = g_app->quick_text[0] == '>' || g_app->quick_text[0] == '@';
+                float dx = right ? p0.x + rw - ImGui::CalcTextSize(it.detail.c_str()).x - 10.0f
+                                 : p0.x + 32.0f + ImGui::CalcTextSize(it.label.c_str()).x + 10.0f;
+                dl->AddText(ImVec2(dx, ty), IM_COL32(0x80, 0x80, 0x80, 255), it.detail.c_str());
+            }
+            if (sel && last_sel != g_app->palette_sel) ImGui::SetScrollHereY(0.5f);
+        }
+        last_sel = g_app->palette_sel;
+        ImGui::EndChild();
+    }
+    // Clicking anywhere outside closes it, as does losing keyboard focus.
+    if (!just_opened && !input_active && !ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows)) close = true;
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
+
+    if (run_sel && n > 0 && items[(size_t)g_app->palette_sel].run) {
+        auto fn = items[(size_t)g_app->palette_sel].run;
+        g_app->quick_open = false;
+        fn();
+    } else if (close) {
+        g_app->quick_open = false;
+    }
+}
+
 static void modals() {
     if (g_app->new_file_modal) ImGui::OpenPopup("New File");
     if (g_app->new_folder_modal) ImGui::OpenPopup("New Folder");
@@ -1829,54 +2297,7 @@ static void modals() {
         ImGui::EndPopup();
     }
 
-    if (g_app->palette_open) {
-        ImVec2 ds = ImGui::GetIO().DisplaySize;
-        ImGui::SetNextWindowPos(ImVec2(ds.x * 0.5f, 80), ImGuiCond_Always, ImVec2(0.5f, 0));
-        ImGui::SetNextWindowSize(ImVec2(520, 320));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 12));
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.078f, 0.078f, 0.078f, 1));
-        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.180f, 0.180f, 0.180f, 1));
-        ImGui::Begin("Command Palette", &g_app->palette_open,
-                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
-        ui_push_field();
-        ImGui::SetNextItemWidth(-1);
-        ImGui::SetKeyboardFocusHere();
-        ImGui::InputTextWithHint("##pal", "Type a command",
-                                 g_app->palette_text, sizeof(g_app->palette_text));
-        ui_pop_field();
-        ImGui::Dummy(ImVec2(1, 8));
-        struct Cmd { const char* label; std::function<void()> run; };
-        Cmd cmds[] = {
-            {"File: New File",        [] { new_untitled(); }},
-            {"File: Open File",       [] { std::string p; if (open_file_dialog(p)) open_path(p, false); }},
-            {"File: Open Folder",     [] { std::string f; if (open_folder_dialog(f)) set_folder(f); }},
-            {"File: Save",            [] { if (g_app->active >= 0) save_buffer(g_app->active); }},
-            {"Run: Run",              [] { run_active(true); }},
-            {"Run: Build",            [] { run_active(false); }},
-            {"View: Toggle Agent",    [] { g_app->settings.show_agent   = !g_app->settings.show_agent; }},
-            {"View: Toggle Sidebar",  [] { g_app->settings.show_sidebar = !g_app->settings.show_sidebar; }},
-            {"View: Toggle Panel",    [] { g_app->settings.show_panel   = !g_app->settings.show_panel; }},
-            {"Agent: New Chat",       [] { agent_new_chat(); }},
-            {"Edit: Find",            [] { g_app->find_open = true; }},
-            {"Edit: Go to Line",      [] { g_app->goto_open = true; }},
-        };
-        std::string q = g_app->palette_text;
-        for (char& ch : q) ch = (char)std::tolower((unsigned char)ch);
-        for (const auto& cmd : cmds) {
-            std::string l = cmd.label;
-            for (char& ch : l) ch = (char)std::tolower((unsigned char)ch);
-            if (!q.empty() && l.find(q) == std::string::npos) continue;
-            if (ui_chip_row(cmd.label, IC_SPARKLE, IM_COL32(0x6C, 0xB6, 0xFF, 180),
-                            cmd.label, nullptr)) {
-                cmd.run();
-                g_app->palette_open = false;
-            }
-        }
-        ImGui::End();
-        ImGui::PopStyleColor(2);
-        ImGui::PopStyleVar(2);
-    }
+    draw_quick_open();
 }
 
 // ---------------------------------------------------------------------------
@@ -1893,6 +2314,7 @@ void ide_shortcuts() {
         if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_B))
             g_app->settings.show_sidebar = !g_app->settings.show_sidebar;
         if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_P)) g_app->palette_open = true;
+        if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_P)) open_quick("");
         if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_L))
             g_app->settings.show_agent = !g_app->settings.show_agent;
         if (ImGui::IsKeyPressed(ImGuiKey_F5)) run_active(true);
@@ -1902,17 +2324,46 @@ void ide_shortcuts() {
     if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_O)) {
         std::string p; if (open_file_dialog(p)) open_path(p, false);
     }
-    if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_S) && g_app->active >= 0) save_buffer(g_app->active);
+    if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_S) && g_app->active >= 0 &&
+        !(g_app->pending_chord > 0.0 && ImGui::GetTime() - g_app->pending_chord < 1.5))
+        save_buffer(g_app->active);
     if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_S) && g_app->active >= 0) save_buffer(g_app->active, true);
     if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_W) && g_app->active >= 0) close_buffer(g_app->active);
-    if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_F)) g_app->find_open = true;
-    if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_H)) {
+    const bool has_editor = g_app->active >= 0;
+    if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_F) && has_editor) {
+        g_app->find_open = true;
+        g_app->find_focus = true;
+    }
+    if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_H) && has_editor) {
         g_app->find_open = true;
         g_app->replace_open = true;
+        g_app->find_focus = true;
     }
-    if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_G)) g_app->goto_open = true;
-    if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_P)) g_app->palette_open = true;
-    if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_P)) g_app->palette_open = true;
+    if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_G) && has_editor) g_app->goto_open = true;
+    if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_P)) open_quick("");
+    if ((ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_P)) || ImGui::IsKeyPressed(ImGuiKey_F1)) g_app->palette_open = true;
+    if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_O) && has_editor) open_quick("@");
+    if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_M)) {
+        g_app->bottom = BottomTab::Problems;
+        g_app->settings.show_panel = true;
+    }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_GraveAccent)) {
+        g_app->bottom = BottomTab::Terminal;
+        g_app->settings.show_panel = true;
+    }
+    if (shift && !ctrl && ImGui::IsKeyPressed(ImGuiKey_F5) && g_app->proc.running) proc_stop();
+    int nbuf = (int)g_app->buffers.size();
+    if (ctrl && nbuf > 1 && (ImGui::IsKeyPressed(ImGuiKey_Tab) || ImGui::IsKeyPressed(ImGuiKey_PageDown) ||
+                             ImGui::IsKeyPressed(ImGuiKey_PageUp))) {
+        bool back = ImGui::IsKeyPressed(ImGuiKey_PageUp) || (shift && ImGui::IsKeyPressed(ImGuiKey_Tab));
+        g_app->active = (g_app->active + (back ? nbuf - 1 : 1)) % nbuf;
+    }
+    if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_K, false)) g_app->pending_chord = ImGui::GetTime();
+    if (g_app->pending_chord > 0.0 && ImGui::GetTime() - g_app->pending_chord < 1.5 && ctrl &&
+        ImGui::IsKeyPressed(ImGuiKey_S, false) && !ImGui::IsKeyPressed(ImGuiKey_K, false)) {
+        save_all();
+        g_app->pending_chord = 0.0;
+    }
     if (ctrl && alt && ImGui::IsKeyPressed(ImGuiKey_B)) run_active(false);
     if (ImGui::IsKeyPressed(ImGuiKey_F5)) run_active(true);
     if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_B))
@@ -1938,12 +2389,25 @@ void draw_ide() {
     ide_shortcuts();
     proc_tick();
 
+    // Switching to another file re-runs diagnostics for it.
+    static int diag_active = -2;
+    static size_t diag_buffers = 0;
+    if (diag_active != g_app->active || diag_buffers != g_app->buffers.size()) {
+        diag_active = g_app->active;
+        diag_buffers = g_app->buffers.size();
+        g_app->diag_dirty = true;
+        g_app->last_diag = 0.0;
+    }
     if (g_app->diag_dirty && ImGui::GetTime() - g_app->last_diag > 0.45) {
         refresh_problems();
     }
     if (g_app->active >= 0) {
         TextBuffer& b = g_app->buffers[(size_t)g_app->active];
         if (b.spans_dirty && ImGui::GetTime() - b.last_edit > 0.12) buffer_refresh(b);
+        if (b.is_nexa && b.outline_dirty && ImGui::GetTime() - b.last_edit > 0.3) {
+            index_nexa(b.text, b.outline);
+            b.outline_dirty = false;
+        }
     }
 
     ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -1969,6 +2433,9 @@ void draw_ide() {
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     draw_activity();
     ImGui::EndChild();
+    if (ImGui::IsMouseClicked(0) && ImGui::IsMouseHoveringRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax()) &&
+        !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId))
+        g_app->editor_focused = false;
     ImGui::SameLine(0, 0);
 
     if (g_app->settings.show_sidebar) {
@@ -1976,6 +2443,9 @@ void draw_ide() {
                           ImGuiWindowFlags_NoScrollbar);
         draw_sidebar();
         ImGui::EndChild();
+        if (ImGui::IsMouseClicked(0) && ImGui::IsMouseHoveringRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax()) &&
+            !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId))
+            g_app->editor_focused = false;
         ImGui::SameLine(0, 0);
         splitter_v("s1", &g_app->settings.sidebar_w, 180.0f, 600.0f, main_h);
         ImGui::SameLine(0, 0);

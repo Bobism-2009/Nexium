@@ -139,7 +139,7 @@ static void erase_disp(TermScreen& s, int mode) {
     screen_ensure(s);
     if (mode >= 2) {
         for (auto& c : s.cells) c = TermCell{};
-        if (mode >= 3) s.scrollback.clear();
+        s.scrollback.clear();
         s.cx = 0;
         s.cy = 0;
     } else if (mode == 0) {
@@ -1073,10 +1073,14 @@ void draw_terminal(const ImVec2& size) {
     static uint64_t last_gen = 0;
     float cursor_y = (float)(hist + snap.cy) * line_h;
     bool at_bottom = (max_sy <= 1.0f) || (sy >= max_sy - line_h * 2.0f);
-    if (snap.gen != last_gen && at_bottom) {
-        float want = cursor_y + line_h - size.y;
-        if (want < 0.0f) want = 0.0f;
-        ImGui::SetScrollY(want);
+    if (snap.gen != last_gen) {
+        if (hist == 0 && snap.cy == 0) {
+            ImGui::SetScrollY(0);
+        } else if (at_bottom) {
+            float want = cursor_y + line_h - size.y;
+            if (want < 0.0f) want = 0.0f;
+            ImGui::SetScrollY(want);
+        }
     }
     last_gen = snap.gen;
 

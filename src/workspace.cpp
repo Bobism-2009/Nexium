@@ -42,24 +42,37 @@ void set_folder(const std::string& folder) {
     SetWindowTextW(g_app->hwnd, utf8_to_wide(title).c_str());
 }
 
-static void collect_nxa(const std::string& dir, std::vector<std::string>& out, int depth = 0) {
-    if (depth > 8) return;
+static bool skip_dir(const std::string& name) {
+    return name == "node_modules" || name == "dist" || name == "build" || name == ".git" ||
+           name == ".vs" || name == ".vscode" || name == "__pycache__" || name == ".cache" ||
+           name == "out" || name == "obj" || name == ".nexium";
+}
+
+static void collect_files(const std::string& dir, std::vector<std::string>& out, bool text_only,
+                          int depth = 0) {
+    if (depth > 10 || out.size() >= 20000) return;
     for (const auto& e : list_dir(dir)) {
         std::string p = path_join(dir, e.first);
         if (e.second) {
-            if (e.first == "node_modules" || e.first == "dist" || e.first == "build") continue;
-            collect_nxa(p, out, depth + 1);
-        } else if (path_is_nexa(p) || path_is_json(p)) {
+            if (skip_dir(e.first)) continue;
+            collect_files(p, out, text_only, depth + 1);
+        } else if (!text_only || lang_for_path(p) != Lang::Plain || path_ext(p) == ".txt") {
             out.push_back(p);
         }
     }
+}
+
+void workspace_files(std::vector<std::string>& out) {
+    out.clear();
+    if (g_app->settings.folder.empty()) return;
+    collect_files(g_app->settings.folder, out, false);
 }
 
 void workspace_search(const std::string& query) {
     g_app->search_hits.clear();
     if (query.empty() || g_app->settings.folder.empty()) return;
     std::vector<std::string> files;
-    collect_nxa(g_app->settings.folder, files);
+    collect_files(g_app->settings.folder, files, true);
     for (const auto& path : files) {
         std::string text;
         if (!file_read(path, text)) continue;
@@ -92,7 +105,7 @@ void workspace_search(const std::string& query) {
 void refresh_problems() {
     g_app->problems.clear();
     auto add_buf = [&](const TextBuffer& b) {
-        if (!b.is_nexa) return;
+        if (b.lang != Lang::Nexa) return;
         std::vector<Diagnostic> ds;
         diagnose_nexa(b.text, b.untitled ? b.name : b.path, ds);
         for (auto& d : ds) g_app->problems.push_back(std::move(d));
@@ -418,7 +431,7 @@ void draw_problems() {
         std::string loc = std::to_string(d.line);
         char id[32];
         std::snprintf(id, sizeof(id), "pr%d", i);
-        bool err = d.message.find("error") != std::string::npos;
+        bool err = d.error;
         if (ui_chip_row(id, err ? IC_ERROR : IC_WARN,
                         err ? IM_COL32(0xD0, 0x3C, 0x3C, 255) : IM_COL32(0xC8, 0xA8, 0x78, 255),
                         d.message.c_str(), loc.c_str())) {

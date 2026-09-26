@@ -1,6 +1,7 @@
 #include "nexium.hpp"
 #include "resource.h"
 
+#include "imgui_internal.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 
@@ -287,6 +288,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigNavMoveSetMousePos = false;
     io.IniFilename = nullptr;
+    // Ctrl+Tab switches editor tabs; ImGui's own window switcher would steal it.
+    GImGui->ConfigNavWindowingKeyNext = 0;
+    GImGui->ConfigNavWindowingKeyPrev = 0;
     apply_vscode_theme();
     ImGui::GetStyle().ScaleAllSizes(app.dpi);
     {

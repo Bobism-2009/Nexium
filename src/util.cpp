@@ -73,14 +73,16 @@ std::string path_norm(const std::string& p) {
 }
 
 bool path_is_nexa(const std::string& p) {
-    return path_ext(p) == ".nxa";
+    std::string e = path_ext(p);
+    for (char& c : e) c = (char)std::tolower((unsigned char)c);
+    return e == ".nxa";
 }
 
 bool path_is_json(const std::string& p) {
     return path_ext(p) == ".json";
 }
 
-bool file_read(const std::string& path, std::string& out, std::string* err) {
+bool file_read(const std::string& path, std::string& out, std::string* err, bool* had_crlf) {
     std::ifstream in(std::filesystem::u8path(path), std::ios::binary);
     if (!in) {
         if (err) *err = "Could not open " + path;
@@ -94,9 +96,13 @@ bool file_read(const std::string& path, std::string& out, std::string* err) {
     }
     std::string norm;
     norm.reserve(out.size());
+    if (had_crlf) *had_crlf = false;
     for (size_t i = 0; i < out.size(); i++) {
         if (out[i] == '\r') {
-            if (i + 1 < out.size() && out[i + 1] == '\n') continue;
+            if (i + 1 < out.size() && out[i + 1] == '\n') {
+                if (had_crlf) *had_crlf = true;
+                continue;
+            }
             norm += '\n';
         } else {
             norm += out[i];

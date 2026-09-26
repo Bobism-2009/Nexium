@@ -208,9 +208,12 @@ void agent_apply_write(const std::string& path, const std::string& content) {
     std::string parent = path_parent(abs);
     if (!parent.empty()) make_dir(parent);
     file_write(abs, content);
+    // Applied as an ordinary edit so the agent's change can be undone and the
+    // undo history stays in step with the text.
     for (auto& b : g_app->buffers) {
         if (!b.untitled && path_norm(b.path) == abs) {
-            b.text = content;
+            buffer_set_text(b, content);
+            b.saved_undo_pos = b.undo_pos;
             b.dirty = false;
             buffer_refresh(b);
         }
