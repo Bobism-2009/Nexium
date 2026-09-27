@@ -1,0 +1,581 @@
+// Commands: one table behind the menus, the command palette and shortcuts.
+
+fn cmd(id: string, label: string, keys: string) {
+    cmd_ids.push(id);
+    cmd_labels.push(label);
+    cmd_keys.push(keys);
+}
+
+fn cmd_init() {
+    cmd("file.new", "File: New File", "Ctrl+N");
+    cmd("file.open", "File: Open File...", "Ctrl+O");
+    cmd("file.openFolder", "File: Open Folder...", "Ctrl+K Ctrl+O");
+    cmd("file.save", "File: Save", "Ctrl+S");
+    cmd("file.saveAs", "File: Save As...", "Ctrl+Shift+S");
+    cmd("file.saveAll", "File: Save All", "Ctrl+K S");
+    cmd("file.close", "View: Close Editor", "Ctrl+W");
+    cmd("file.closeAll", "View: Close All Editors", "Ctrl+K W");
+    cmd("file.closeFolder", "File: Close Folder", "");
+    cmd("file.revert", "File: Revert File", "");
+    cmd("file.reveal", "File: Reveal Active File in File Explorer", "");
+    cmd("file.copyPath", "File: Copy Path of Active File", "");
+    cmd("app.settings", "Preferences: Open Settings", "Ctrl+,");
+    cmd("app.exit", "File: Exit", "Alt+F4");
+    cmd("edit.undo", "Edit: Undo", "Ctrl+Z");
+    cmd("edit.redo", "Edit: Redo", "Ctrl+Y");
+    cmd("edit.cut", "Edit: Cut", "Ctrl+X");
+    cmd("edit.copy", "Edit: Copy", "Ctrl+C");
+    cmd("edit.paste", "Edit: Paste", "Ctrl+V");
+    cmd("edit.find", "Edit: Find", "Ctrl+F");
+    cmd("edit.replace", "Edit: Replace", "Ctrl+H");
+    cmd("edit.findNext", "Edit: Find Next", "F3");
+    cmd("edit.findPrev", "Edit: Find Previous", "Shift+F3");
+    cmd("edit.findInFiles", "Search: Find in Files", "Ctrl+Shift+F");
+    cmd("edit.comment", "Edit: Toggle Line Comment", "Ctrl+/");
+    cmd("edit.trim", "Edit: Trim Trailing Whitespace", "");
+    cmd("edit.upper", "Edit: Transform to Uppercase", "");
+    cmd("edit.lower", "Edit: Transform to Lowercase", "");
+    cmd("sel.all", "Selection: Select All", "Ctrl+A");
+    cmd("sel.line", "Selection: Expand Line Selection", "Ctrl+L");
+    cmd("sel.copyUp", "Selection: Copy Line Up", "Shift+Alt+Up");
+    cmd("sel.copyDown", "Selection: Copy Line Down", "Shift+Alt+Down");
+    cmd("sel.moveUp", "Selection: Move Line Up", "Alt+Up");
+    cmd("sel.moveDown", "Selection: Move Line Down", "Alt+Down");
+    cmd("sel.duplicate", "Selection: Duplicate Line", "Ctrl+D");
+    cmd("sel.deleteLine", "Selection: Delete Line", "Ctrl+Shift+K");
+    cmd("sel.indent", "Selection: Indent Line", "Ctrl+]");
+    cmd("sel.outdent", "Selection: Outdent Line", "Ctrl+[");
+    cmd("view.palette", "View: Command Palette", "Ctrl+Shift+P");
+    cmd("view.quickOpen", "Go: Go to File...", "Ctrl+P");
+    cmd("view.explorer", "View: Show Explorer", "Ctrl+Shift+E");
+    cmd("view.search", "View: Show Search", "Ctrl+Shift+F");
+    cmd("view.sidebar", "View: Toggle Primary Side Bar", "Ctrl+B");
+    cmd("view.panel", "View: Toggle Panel", "Ctrl+J");
+    cmd("view.problems", "View: Show Problems", "Ctrl+Shift+M");
+    cmd("view.output", "View: Show Output", "Ctrl+Shift+U");
+    cmd("view.terminal", "View: Toggle Terminal", "Ctrl+`");
+    cmd("view.zoomIn", "View: Increase Font Size", "Ctrl+=");
+    cmd("view.zoomOut", "View: Decrease Font Size", "Ctrl+-");
+    cmd("view.zoomReset", "View: Reset Font Size", "Ctrl+0");
+    cmd("view.whitespace", "View: Toggle Render Whitespace", "");
+    cmd("go.line", "Go: Go to Line...", "Ctrl+G");
+    cmd("go.symbol", "Go: Go to Symbol in Editor...", "Ctrl+Shift+O");
+    cmd("go.definition", "Go: Go to Definition", "F12");
+    cmd("go.bracket", "Go: Go to Bracket", "Ctrl+Shift+\\");
+    cmd("go.nextTab", "View: Open Next Editor", "Ctrl+Tab");
+    cmd("go.prevTab", "View: Open Previous Editor", "Ctrl+Shift+Tab");
+    cmd("run.run", "Run: Build and Run", "F5");
+    cmd("run.build", "Run: Build", "Ctrl+Shift+B");
+    cmd("run.stop", "Run: Stop", "Shift+F5");
+    cmd("run.check", "Run: Check Active File", "");
+    cmd("term.new", "Terminal: Restart Terminal", "");
+    cmd("term.clear", "Terminal: Clear", "");
+    cmd("help.welcome", "Help: Welcome", "");
+    cmd("help.docs", "Help: Nexa Documentation", "");
+    cmd("help.repo", "Help: Nexium on GitHub", "");
+    cmd("help.about", "Help: About", "");
+}
+
+fn cmd_index(id: string): int {
+    return cmd_ids.index_of(id);
+}
+
+fn cmd_short_label(id: string): string {
+    let i = cmd_index(id);
+    if (i < 0) { return id; }
+    let l: string = cmd_labels[i];
+    let c = l.index_of(": ");
+    if (c >= 0) { return l.substring(c + 2, -1); }
+    return l;
+}
+
+fn cmd_shortcut(id: string): string {
+    let i = cmd_index(id);
+    if (i < 0) { return ""; }
+    return cmd_keys[i];
+}
+
+fn run_cmd(id: string) {
+    menu_open = -1;
+    ctx_open = false;
+    frame_dirty = true;
+    let file_tab = is_file_tab();
+    switch (id) {
+        case "file.new": new_untitled(); break;
+        case "file.open": open_file_dialog(); break;
+        case "file.openFolder": open_folder_dialog(); break;
+        case "file.save": save_doc(); break;
+        case "file.saveAs": save_doc_as(); break;
+        case "file.saveAll": save_all(); break;
+        case "file.close": close_tab(active); break;
+        case "file.closeAll": close_all(); break;
+        case "file.closeFolder":
+            if (close_all()) {
+                folder = "";
+                refresh_tree();
+                save_settings();
+                update_title();
+            }
+            break;
+        case "file.revert":
+            if (file_tab && len(doc_path) > 0) {
+                doc_saved = -1;
+                bufs[active].mtime = 0;
+                doc_ver = 0;
+                doc_saved = 0;
+                doc_store();
+                bufs[active].saved = bufs[active].ver;
+                check_disk_changes();
+            }
+            break;
+        case "file.reveal": if (len(doc_path) > 0) { nx_reveal(doc_path); } break;
+        case "file.copyPath": if (len(doc_path) > 0) { nx_clip_set(doc_path); } break;
+        case "app.settings": open_special(1); break;
+        case "app.exit": quit_requested = true; break;
+        case "edit.undo": if (file_tab) { undo(); } break;
+        case "edit.redo": if (file_tab) { redo(); } break;
+        case "edit.cut": if (file_tab) { copy_sel(true); } break;
+        case "edit.copy": if (file_tab) { copy_sel(false); } break;
+        case "edit.paste": if (file_tab) { paste(); } break;
+        case "edit.find": open_find(false); break;
+        case "edit.replace": open_find(true); break;
+        case "edit.findNext": if (file_tab) { find_open = true; find_next(1); } break;
+        case "edit.findPrev": if (file_tab) { find_open = true; find_next(-1); } break;
+        case "edit.findInFiles": show_search(); break;
+        case "edit.comment": if (file_tab) { toggle_comment(); } break;
+        case "edit.trim": if (file_tab) { trim_trailing(); } break;
+        case "edit.upper": if (file_tab) { change_case(true); } break;
+        case "edit.lower": if (file_tab) { change_case(false); } break;
+        case "sel.all":
+            if (file_tab) {
+                ay = 0;
+                ax = 0;
+                cy = len(L) - 1;
+                cx = len(L[cy]);
+            }
+            break;
+        case "sel.line": if (file_tab) { select_line(); } break;
+        case "sel.copyUp": if (file_tab) { copy_lines(-1); } break;
+        case "sel.copyDown": if (file_tab) { copy_lines(1); } break;
+        case "sel.moveUp": if (file_tab) { move_lines(-1); } break;
+        case "sel.moveDown": if (file_tab) { move_lines(1); } break;
+        case "sel.duplicate": if (file_tab) { copy_lines(1); } break;
+        case "sel.deleteLine": if (file_tab) { delete_lines(); } break;
+        case "sel.indent": if (file_tab) { indent_lines(false); } break;
+        case "sel.outdent": if (file_tab) { indent_lines(true); } break;
+        case "view.palette": open_quick(">"); break;
+        case "view.quickOpen": open_quick(""); break;
+        case "view.explorer":
+            show_sidebar = true;
+            view = 0;
+            focus = F_TREE;
+            break;
+        case "view.search": show_search(); break;
+        case "view.sidebar": show_sidebar = !show_sidebar; break;
+        case "view.panel": show_panel = !show_panel; break;
+        case "view.problems": show_panel_tab(0); break;
+        case "view.output": show_panel_tab(1); break;
+        case "view.terminal":
+            if (show_panel && panel_tab == 2 && focus == F_TERM) {
+                show_panel = false;
+                focus = F_EDITOR;
+            } else {
+                show_panel_tab(2);
+                focus = F_TERM;
+            }
+            break;
+        case "view.zoomIn": set_font_size(font_size + 1); break;
+        case "view.zoomOut": set_font_size(font_size - 1); break;
+        case "view.zoomReset": set_font_size(14); break;
+        case "view.whitespace": show_ws = !show_ws; break;
+        case "go.line": open_quick(":"); break;
+        case "go.symbol": open_quick("@"); break;
+        case "go.definition": if (file_tab) { goto_definition(word_at(cy, cx)); } break;
+        case "go.bracket": if (file_tab) { jump_bracket(); } break;
+        case "go.nextTab": if (len(bufs) > 0) { switch_to((active + 1) % len(bufs)); } break;
+        case "go.prevTab": if (len(bufs) > 0) { switch_to((active + len(bufs) - 1) % len(bufs)); } break;
+        case "run.run": run_task(true); break;
+        case "run.build": run_task(false); break;
+        case "run.stop": stop_task(); break;
+        case "run.check":
+            check_due = now_ms;
+            break;
+        case "term.new":
+            if (term_proc >= 0) {
+                nx_proc_free(term_proc);
+                term_proc = -1;
+            }
+            term_lines.clear();
+            term_partial = "";
+            show_panel_tab(2);
+            focus = F_TERM;
+            break;
+        case "term.clear":
+            term_lines.clear();
+            break;
+        case "help.welcome": open_special(2); break;
+        case "help.docs": os.open("https://github.com/Bobism-2009/Nexa-Lang/tree/main/SYNTAX"); break;
+        case "help.repo": os.open("https://github.com/Roms-lab/Nexium"); break;
+        case "help.about":
+            nx_message("Nexium " + VERSION + "\n\nA code editor for the Nexa language, written in Nexa and drawn with std/ui.\n\nCompiler: " + (len(nexac_version) > 0 ? nexac_version : "not found"));
+            break;
+        default: break;
+    }
+    if (active >= 0 && file_tab) { clamp_cursor(); }
+}
+
+fn show_search() {
+    show_sidebar = true;
+    view = 1;
+    focus = F_SEARCH;
+    let t = sel_text();
+    if (is_file_tab() && len(t) > 0 && !t.contains("\n")) { fld_set(FLD_SEARCH, t); }
+    fld_select_all(FLD_SEARCH);
+}
+
+fn show_panel_tab(t: int) {
+    show_panel = true;
+    panel_tab = t;
+    if (t == 2) { ensure_terminal(); }
+}
+
+fn set_font_size(n: int) {
+    font_size = clamp(n, 8, 32);
+    metrics_init();
+    frame_dirty = true;
+    save_settings();
+}
+
+// ---- menus ---------------------------------------------------------------------------------------------
+
+fn menu_items(m: int): []string {
+    if (m == 0) { return ["file.new", "file.open", "file.openFolder", "-", "file.save", "file.saveAs", "file.saveAll", "-", "file.revert", "file.close", "file.closeAll", "file.closeFolder", "-", "app.settings", "-", "app.exit"]; }
+    if (m == 1) { return ["edit.undo", "edit.redo", "-", "edit.cut", "edit.copy", "edit.paste", "-", "edit.find", "edit.replace", "edit.findInFiles", "-", "edit.comment", "edit.trim", "edit.upper", "edit.lower"]; }
+    if (m == 2) { return ["sel.all", "sel.line", "-", "sel.copyUp", "sel.copyDown", "sel.moveUp", "sel.moveDown", "sel.duplicate", "sel.deleteLine", "-", "sel.indent", "sel.outdent"]; }
+    if (m == 3) { return ["view.palette", "view.quickOpen", "-", "view.explorer", "view.search", "view.problems", "view.output", "view.terminal", "-", "view.sidebar", "view.panel", "view.whitespace", "-", "view.zoomIn", "view.zoomOut", "view.zoomReset"]; }
+    if (m == 4) { return ["view.quickOpen", "go.line", "go.symbol", "go.definition", "go.bracket", "-", "go.nextTab", "go.prevTab"]; }
+    if (m == 5) { return ["run.run", "run.build", "run.stop", "-", "run.check"]; }
+    if (m == 6) { return ["view.terminal", "term.new", "term.clear", "-", "run.run", "run.build"]; }
+    if (m == 7) { return ["help.welcome", "view.palette", "-", "help.docs", "help.repo", "-", "help.about"]; }
+    // the explorer's context menu
+    if (m == 100) {
+        if (ctx_isdir) { return ["ctx.newFile", "ctx.newFolder", "-", "ctx.reveal", "ctx.copyPath", "ctx.copyRel", "-", "ctx.terminal", "-", "ctx.rename", "ctx.delete"]; }
+        return ["ctx.open", "-", "ctx.reveal", "ctx.copyPath", "ctx.copyRel", "-", "ctx.rename", "ctx.delete"];
+    }
+    // the editor's context menu
+    if (m == 102) { return ["go.definition", "-", "edit.cut", "edit.copy", "edit.paste", "-", "edit.comment", "sel.all", "edit.find", "-", "view.palette"]; }
+    // a tab's context menu
+    if (m == 101) { return ["tab.close", "tab.closeOthers", "tab.closeAll", "-", "tab.copyPath", "tab.reveal"]; }
+    return [];
+}
+
+fn ctx_label(id: string): string {
+    switch (id) {
+        case "ctx.newFile": return "New File...";
+        case "ctx.newFolder": return "New Folder...";
+        case "ctx.open": return "Open";
+        case "ctx.reveal": return "Reveal in File Explorer";
+        case "ctx.copyPath": return "Copy Path";
+        case "ctx.copyRel": return "Copy Relative Path";
+        case "ctx.terminal": return "Open in Integrated Terminal";
+        case "ctx.rename": return "Rename...";
+        case "ctx.delete": return "Delete";
+        case "tab.close": return "Close";
+        case "tab.closeOthers": return "Close Others";
+        case "tab.closeAll": return "Close All";
+        case "tab.copyPath": return "Copy Path";
+        case "tab.reveal": return "Reveal in File Explorer";
+        default: break;
+    }
+    return cmd_short_label(id);
+}
+
+fn ctx_keys(id: string): string {
+    if (id == "ctx.rename") { return "F2"; }
+    if (id == "ctx.delete") { return "Delete"; }
+    if (id == "tab.close") { return "Ctrl+W"; }
+    if (id.starts_with("ctx.") || id.starts_with("tab.")) { return ""; }
+    return cmd_shortcut(id);
+}
+
+fn run_ctx(id: string) {
+    menu_open = -1;
+    let p = ctx_path;
+    switch (id) {
+        case "ctx.newFile": start_new(p, 1); break;
+        case "ctx.newFolder": start_new(p, 2); break;
+        case "ctx.open":
+            open_file(p, false);
+            focus = F_EDITOR;
+            break;
+        case "ctx.reveal": nx_reveal(p); break;
+        case "ctx.copyPath": nx_clip_set(p); break;
+        case "ctx.copyRel": nx_clip_set(rel_path(p)); break;
+        case "ctx.terminal":
+            show_panel_tab(2);
+            nx_proc_write(term_proc, "cd /d \"" + p + "\"\r\n");
+            focus = F_TERM;
+            break;
+        case "ctx.rename": start_rename(p); break;
+        case "ctx.delete": delete_path(p); break;
+        case "tab.close": close_tab(tab_ctx); break;
+        case "tab.closeOthers": close_others(tab_ctx); break;
+        case "tab.closeAll": close_all(); break;
+        case "tab.copyPath":
+            if (tab_ctx >= 0 && tab_ctx < len(bufs)) { nx_clip_set(bufs[tab_ctx].path); }
+            break;
+        case "tab.reveal":
+            if (tab_ctx >= 0 && tab_ctx < len(bufs)) {
+                let bp: string = bufs[tab_ctx].path;
+                if (len(bp) > 0) { nx_reveal(bp); }
+            }
+            break;
+        default: break;
+    }
+}
+
+fn open_ctx_menu(x: int, y: int) {
+    menu_open = 100;
+    menu_x = x;
+    menu_y = y;
+    menu_hover = -1;
+}
+
+fn menu_label_x(m: int): int {
+    let names = MENU_NAMES.split(" ");
+    let x = px(40);
+    for (i, m) { x += tw(names[i], UI) + px(16); }
+    return x;
+}
+
+// Geometry of the open menu.
+fn menu_width(items: []string): int {
+    let w = px(220);
+    for (id in items) {
+        if (id == "-") { continue; }
+        let lw = tw(ctx_label(id), UI) + tw(ctx_keys(id), UI) + px(80);
+        w = imax(w, lw);
+    }
+    return w;
+}
+
+fn menu_height(items: []string): int {
+    let h = px(8);
+    for (id in items) { h += id == "-" ? px(9) : px(26); }
+    return h;
+}
+
+fn menu_origin_x(): int {
+    if (menu_open >= 100) { return menu_x; }
+    return menu_label_x(menu_open) - px(4);
+}
+
+fn menu_origin_y(): int {
+    if (menu_open >= 100) { return menu_y; }
+    return TOOLBAR_H - px(4);
+}
+
+fn draw_menu() {
+    if (menu_open < 0) { return; }
+    let items = menu_items(menu_open);
+    let w = menu_width(items);
+    let h = menu_height(items);
+    let x = menu_origin_x();
+    let y = menu_origin_y();
+    if (x + w > win_w - px(4)) { x = win_w - w - px(4); }
+    if (y + h > win_h - px(4)) { y = imax(px(4), win_h - h - px(4)); }
+    menu_x_draw = x;
+    menu_y_draw = y;
+    ui.panel(x, y, w, h);
+    fill(x + 1, y + 1, w - 2, h - 2, C_EDITOR);
+    rrect_line(x, y, w, h, px(5), 0x454545);
+    let ry = y + px(4);
+    menu_hover = -1;
+    for (i, len(items)) {
+        let id: string = items[i];
+        if (id == "-") {
+            hline(x + px(10), ry + px(4), w - px(20), 0x454545);
+            ry += px(9);
+            continue;
+        }
+        let rh = px(26);
+        if (hovered(x + px(4), ry, w - px(8), rh)) {
+            rrect(x + px(4), ry, w - px(8), rh, px(4), C_ACCENT);
+            menu_hover = i;
+        }
+        let tc = menu_hover == i ? C_BRIGHT : C_TEXT;
+        if (id == "ctx.delete" && menu_hover != i) { tc = C_TEXT; }
+        txt_v(x + px(24), ry, rh, ctx_label(id), tc, UI);
+        let k = ctx_keys(id);
+        if (len(k) > 0) {
+            let kw = tw(k, UI);
+            txt_v(x + w - kw - px(20), ry, rh, k, menu_hover == i ? C_BRIGHT : C_MUTED, UI);
+        }
+        ry += rh;
+    }
+}
+
+// Mouse down while a menu is open; returns true if it used the click.
+fn menu_mouse(x: int, y: int): bool {
+    let items = menu_items(menu_open);
+    let w = menu_width(items);
+    let h = menu_height(items);
+    if (!inside(x, y, menu_x_draw, menu_y_draw, w, h)) {
+        let was = menu_open;
+        menu_open = -1;
+        // a click on another menu title switches to it (handled by the toolbar)
+        if (was < 100 && y < TOOLBAR_H) { return false; }
+        return true;
+    }
+    let ry = menu_y_draw + px(4);
+    for (i, len(items)) {
+        let id: string = items[i];
+        let rh = id == "-" ? px(9) : px(26);
+        if (y >= ry && y < ry + rh && id != "-") {
+            let m = menu_open;
+            menu_open = -1;
+            if (m >= 100) {
+                run_ctx(id);
+            } else {
+                run_cmd(id);
+            }
+            return true;
+        }
+        ry += rh;
+    }
+    return true;
+}
+
+// ---- build and run ------------------------------------------------------------------------------------------
+
+fn find_compiler(): string {
+    let names: []string;
+    if (len(nexac) > 0) { names.push(nexac); }
+    names.push("NexaC");
+    names.push("Nexa");
+    names.push("nexac");
+    for (n in names) {
+        if (file.isfile(n)) { return n; }
+        let p: string = nx_which(n);
+        if (len(p) > 0) { return p; }
+    }
+    return "";
+}
+
+fn detect_compiler_version() {
+    let c = find_compiler();
+    nexac_version = "";
+    if (len(c) == 0) { return; }
+    let out: string = os.system("\"" + c + "\" --version 2>nul");
+    nexac_version = out.trim();
+}
+
+// The folder a project builds in: the one with nexapkg.json, or the active
+// file's folder.
+fn project_dir(): string {
+    if (len(folder) > 0) {
+        if (file.isfile(path_join(folder, "nexapkg.json"))) { return folder; }
+        let src = path_join(folder, "src");
+        if (file.isfile(path_join(src, "nexapkg.json"))) { return src; }
+    }
+    if (is_file_tab() && len(doc_path) > 0 && doc_path.lower().ends_with(".nxa")) { return file.dirname(doc_path); }
+    return folder;
+}
+
+// The .nxa with fn main() to build when there is no nexapkg.json.
+fn entry_file(dir: string): string {
+    if (is_file_tab() && len(doc_path) > 0 && doc_path.lower().ends_with(".nxa")) {
+        for (s in L) {
+            if (s.trim().starts_with("fn main(")) { return doc_path; }
+        }
+    }
+    let main_nxa = path_join(dir, "main.nxa");
+    if (file.isfile(main_nxa)) { return main_nxa; }
+    for (e in list_dir(dir)) {
+        let nm = e.substring(2, -1);
+        if (e.starts_with("f|") && nm.lower().ends_with(".nxa")) {
+            let p = path_join(dir, nm);
+            let t: string = file.read(p);
+            if (t.contains("fn main(")) { return p; }
+        }
+    }
+    if (is_file_tab() && doc_path.lower().ends_with(".nxa")) { return doc_path; }
+    return "";
+}
+
+fn run_task(execute: bool) {
+    save_all();
+    let c = find_compiler();
+    show_panel_tab(1);
+    if (len(c) == 0) {
+        out_lines.clear();
+        log_out("The Nexa compiler was not found. Install NexaC (https://github.com/Bobism-2009/Nexa-Lang/releases) or set its path in Settings.");
+        return;
+    }
+    let dir = project_dir();
+    if (len(dir) == 0) {
+        log_out("Open a folder or a .nxa file first.");
+        return;
+    }
+    stop_task();
+    let cmdline = "";
+    let label = "";
+    if (file.isfile(path_join(dir, "nexapkg.json"))) {
+        cmdline = "\"" + c + "\" build";
+        label = "build";
+        if (execute) {
+            let m: Json = json.parse(file.read(path_join(dir, "nexapkg.json")));
+            let exe = "";
+            if (m.ok() && m.has("output")) { exe = m.get("output").as_string(); }
+            if (len(exe) == 0 && m.ok() && m.has("entry")) {
+                let en = m.get("entry").as_string();
+                exe = en.substring(0, len(en) - len(file.extension(en)));
+            }
+            if (len(exe) > 0) {
+                if (!exe.lower().ends_with(".exe")) { exe += ".exe"; }
+                cmdline += " && \"" + exe + "\"";
+                if (len(run_args.trim()) > 0) { cmdline += " " + run_args; }
+            }
+        }
+    } else {
+        let entry = entry_file(dir);
+        if (len(entry) == 0) {
+            log_out("No .nxa file with fn main() in " + dir + ".");
+            return;
+        }
+        let exe = entry.substring(0, len(entry) - 4) + ".exe";
+        cmdline = "\"" + c + "\" \"" + entry + "\" -o \"" + exe + "\"";
+        if (execute) {
+            cmdline += " && \"" + exe + "\"";
+            if (len(run_args.trim()) > 0) { cmdline += " " + run_args; }
+        }
+    }
+    label = execute ? "Run" : "Build";
+    out_lines.clear();
+    out_partial = "";
+    clear_problems_from("build");
+    log_out("> " + cmdline);
+    log_out("");
+    task_proc = nx_proc_start(cmdline, dir);
+    task_label = label;
+    task_start_ms = now_ms;
+    task_exit = -2;
+    out_follow = true;
+    if (task_proc < 0) { log_out("Could not start the build."); }
+}
+
+fn stop_task() {
+    if (task_proc >= 0) {
+        if (nx_proc_running(task_proc) == 1) {
+            nx_proc_kill(task_proc);
+            log_out("");
+            log_out("[stopped]");
+        }
+        nx_proc_free(task_proc);
+        task_proc = -1;
+    }
+}
+
+fn task_running(): bool {
+    return task_proc >= 0 && task_exit == -2;
+}

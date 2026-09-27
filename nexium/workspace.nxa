@@ -1,0 +1,923 @@
+// The open folder: file tree, workspace search, the file index behind quick
+// open, and the quick-open box itself.
+
+fn path_join(a: string, b: string): string {
+    if (len(a) == 0) { return b; }
+    if (a.ends_with("\\") || a.ends_with("/")) { return a + b; }
+    return a + "\\" + b;
+}
+
+fn rel_path(p: string): string {
+    if (len(folder) > 0 && p.lower().starts_with(folder.lower())) {
+        let r = p.substring(len(folder), -1);
+        while (r.starts_with("\\") || r.starts_with("/")) { r = r.substring(1, -1); }
+        return r;
+    }
+    return p;
+}
+
+fn skip_dir(name: string): bool {
+    return name == ".git" || name == "node_modules" || name == ".nexa" || name == "__pycache__" || name == ".vs";
+}
+
+// Directory entries, folders first, as "d|name" / "f|name"; cached until refresh_tree.
+fn list_dir(dir: string): []string {
+    if (dir_cache.has(dir)) { return dir_cache[dir]; }
+    let dirs: []string;
+    let files: []string;
+    let names: []string = file.list(dir);
+    for (nm in names) {
+        if (nm == "." || nm == ".." || nm == ".git") { continue; }
+        if (file.isdir(path_join(dir, nm))) {
+            dirs.push(nm.lower() + "|" + nm);
+        } else {
+            files.push(nm.lower() + "|" + nm);
+        }
+    }
+    dirs.sort();
+    files.sort();
+    let out: []string;
+    for (d in dirs) { out.push("d|" + d.substring(d.index_of("|") + 1, -1)); }
+    for (f in files) { out.push("f|" + f.substring(f.index_of("|") + 1, -1)); }
+    dir_cache[dir] = out;
+    return out;
+}
+
+fn refresh_tree() {
+    dir_cache.clear();
+    files_index_ms = 0;
+    read_git_branch();
+    frame_dirty = true;
+}
+
+fn tree_walk(dir: string, depth: int) {
+    let entries = list_dir(dir);
+    for (e in entries) {
+        let isdir = e.starts_with("d|");
+        let p = path_join(dir, e.substring(2, -1));
+        tree_rows.push(p);
+        tree_depth.push(depth);
+        tree_dir.push(isdir);
+        if (isdir && expanded.has(p) && expanded[p]) {
+            if (rename_mode > 0 && rename_mode < 3 && same_path(rename_parent, p)) { push_rename_row(depth + 1); }
+            tree_walk(p, depth + 1);
+        }
+    }
+}
+
+fn push_rename_row(depth: int) {
+    tree_rows.push("\x01new");
+    tree_depth.push(depth);
+    tree_dir.push(rename_mode == 2);
+}
+
+fn build_tree() {
+    tree_rows.clear();
+    tree_depth.clear();
+    tree_dir.clear();
+    if (len(folder) == 0 || tree_collapsed) { return; }
+    if (rename_mode > 0 && rename_mode < 3 && same_path(rename_parent, folder)) { push_rename_row(0); }
+    tree_walk(folder, 0);
+}
+
+fn set_folder(p: string) {
+    if (len(p) == 0 || !file.isdir(p)) { return; }
+    folder = file.abspath(p);
+    while (folder.ends_with("\\") && len(folder) > 3) { folder = folder.substring(0, len(folder) - 1); }
+    expanded.clear();
+    tree_scroll = 0;
+    tree_collapsed = false;
+    refresh_tree();
+    let keep: []string;
+    keep.push(folder);
+    for (r in recent) {
+        if (!same_path(r, folder) && len(keep) < 10) { keep.push(r); }
+    }
+    recent = keep;
+    if (term_proc >= 0) {
+        nx_proc_free(term_proc);
+        term_proc = -1;
+    }
+    show_sidebar = true;
+    view = 0;
+    save_settings();
+    update_title();
+}
+
+fn open_folder_dialog() {
+    let p: string = nx_pick_folder();
+    if (len(p) > 0) { set_folder(p); }
+}
+
+fn open_file_dialog() {
+    let p: string = nx_pick_file();
+    if (len(p) > 0) {
+        open_file(p, false);
+        focus = F_EDITOR;
+    }
+}
+
+fn read_git_branch() {
+    git_branch = "";
+    if (len(folder) == 0) { return; }
+    let head = path_join(folder, ".git\\HEAD");
+    if (!file.isfile(head)) { return; }
+    let raw: string = file.read(head);
+    let t = raw.trim();
+    if (t.starts_with("ref: refs/heads/")) {
+        git_branch = t.substring(16, -1);
+    } else if (len(t) >= 7) {
+        git_branch = t.substring(0, 7);
+    }
+}
+
+// ---- file index (quick open, search, go to definition) --------------------------------------
+
+fn index_walk(dir: string, depth: int) {
+    if (depth > 12 || len(files_index) >= 20000) { return; }
+    let entries = list_dir(dir);
+    for (e in entries) {
+        let nm = e.substring(2, -1);
+        let p = path_join(dir, nm);
+        if (e.starts_with("d|")) {
+            if (!skip_dir(nm)) { index_walk(p, depth + 1); }
+        } else {
+            files_index.push(p);
+        }
+    }
+}
+
+fn ensure_files_index() {
+    if (len(folder) == 0) {
+        files_index.clear();
+        return;
+    }
+    if (files_index_ms != 0 && now_ms - files_index_ms < 5000) { return; }
+    files_index.clear();
+    index_walk(folder, 0);
+    files_index_ms = now_ms;
+}
+
+fn is_text_file(p: string): bool {
+    let ext: string = file.extension(p);
+    let e = ext.lower();
+    let bin = [".exe", ".dll", ".o", ".obj", ".a", ".lib", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".res", ".zip", ".7z", ".pdf", ".wav", ".mp3", ".ogg", ".ttf", ".otf", ".woff", ".pdb", ".bin", ".dat", ".so", ".dylib", ".wasm"];
+    return !bin.contains(e);
+}
+
+// ---- explorer view -------------------------------------------------------------------------------
+
+fn chevron(x: int, y: int, down: bool, c: int) {
+    let s = px(3);
+    if (down) {
+        line(x - s, y - s / 2, x, y + s / 2, c, 1);
+        line(x, y + s / 2, x + s, y - s / 2, c, 1);
+    } else {
+        line(x - s / 2, y - s, x + s / 2, y, c, 1);
+        line(x + s / 2, y, x - s / 2, y + s, c, 1);
+    }
+}
+
+fn tree_row_y(i: int): int {
+    return side_y + HEADER_H + ROW_H + i * ROW_H - tree_scroll;
+}
+
+fn draw_explorer() {
+    let x = side_x;
+    let w = sidebar_w;
+    section_title(x, side_y, w, "EXPLORER");
+    let hy = side_y + HEADER_H;
+    if (len(folder) == 0) {
+        let tx = x + px(20);
+        let ty = hy + px(12);
+        ty += para(tx, ty, w - px(40), "You have not yet opened a folder.", C_TEXT, UI) + px(12);
+        if (ui.button(tx, ty, w - px(40), px(28), "Open Folder", "primary")) { open_folder_dialog(); }
+        ty += px(44);
+        ty += para(tx, ty, w - px(40), "Opening a folder lets you browse its files, search them and build the Nexa project in it.", C_MUTED, UI) + px(12);
+        if (ui.button(tx, ty, w - px(40), px(28), "Open File", "secondary")) { open_file_dialog(); }
+        return;
+    }
+    build_tree();
+    let body_top = hy + ROW_H;
+    let body_h = side_y + side_h - body_top;
+    let content = len(tree_rows) * ROW_H;
+    tree_scroll = clamp(tree_scroll, 0, imax(0, content - body_h + ROW_H));
+    let first = tree_scroll / ROW_H;
+    let i = first;
+    let tree_focus = focus == F_TREE;
+    while (i < len(tree_rows)) {
+        let y = tree_row_y(i);
+        if (y >= side_y + side_h) { break; }
+        let p: string = tree_rows[i];
+        let d: int = tree_depth[i];
+        let isdir: bool = tree_dir[i];
+        let ind = px(8) + d * px(8);
+        let rename_here = (p == "\x01new") || (rename_mode == 3 && same_path(p, rename_path));
+        if (p == tree_sel && !rename_here) {
+            fill(x, y, w, ROW_H, tree_focus ? 0x04395E : C_ACTIVE);
+            if (tree_focus) { outline(x, y, w, ROW_H, C_ACCENT); }
+        } else if (hovered(x, y, w, ROW_H) && drag == 0 && !rename_here) {
+            fill(x, y, w, ROW_H, C_HOVER);
+        }
+        // indent guides
+        for (g, d) {
+            vline(x + px(8) + g * px(8) + px(8), y, ROW_H, 0x3A3A3A);
+        }
+        let cxp = x + ind + px(8);
+        if (isdir) {
+            let open = expanded.has(p) && expanded[p];
+            chevron(cxp, y + ROW_H / 2, open, C_TEXT);
+        }
+        let ix = x + ind + px(18);
+        let name = file.basename(p);
+        if (rename_here) {
+            fld_draw(FLD_RENAME, ix, y + 1, w - (ix - x) - px(6), ROW_H - 2, focus == F_RENAME, isdir ? "Folder name" : "File name");
+            i++;
+            continue;
+        }
+        let tc = C_TEXT;
+        if (!isdir) {
+            draw_badge(ix, y, ROW_H, name);
+            if (active >= 0 && same_path(p, doc_path)) { tc = C_BRIGHT; }
+        } else {
+            ix -= px(2);
+            // a folder glyph: tab and body
+            fill(ix + px(1), y + px(6), px(6), px(2), 0xC09553);
+            fill(ix + px(1), y + px(8), px(13), px(8), 0xC09553);
+        }
+        let dirty_mark = false;
+        let bi = find_buf(p);
+        if (bi >= 0 && buf_dirty(bi)) { dirty_mark = true; }
+        txt_v(ix + px(20), y, ROW_H, fit(name, w - (ix - x) - px(34), UI), tc, UI);
+        if (dirty_mark) { disc(x + w - px(14), y + ROW_H / 2, px(4), C_TEXT); }
+        i++;
+    }
+    // folder header, drawn over rows scrolled under it
+    fill(x, hy, w, ROW_H, C_CHROME);
+    chevron(x + px(10), hy + ROW_H / 2, !tree_collapsed, C_TEXT);
+    txt_bold(x + px(20), hy, ROW_H, fit(upper_s(file.basename(folder)), w - px(120), UI_SMALL), UI_SMALL);
+    if (hovered(x, side_y, w, side_h)) {
+        // actions: new file, new folder, refresh, collapse
+        let ax_ = x + w - px(92);
+        if (icon_button(ax_, hy + 1, "newfile", "New File")) { start_new(folder, 1); }
+        if (icon_button(ax_ + px(22), hy + 1, "newfolder", "New Folder")) { start_new(folder, 2); }
+        if (icon_button(ax_ + px(44), hy + 1, "refresh", "Refresh")) { refresh_tree(); }
+        if (icon_button(ax_ + px(66), hy + 1, "collapse", "Collapse Folders")) { expanded.clear(); }
+    }
+    if (content > body_h) {
+        let th = imax(px(20), body_h * body_h / content);
+        let ty = body_top + (body_h - th) * tree_scroll / imax(1, content - body_h + ROW_H);
+        fill_a(x + w - px(10), ty, px(10), th, 0x797979, 70);
+    }
+}
+
+// A 20px icon button drawn with text; true when clicked.
+fn icon_button(x: int, y: int, label: string, tip: string): bool {
+    let s = px(20);
+    let hov = hovered(x, y, s, s);
+    if (hov) {
+        rrect(x, y, s, s, px(4), 0x3A3D41);
+        tooltip(tip);
+    }
+    draw_glyph(label, x, y, s, C_TEXT);
+    return clicked_in(x, y, s, s);
+}
+
+fn start_new(parent: string, mode: int) {
+    rename_mode = mode;
+    rename_parent = parent;
+    expanded[parent] = true;
+    fld_set(FLD_RENAME, "");
+    focus = F_RENAME;
+    tree_collapsed = false;
+    frame_dirty = true;
+}
+
+fn start_rename(p: string) {
+    rename_mode = 3;
+    rename_path = p;
+    rename_parent = file.dirname(p);
+    let nm = file.basename(p);
+    fld_set(FLD_RENAME, nm);
+    let dot = nm.last_index_of(".");
+    if (dot > 0) {
+        fld_anchor[FLD_RENAME] = 0;
+        fld_caret[FLD_RENAME] = dot;
+    } else {
+        fld_select_all(FLD_RENAME);
+    }
+    focus = F_RENAME;
+}
+
+fn finish_rename(commit: bool) {
+    let name: string = fld_text[FLD_RENAME].trim();
+    let mode = rename_mode;
+    rename_mode = 0;
+    focus = F_TREE;
+    if (!commit || len(name) == 0) {
+        frame_dirty = true;
+        return;
+    }
+    if (mode == 1 || mode == 2) {
+        let p = path_join(rename_parent, name);
+        if (file.exists(p)) {
+            nx_message("A file or folder named " + name + " already exists here.");
+        } else if (mode == 1) {
+            let dir = file.dirname(p);
+            if (!file.isdir(dir)) { file.mkdir(dir); }
+            file.write(p, "");
+            refresh_tree();
+            open_file(p, false);
+            tree_sel = p;
+            focus = F_EDITOR;
+        } else {
+            file.mkdir(p);
+            expanded[p] = true;
+            tree_sel = p;
+        }
+    } else if (mode == 3) {
+        let np = path_join(rename_parent, name);
+        if (!same_path(np, rename_path)) {
+            if (file.rename(rename_path, np)) {
+                // open tabs follow the rename
+                doc_store();
+                for (i, len(bufs)) {
+                    let bp: string = bufs[i].path;
+                    if (len(bp) > 0 && bp.lower().starts_with(rename_path.lower())) {
+                        let nbp = np + bp.substring(len(rename_path), -1);
+                        bufs[i].path = nbp;
+                        bufs[i].name = file.basename(nbp);
+                        bufs[i].lang = lang_for(nbp);
+                    }
+                }
+                let keep = active;
+                active = -1;
+                doc_load(keep);
+                tree_sel = np;
+            } else {
+                nx_message("Could not rename " + file.basename(rename_path) + ".");
+            }
+        }
+    }
+    refresh_tree();
+}
+
+fn delete_path(p: string) {
+    let nm = file.basename(p);
+    let isdir: bool = file.isdir(p) == 1;
+    let what = isdir ? "the folder '" + nm + "' and everything in it" : "'" + nm + "'";
+    if (nx_confirm("Are you sure you want to delete " + what + "? This cannot be undone.") == 0) { return; }
+    let ok = isdir ? file.remove_all(p) : file.remove(p);
+    if (!ok) {
+        nx_message("Could not delete " + nm + ".");
+    }
+    // close tabs of deleted files
+    let i = len(bufs) - 1;
+    while (i >= 0) {
+        let bp: string = bufs[i].path;
+        if (len(bp) > 0 && bp.lower().starts_with(p.lower()) && !file.exists(bp)) {
+            doc_store();
+            bufs[i].ver = bufs[i].saved;
+            if (i == active) { doc_saved = doc_ver; }
+            close_tab(i);
+        }
+        i--;
+    }
+    refresh_tree();
+}
+
+fn explorer_mouse(x: int, y: int, btn: int, clicks: int) {
+    if (len(folder) == 0) { return; }
+    let hy = side_y + HEADER_H;
+    if (y < hy) { return; }
+    if (y < hy + ROW_H) {
+        if (x < side_x + sidebar_w - px(96) || !hovered(side_x, side_y, sidebar_w, side_h)) {
+            tree_collapsed = !tree_collapsed;
+        }
+        return;
+    }
+    let i = (y - hy - ROW_H + tree_scroll) / ROW_H;
+    if (i < 0 || i >= len(tree_rows)) {
+        if (btn == 1) {
+            ctx_path = folder;
+            ctx_isdir = true;
+            open_ctx_menu(x, y);
+        }
+        tree_sel = "";
+        focus = F_TREE;
+        return;
+    }
+    let p: string = tree_rows[i];
+    if (p == "\x01new" || (rename_mode == 3 && same_path(p, rename_path))) {
+        focus = F_RENAME;
+        return;
+    }
+    if (rename_mode > 0) { finish_rename(true); }
+    tree_sel = p;
+    focus = F_TREE;
+    let isdir: bool = tree_dir[i];
+    if (btn == 1) {
+        ctx_path = p;
+        ctx_isdir = isdir;
+        open_ctx_menu(x, y);
+        return;
+    }
+    if (isdir) {
+        expanded[p] = !(expanded.has(p) && expanded[p]);
+    } else {
+        open_file(p, clicks < 2);
+        if (clicks >= 2) {
+            if (active >= 0) { bufs[active].preview = false; }
+            focus = F_EDITOR;
+        }
+    }
+    frame_dirty = true;
+}
+
+fn tree_key(vk: int, mods: int) {
+    build_tree();
+    let n = len(tree_rows);
+    if (n == 0) { return; }
+    let i = tree_rows.index_of(tree_sel);
+    if (vk == K_DOWN) {
+        i = imin(n - 1, i + 1);
+    } else if (vk == K_UP) {
+        i = imax(0, i - 1);
+    } else if (vk == K_HOME) {
+        i = 0;
+    } else if (vk == K_END) {
+        i = n - 1;
+    } else if (vk == K_RIGHT && i >= 0 && tree_dir[i]) {
+        expanded[tree_rows[i]] = true;
+    } else if (vk == K_LEFT && i >= 0) {
+        if (tree_dir[i] && expanded.has(tree_rows[i]) && expanded[tree_rows[i]]) {
+            expanded[tree_rows[i]] = false;
+        } else {
+            let par = file.dirname(tree_rows[i]);
+            let pi = tree_rows.index_of(par);
+            if (pi >= 0) { i = pi; }
+        }
+    } else if (vk == K_ENTER && i >= 0) {
+        if (tree_dir[i]) {
+            expanded[tree_rows[i]] = !(expanded.has(tree_rows[i]) && expanded[tree_rows[i]]);
+        } else {
+            open_file(tree_rows[i], false);
+            focus = F_EDITOR;
+        }
+    } else if (vk == K_F2 && i >= 0) {
+        start_rename(tree_rows[i]);
+    } else if (vk == K_DELETE && i >= 0) {
+        delete_path(tree_rows[i]);
+        return;
+    } else if (vk == K_ESC) {
+        focus = F_EDITOR;
+    }
+    if (i >= 0 && i < n) {
+        tree_sel = tree_rows[i];
+        // keep the selection in view
+        let top = i * ROW_H;
+        let body_h = side_h - HEADER_H - ROW_H;
+        if (top < tree_scroll) { tree_scroll = top; }
+        if (top + ROW_H > tree_scroll + body_h) { tree_scroll = top + ROW_H - body_h; }
+    }
+    frame_dirty = true;
+}
+
+fn rename_key(vk: int, mods: int) {
+    if (vk == K_ENTER) {
+        finish_rename(true);
+        return;
+    }
+    if (vk == K_ESC) {
+        finish_rename(false);
+        return;
+    }
+    fld_key(FLD_RENAME, vk, mods);
+}
+
+// ---- search view ---------------------------------------------------------------------------------------
+
+fn run_search() {
+    search_files.clear();
+    search_lines.clear();
+    search_cols.clear();
+    search_text.clear();
+    search_scroll = 0;
+    let pat: string = fld_text[FLD_SEARCH];
+    if (len(pat) == 0 || len(folder) == 0) {
+        search_summary = "";
+        return;
+    }
+    doc_store();
+    ensure_files_index();
+    let p = search_case ? pat : pat.lower();
+    let nfiles = 0;
+    let nhits = 0;
+    for (f in files_index) {
+        if (!is_text_file(f)) { continue; }
+        let size: int = file.size(f);
+        if (size > 4 * 1024 * 1024) { continue; }
+        // an open buffer's unsaved text is what gets searched
+        let lines: []string;
+        let bi = find_buf(f);
+        if (bi >= 0) {
+            lines = bufs[bi].lines;
+        } else {
+            let t: string = file.read(f);
+            if (t.substring(0, 4096).contains("\x00")) { continue; }
+            lines = split_lines(t);
+        }
+        let found = false;
+        for (k, len(lines)) {
+            let s: string = lines[k];
+            let hay = search_case ? s : s.lower();
+            let at = hay.index_of(p);
+            if (at >= 0) {
+                if (!found) {
+                    found = true;
+                    nfiles++;
+                    search_files.push(f);
+                    search_lines.push(-1);
+                    search_cols.push(0);
+                    search_text.push("");
+                }
+                search_files.push(f);
+                search_lines.push(k);
+                search_cols.push(at);
+                search_text.push(s);
+                nhits++;
+                if (nhits >= 5000) { break; }
+            }
+        }
+        if (nhits >= 5000) { break; }
+    }
+    if (nhits == 0) {
+        search_summary = "No results found.";
+    } else {
+        search_summary = f"{nhits} result{nhits == 1 ? "" : "s"} in {nfiles} file{nfiles == 1 ? "" : "s"}";
+    }
+    frame_dirty = true;
+}
+
+fn draw_search_view() {
+    let x = side_x;
+    let w = sidebar_w;
+    section_title(x, side_y, w, "SEARCH");
+    let fy = side_y + HEADER_H;
+    let fx = x + px(12);
+    let fwid = w - px(24);
+    fld_draw(FLD_SEARCH, fx, fy, fwid, px(26), focus == F_SEARCH, "Search");
+    if (toggle_box(fx + fwid - px(24), fy + px(3), "Aa", search_case)) {
+        search_case = !search_case;
+        run_search();
+    }
+    let ry = fy + px(34);
+    if (len(search_summary) > 0) {
+        txt(fx, ry, search_summary, C_MUTED, UI_SMALL);
+        ry += px(20);
+    }
+    let top = ry;
+    let body_h = side_y + side_h - top;
+    let content = len(search_files) * ROW_H;
+    search_scroll = clamp(search_scroll, 0, imax(0, content - body_h));
+    let i = search_scroll / ROW_H;
+    let pat: string = fld_text[FLD_SEARCH];
+    while (i < len(search_files)) {
+        let y = top + i * ROW_H - search_scroll;
+        if (y >= side_y + side_h) { break; }
+        if (y + ROW_H <= top) {
+            i++;
+            continue;
+        }
+        let f: string = search_files[i];
+        let ln: int = search_lines[i];
+        if (hovered(x, y, w, ROW_H) && y >= top) { fill(x, y, w, ROW_H, C_HOVER); }
+        if (ln < 0) {
+            chevron(x + px(12), y + ROW_H / 2, true, C_TEXT);
+            let nm = file.basename(f);
+            draw_badge(x + px(20), y, ROW_H, nm);
+            let nw = txt_v(x + px(38), y, ROW_H, nm, C_TEXT, UI);
+            let dir = rel_path(file.dirname(f));
+            txt_v(x + px(44) + nw, y, ROW_H, fit(dir, w - nw - px(60), UI_SMALL), C_MUTED, UI_SMALL);
+        } else {
+            let s: string = search_text[i];
+            let col: int = search_cols[i];
+            // show the match with a little context before it
+            let start = imax(0, col - 20);
+            let before = s.substring(start, col - start).replace("\t", " ");
+            if (start == 0) { before = before.trim(); } else { before = "…" + before; }
+            let hit = s.substring(col, len(pat));
+            let after = s.substring(col + len(pat), -1).replace("\t", " ");
+            let tx = x + px(36);
+            let bw = txt_v(tx, y, ROW_H, before, C_TEXT, UI);
+            let hw = tw(hit, UI);
+            fill_a(tx + bw, y + px(3), hw, ROW_H - px(6), 0xEA5C00, 90);
+            txt_v(tx + bw, y, ROW_H, hit, C_BRIGHT, UI);
+            txt_v(tx + bw + hw, y, ROW_H, fit(after, w - (tx - x) - bw - hw - px(8), UI), C_TEXT, UI);
+        }
+        i++;
+    }
+    search_top = top;
+}
+
+fn search_mouse(x: int, y: int, mods: int) {
+    let fy = side_y + HEADER_H;
+    if (y >= fy && y < fy + px(26)) {
+        if (x < side_x + sidebar_w - px(36)) {
+            focus = F_SEARCH;
+            fld_click(FLD_SEARCH, x - side_x - px(18), (mods & M_SHIFT) != 0);
+        }
+        return;
+    }
+    if (y < search_top) { return; }
+    let i = (y - search_top + search_scroll) / ROW_H;
+    if (i < 0 || i >= len(search_files)) { return; }
+    let ln: int = search_lines[i];
+    if (ln < 0) { return; }
+    let f: string = search_files[i];
+    if (open_file(f, false)) {
+        let col: int = search_cols[i];
+        ay = ln;
+        ax = col;
+        cy = ln;
+        cx = col + len(fld_text[FLD_SEARCH]);
+        clamp_cursor();
+        reveal(true);
+        focus = F_EDITOR;
+    }
+}
+
+fn search_key(vk: int, mods: int) {
+    if (vk == K_ENTER) {
+        run_search();
+        return;
+    }
+    if (vk == K_ESC) {
+        focus = F_EDITOR;
+        return;
+    }
+    fld_key(FLD_SEARCH, vk, mods);
+}
+
+// ---- quick open -------------------------------------------------------------------------------------------
+
+fn open_quick(prefix: string) {
+    quick_open = true;
+    fld_set(FLD_QUICK, prefix);
+    quick_last = "~";
+    quick_sel = 0;
+    quick_top = 0;
+    focus = F_QUICK;
+    comp_open = false;
+    menu_open = -1;
+    frame_dirty = true;
+}
+
+fn close_quick() {
+    quick_open = false;
+    focus = F_EDITOR;
+    frame_dirty = true;
+}
+
+fn quick_add(label: string, detail: string, kind: int, key: string) {
+    quick_items.push(label);
+    quick_detail.push(detail);
+    quick_kind.push(kind);
+    quick_key.push(key);
+}
+
+// kind: 1 file, 2 command, 3 symbol, 4 line, 5 info
+fn quick_refresh() {
+    let q: string = fld_text[FLD_QUICK];
+    if (q == quick_last) { return; }
+    quick_last = q;
+    quick_items.clear();
+    quick_detail.clear();
+    quick_kind.clear();
+    quick_key.clear();
+    quick_sel = 0;
+    quick_top = 0;
+    if (q.starts_with(">")) {
+        let pat = q.substring(1, -1).trim();
+        let scored: []string;
+        for (i, len(cmd_ids)) {
+            let lab: string = cmd_labels[i];
+            let sc = fuzzy(lab, pat);
+            if (sc >= 0) { scored.push(f"{9999 - sc:05}{i:04}"); }
+        }
+        scored.sort();
+        for (s in scored) {
+            let i = (int)s.substring(5, 4);
+            quick_add(cmd_labels[i], cmd_keys[i], 2, cmd_ids[i]);
+        }
+        if (len(quick_items) == 0) { quick_add("No matching commands", "", 5, ""); }
+        return;
+    }
+    if (q.starts_with(":")) {
+        let n = (int)q.substring(1, -1).trim();
+        if (!is_file_tab()) {
+            quick_add("Open a file to go to a line", "", 5, "");
+        } else if (n > 0) {
+            quick_add(f"Go to line {n}", f"of {len(L)}", 4, (string)n);
+        } else {
+            quick_add(f"Type a line number between 1 and {len(L)}", f"current line {cy + 1}", 5, "");
+        }
+        return;
+    }
+    if (q.starts_with("@")) {
+        let pat = q.substring(1, -1).trim();
+        if (!is_file_tab()) {
+            quick_add("Open a file to see its symbols", "", 5, "");
+            return;
+        }
+        collect_symbols();
+        for (i, len(sym_names)) {
+            let nm: string = sym_names[i];
+            if (fuzzy(nm, pat) >= 0) {
+                let kind: int = sym_kinds[i];
+                let kn = "variable";
+                if (kind == 1) { kn = "function"; }
+                if (kind == 2) { kn = "struct"; }
+                if (kind == 3) { kn = "enum"; }
+                quick_add(nm, f"{kn} · line {sym_lines[i] + 1}", 3, (string)sym_lines[i]);
+            }
+        }
+        if (len(quick_items) == 0) { quick_add("No symbols found", "", 5, ""); }
+        return;
+    }
+    // files
+    ensure_files_index();
+    let pat = q.trim();
+    if (len(pat) == 0) {
+        // recently used: open tabs first
+        for (i, len(bufs)) {
+            let p: string = bufs[i].path;
+            if (bufs[i].kind == 0 && len(p) > 0) { quick_add(file.basename(p), rel_path(file.dirname(p)), 1, p); }
+        }
+    }
+    let scored: []string;
+    for (i, len(files_index)) {
+        let p: string = files_index[i];
+        let rp = rel_path(p);
+        let sc = fuzzy(file.basename(p), pat);
+        if (sc >= 0) {
+            sc += 100;
+        } else {
+            sc = fuzzy(rp, pat);
+        }
+        if (sc >= 0) { scored.push(f"{99999 - sc:06}{i:06}"); }
+    }
+    scored.sort();
+    for (s in scored) {
+        if (len(quick_items) >= 200) { break; }
+        let i = (int)s.substring(6, 6);
+        let p: string = files_index[i];
+        if (quick_key.contains(p)) { continue; }
+        quick_add(file.basename(p), rel_path(file.dirname(p)), 1, p);
+    }
+    if (len(quick_items) == 0) {
+        if (len(folder) == 0) {
+            quick_add("Open a folder to search its files", "", 5, "");
+        } else {
+            quick_add("No matching files", "", 5, "");
+        }
+    }
+}
+
+fn quick_accept() {
+    if (quick_sel < 0 || quick_sel >= len(quick_items)) { return; }
+    let kind: int = quick_kind[quick_sel];
+    let key: string = quick_key[quick_sel];
+    if (kind == 5) { return; }
+    close_quick();
+    if (kind == 1) {
+        open_file(key, false);
+        focus = F_EDITOR;
+    } else if (kind == 2) {
+        run_cmd(key);
+    } else if (kind == 3 || kind == 4) {
+        let n = (int)key;
+        if (kind == 4) { n--; }
+        n = clamp(n, 0, len(L) - 1);
+        set_cursor(n, len(leading_ws(L[n])), false);
+        reveal(true);
+        focus = F_EDITOR;
+    }
+}
+
+fn quick_key_press(vk: int, mods: int) {
+    let n = len(quick_items);
+    if (vk == K_ESC) {
+        close_quick();
+        return;
+    }
+    if (vk == K_ENTER) {
+        quick_refresh();
+        quick_accept();
+        return;
+    }
+    if (vk == K_DOWN) {
+        if (n > 0) { quick_sel = (quick_sel + 1) % n; }
+        return;
+    }
+    if (vk == K_UP) {
+        if (n > 0) { quick_sel = (quick_sel + n - 1) % n; }
+        return;
+    }
+    if (vk == K_PGDN) {
+        quick_sel = imin(n - 1, quick_sel + 10);
+        return;
+    }
+    if (vk == K_PGUP) {
+        quick_sel = imax(0, quick_sel - 10);
+        return;
+    }
+    fld_key(FLD_QUICK, vk, mods);
+    // a live preview of the line while typing ":123"
+    let q: string = fld_text[FLD_QUICK];
+    if (q.starts_with(":") && is_file_tab()) {
+        let ln = (int)q.substring(1, -1).trim();
+        if (ln > 0) {
+            cy = clamp(ln - 1, 0, len(L) - 1);
+            cx = 0;
+            ay = cy;
+            ax = 0;
+            reveal(true);
+        }
+    }
+}
+
+fn draw_quick() {
+    if (!quick_open) { return; }
+    quick_refresh();
+    let w = imin(px(620), win_w - px(40));
+    let x = (win_w - w) / 2;
+    let y = TOOLBAR_H + px(2);
+    let rh = px(24);
+    let rows = imin(len(quick_items), 14);
+    let h = px(40) + rows * rh + px(6);
+    qk_x = x;
+    qk_y = y;
+    qk_w = w;
+    qk_h = h;
+    qk_row = rh;
+    ui.panel(x, y, w, h);
+    fill(x + 1, y + 1, w - 2, h - 2, 0x222222);
+    outline(x, y, w, h, 0x454545);
+    fld_draw(FLD_QUICK, x + px(8), y + px(7), w - px(16), px(26), true, "Search files by name (> for commands, @ for symbols, : for a line)");
+    if (quick_sel < quick_top) { quick_top = quick_sel; }
+    if (quick_sel >= quick_top + rows) { quick_top = quick_sel - rows + 1; }
+    let ly = y + px(40);
+    qk_list_y = ly;
+    let q: string = fld_text[FLD_QUICK];
+    for (r, rows) {
+        let i = quick_top + r;
+        if (i >= len(quick_items)) { break; }
+        let ry = ly + r * rh;
+        let kind: int = quick_kind[i];
+        if (i == quick_sel && kind != 5) {
+            fill(x + px(4), ry, w - px(8), rh, 0x04395E);
+        } else if (hovered(x, ry, w, rh) && kind != 5) {
+            fill(x + px(4), ry, w - px(8), rh, C_HOVER);
+        }
+        let label: string = quick_items[i];
+        let detail: string = quick_detail[i];
+        let tx = x + px(14);
+        if (kind == 1) {
+            draw_badge(tx, ry, rh, label);
+            tx += px(20);
+        } else if (kind == 3) {
+            draw_glyph("symbol", tx - px(2), ry + (rh - px(16)) / 2, px(16), 0xB180D7);
+            tx += px(20);
+        }
+        let lc = kind == 5 ? C_MUTED : C_TEXT;
+        let lw = txt_v(tx, ry, rh, fit(label, w - px(200), UI), lc, UI);
+        if (kind == 2) {
+            // shortcut on the right, as keycaps
+            if (len(detail) > 0) {
+                let kw = tw(detail, UI_SMALL) + px(10);
+                keycap(x + w - kw - px(14), ry + px(2), detail);
+            }
+        } else if (len(detail) > 0) {
+            txt_v(tx + lw + px(8), ry, rh, fit(detail, w - (tx - x) - lw - px(24), UI_SMALL), C_MUTED, UI_SMALL);
+        }
+    }
+}
+
+// Mouse down while quick open is showing; returns true if it was inside.
+fn quick_mouse(x: int, y: int): bool {
+    if (!inside(x, y, qk_x, qk_y, qk_w, qk_h)) {
+        close_quick();
+        return false;
+    }
+    if (y >= qk_list_y) {
+        let i = quick_top + (y - qk_list_y) / qk_row;
+        if (i >= 0 && i < len(quick_items)) {
+            quick_sel = i;
+            quick_accept();
+        }
+    } else {
+        fld_click(FLD_QUICK, x - qk_x - px(14), false);
+    }
+    return true;
+}

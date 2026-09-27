@@ -1,0 +1,866 @@
+// Syntax highlighting: one line at a time, with a state carried from the end
+// of one line to the start of the next (block comments, raw strings, Markdown
+// code fences, bracket depth for the rainbow). A state is mode | depth << 4.
+
+// which: 0 Nexa, 1 C++, 2 shell
+fn add_words(which: int, words: string, kind: int) {
+    for (w in words.split(" ")) {
+        if (len(w) == 0) { continue; }
+        if (which == 0) { nx_words[w] = kind; }
+        if (which == 1) { cpp_words[w] = kind; }
+        if (which == 2) { sh_words[w] = kind; }
+    }
+}
+
+fn word_kind(lang: int, w: string): int {
+    if (lang == L_CPP) {
+        if (cpp_words.has(w)) { return cpp_words[w]; }
+        return 0;
+    }
+    if (nx_words.has(w)) { return nx_words[w]; }
+    return 0;
+}
+
+fn add_members(mod: string, names: string) {
+    nx_members[mod] = names.split(" ");
+}
+
+fn hl_init() {
+    // 1 control, 2 keyword, 3 type, 4 constant, 5 module
+    add_words(0, "fn extern if else while for switch case default return break continue goto try catch throw", 1);
+    add_words(0, "let const struct enum new delete sizeof in self and or not", 2);
+    add_words(0, "int short long size_t string bool float char void unsigned map Result result Json json HttpResponse HttpServer HttpRequest", 3);
+    add_words(0, "true false null", 4);
+    add_words(0, "io os dll file random math crypto http tcp udp json time thread gfx gfx3d ui", 5);
+
+    add_words(1, "if else for while do switch case default break continue return goto try catch throw co_await co_return co_yield", 1);
+    add_words(1, "alignas alignof asm auto class concept const consteval constexpr constinit const_cast decltype delete dynamic_cast enum explicit export extern final friend inline mutable namespace new noexcept operator override private protected public register reinterpret_cast requires sizeof static static_assert static_cast struct template this thread_local typedef typeid typename union using virtual volatile and or not xor", 2);
+    add_words(1, "void bool char char8_t char16_t char32_t wchar_t short int long float double signed unsigned size_t ssize_t ptrdiff_t intptr_t uintptr_t int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t std string vector map", 3);
+    add_words(1, "true false nullptr NULL", 4);
+
+    add_words(2, "if then else elif fi for in do done while until case esac function return exit goto call break continue foreach switch default param try catch finally", 1);
+    add_words(2, "echo set setlocal endlocal export local declare readonly unset shift source alias cd pushd popd not exist defined errorlevel equ neq lss leq gtr geq ifeq ifneq ifdef ifndef endif define endef include PHONY", 2);
+    add_words(2, "true false null $true $false $null", 4);
+
+    add_members("io", "print println flush readln read_int to_int getline trim");
+    add_members("os", "system spawn spawn_wait spawn_at wait kill platform arch cpu_count getenv setenv unsetenv hostname username user home tempdir cwd chdir executable which total_mem avail_mem page_size uptime shell newline path_sep lang isatty environ env config_dir cache_dir desktop endian exit getpid exe_dir clip_get clip_set notify open load save play lock shutdown reboot suspend logout set_volume get_volume mute unmute toggle_mute set_brightness get_brightness type messagebox getkey keypressed");
+    add_members("file", "read write append exists mkdir remove delete remove_all rename move copy list listdir isdir isfile size cwd chdir abspath join dirname parent basename name extension");
+    add_members("random", "int seed");
+    add_members("math", "abs min max pow sqrt floor ceil round sin cos tan log log10 exp pi e");
+    add_members("crypto", "xor sha256 sha1 hmac_sha256 hex_encode hex_decode base64_encode base64_decode random_bytes");
+    add_members("http", "get post put patch delete request localhost accept reply raw close");
+    add_members("tcp", "connect listen accept send recv port close");
+    add_members("udp", "open port send recv sender sender_port close");
+    add_members("json", "parse stringify of null bool int float string array object");
+    add_members("time", "sleep seconds milliseconds now_ms");
+    add_members("thread", "spawn join worker run worker_join");
+    add_members("dll", "load call");
+    add_members("gfx", "open resize width height scale title close poll closed clear plot get fill rect round_rect fill_round_rect line circle fill_circle ellipse fill_ellipse arc pie tri fill_tri poly fill_poly alpha save text text_size text_width text_height present maxfps fullscreen borderless ontop transparent audio sample audio_queued audio_flush sound play loop stop volume image decode image_w image_h blit blit_rot icon cursor key pressed released wheel wheel_x typed mouse_x mouse_y mouse drop opendialog openfile");
+    add_members("gfx3d", "open close closed poll present clear width height maxfps backend renderer camera perspective ambient light reset translate rotate scale draw cube box sphere cylinder cone capsule teapot grid tri line3 model model_tris get save key pressed released typed mouse mouse_x mouse_y wheel wheel_x audio sample audio_queued audio_flush sound sound_at play loop stop volume");
+    add_members("ui", "open background theme accent rounding font_size text heading caption text_width text_height panel separator button checkbox toggle radio slider progress textbox dropdown");
+    nx_methods = "upper lower trim len contains starts_with ends_with index_of last_index_of count replace substring repeat split push pop insert remove clear has sort sort_desc reverse min max sum join keys values ok value error kind is_null is_bool is_number is_string is_array is_object is_error as_bool as_int as_float as_string get set".split(" ");
+}
+
+fn lang_for(path: string): int {
+    let p = path.lower();
+    let name = file.basename(p);
+    if (p.ends_with(".nxa")) { return L_NEXA; }
+    if (p.ends_with(".cpp") || p.ends_with(".hpp") || p.ends_with(".h") || p.ends_with(".c") || p.ends_with(".cc") || p.ends_with(".cxx") || p.ends_with(".hh") || p.ends_with(".rc")) { return L_CPP; }
+    if (p.ends_with(".json") || p.ends_with(".jsonc") || name == "nexapkg.lock") { return L_JSON; }
+    if (p.ends_with(".md") || p.ends_with(".markdown")) { return L_MD; }
+    if (p.ends_with(".ini") || p.ends_with(".toml") || p.ends_with(".yaml") || p.ends_with(".yml") || p.ends_with(".cfg") || p.ends_with(".conf") || name == ".gitignore" || name == ".gitattributes" || name == ".editorconfig") { return L_INI; }
+    if (p.ends_with(".sh") || p.ends_with(".bat") || p.ends_with(".cmd") || p.ends_with(".ps1") || p.ends_with(".bash") || name == "makefile" || p.ends_with(".mk")) { return L_SHELL; }
+    return L_PLAIN;
+}
+
+fn lang_name(l: int): string {
+    switch (l) {
+        case 1: return "Nexa";
+        case 2: return "C++";
+        case 3: return "JSON";
+        case 4: return "Markdown";
+        case 5: return "Config";
+        case 6: return "Shell";
+        default: return "Plain Text";
+    }
+    return "Plain Text";
+}
+
+fn lang_comment(l: int): string {
+    if (l == L_NEXA || l == L_CPP || l == L_JSON) { return "//"; }
+    if (l == L_INI || l == L_SHELL) { return "#"; }
+    return "";
+}
+
+// Colour of the file-type badge in tabs and the explorer.
+fn lang_color(path: string): int {
+    let l = lang_for(path);
+    if (l == L_NEXA) { return 0x4FC1FF; }
+    if (l == L_CPP) { return 0x9B7BD4; }
+    if (l == L_JSON) { return 0xCBCB41; }
+    if (l == L_MD) { return 0x519ABA; }
+    if (l == L_INI) { return 0x6D8086; }
+    if (l == L_SHELL) { return 0x89E051; }
+    return 0x8B8B8B;
+}
+
+fn lang_badge(path: string): string {
+    let l = lang_for(path);
+    if (l == L_NEXA) { return "N"; }
+    if (l == L_CPP) {
+        if (path.ends_with(".h") || path.ends_with(".hpp")) { return "h"; }
+        return "C";
+    }
+    if (l == L_JSON) { return "{}"; }
+    if (l == L_MD) { return "M"; }
+    if (l == L_INI) { return "#"; }
+    if (l == L_SHELL) { return "$"; }
+    return "";
+}
+
+fn bracket_color(depth: int): int {
+    let d = depth % 3;
+    if (d < 0) { d += 3; }
+    if (d == 0) { return S_BR1; }
+    if (d == 1) { return S_BR2; }
+    return S_BR3;
+}
+
+fn paint(a: int, b: int, c: int) {
+    let n = len(HC);
+    let i = imax(a, 0);
+    let e = imin(b, n);
+    while (i < e) {
+        HC[i] = c;
+        i++;
+    }
+}
+
+// A comment from a to b, with TODO-style tags picked out.
+fn paint_comment(s: string, a: int, b: int) {
+    paint(a, b, S_COMMENT);
+    for (tag in ["TODO", "FIXME", "NOTE", "HACK", "XXX", "BUG"]) {
+        let at = s.index_of(tag, a);
+        while (at >= 0 && at + len(tag) <= b) {
+            if (!is_word_at(s, at - 1) && !is_word_at(s, at + len(tag))) {
+                paint(at, at + len(tag), S_TODO);
+            }
+            at = s.index_of(tag, at + 1);
+        }
+    }
+}
+
+fn word_end(s: string, i: int): int {
+    let j = i;
+    while (j < len(s) && is_word_b(ubyte(s, j))) { j++; }
+    return j;
+}
+
+fn skip_ws(s: string, i: int): int {
+    let j = i;
+    while (j < len(s) && is_space_b(ubyte(s, j))) { j++; }
+    return j;
+}
+
+fn prev_non_ws(s: string, i: int): int {
+    let j = i - 1;
+    while (j >= 0 && is_space_b(ubyte(s, j))) { j--; }
+    return j;
+}
+
+fn is_digit_b(b: int): bool {
+    return b >= 48 && b <= 57;
+}
+
+fn is_upper_b(b: int): bool {
+    return b >= 65 && b <= 90;
+}
+
+// Colours for one line; the state after it is left in hl_out_state (and a raw
+// string's delimiter in hl_out_delim).
+fn hl_line(lang: int, s: string, st: int, dl: string): []int {
+    hl_out_delim = dl;
+    if (lang == L_NEXA || lang == L_CPP) { return hl_code(lang, s, st, dl); }
+    if (lang == L_JSON) { return hl_json(s, st); }
+    if (lang == L_MD) { return hl_md(s, st); }
+    if (lang == L_INI) { return hl_ini(s); }
+    if (lang == L_SHELL) { return hl_shell(s); }
+    HC.clear();
+    for (i, len(s)) { HC.push(S_TEXT); }
+    hl_out_state = 0;
+    return HC;
+}
+
+// A quoted string starting at the quote s[i]; returns the index after it.
+// f-strings get their {expressions} highlighted as code.
+fn hl_string(lang: int, s: string, i: int, fstr: bool): int {
+    let q = s[i];
+    let n = len(s);
+    let j = i + 1;
+    HC[i] = S_STRING;
+    while (j < n) {
+        let c = s[j];
+        if (c == '\\') {
+            let e = j + 2;
+            let ok = true;
+            if (j + 1 < n) {
+                let d = s[j + 1];
+                if (d == 'x') {
+                    e = j + 4;
+                    ok = j + 3 < n && is_hex(s[j + 2]) && is_hex(s[j + 3]);
+                    if (lang == L_CPP) { ok = j + 2 < n && is_hex(s[j + 2]); }
+                } else if (lang == L_NEXA) {
+                    ok = d == 'n' || d == 't' || d == 'r' || d == 'a' || d == 'b' || d == 'f' || d == 'v' || d == '0' || d == '\\' || d == '"' || d == '\'';
+                }
+            }
+            paint(j, imin(e, n), ok ? S_ESCAPE : S_INVALID);
+            j = e;
+            continue;
+        }
+        if (fstr && c == '{') {
+            if (j + 1 < n && s[j + 1] == '{') {
+                paint(j, j + 2, S_ESCAPE);
+                j += 2;
+                continue;
+            }
+            // find the matching }, skipping nested strings and braces
+            let k = j + 1;
+            let depth = 1;
+            while (k < n && depth > 0) {
+                if (s[k] == '"') {
+                    k++;
+                    while (k < n && s[k] != '"') {
+                        if (s[k] == '\\') { k++; }
+                        k++;
+                    }
+                } else if (s[k] == '{') {
+                    depth++;
+                } else if (s[k] == '}') {
+                    depth--;
+                    if (depth == 0) { break; }
+                }
+                k++;
+            }
+            HC[j] = S_KEYWORD;
+            let inner = s.substring(j + 1, k - j - 1);
+            let fmt = inner.index_of(":");
+            let code = inner;
+            if (fmt >= 0 && !inner.contains("?") && !inner.contains("\"")) { code = inner.substring(0, fmt); }
+            let saved = HC;
+            let sub = hl_code(lang, code, 0, "");
+            HC = saved;
+            for (t, len(sub)) { HC[j + 1 + t] = sub[t]; }
+            if (len(code) < len(inner)) { paint(j + 1 + len(code), k, S_ESCAPE); }
+            if (k < n) { HC[k] = S_KEYWORD; }
+            j = k + 1;
+            continue;
+        }
+        if (fstr && c == '}' && j + 1 < n && s[j + 1] == '}') {
+            paint(j, j + 2, S_ESCAPE);
+            j += 2;
+            continue;
+        }
+        HC[j] = S_STRING;
+        j++;
+        if (c == q) { return j; }
+    }
+    return n;
+}
+
+fn is_hex(c: char): bool {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+fn hl_number(s: string, i: int): int {
+    let n = len(s);
+    let j = i;
+    let ok = true;
+    if (s[j] == '0' && j + 1 < n && (s[j + 1] == 'x' || s[j + 1] == 'X')) {
+        j += 2;
+        let st = j;
+        while (j < n && (is_hex(s[j]) || s[j] == '\'')) { j++; }
+        ok = j > st;
+    } else if (s[j] == '0' && j + 1 < n && (s[j + 1] == 'b' || s[j + 1] == 'B')) {
+        j += 2;
+        while (j < n && (s[j] == '0' || s[j] == '1')) { j++; }
+    } else {
+        while (j < n && (is_digit_b(ubyte(s, j)) || s[j] == '\'' || s[j] == '_')) { j++; }
+        if (j < n && s[j] == '.' && j + 1 < n && is_digit_b(ubyte(s, j + 1))) {
+            j++;
+            while (j < n && is_digit_b(ubyte(s, j))) { j++; }
+        }
+        if (j < n && (s[j] == 'e' || s[j] == 'E')) {
+            let k = j + 1;
+            if (k < n && (s[k] == '+' || s[k] == '-')) { k++; }
+            if (k < n && is_digit_b(ubyte(s, k))) {
+                j = k;
+                while (j < n && is_digit_b(ubyte(s, j))) { j++; }
+            }
+        }
+    }
+    // suffixes (u, l, f) belong to the number; any other letter makes it invalid
+    let suf = j;
+    while (j < n && is_word_b(ubyte(s, j))) { j++; }
+    if (j > suf) {
+        let tail = s.substring(suf, j - suf).lower();
+        if (tail != "u" && tail != "l" && tail != "ul" && tail != "lu" && tail != "ll" && tail != "ull" && tail != "f" && tail != "z") { ok = false; }
+    }
+    paint(i, j, ok ? S_NUMBER : S_INVALID);
+    return j;
+}
+
+fn hl_code(lang: int, s: string, st: int, dl: string): []int {
+    let n = len(s);
+    HC.clear();
+    for (k, n) { HC.push(S_PLAIN); }
+    let mode = st & 15;
+    let depth = st >> 4;
+    let delim = dl;
+    let i = 0;
+    if (mode == HM_BLOCK) {
+        let e = s.index_of("*/");
+        if (e < 0) {
+            paint_comment(s, 0, n);
+            hl_out_state = st;
+            return HC;
+        }
+        paint_comment(s, 0, e + 2);
+        i = e + 2;
+        mode = HM_NORMAL;
+    } else if (mode == HM_RAW) {
+        let close = ")" + delim + "\"";
+        let e = s.index_of(close);
+        if (e < 0) {
+            paint(0, n, S_STRING);
+            hl_out_state = st;
+            hl_out_delim = delim;
+            return HC;
+        }
+        paint(0, e + len(close), S_STRING);
+        i = e + len(close);
+        mode = HM_NORMAL;
+    }
+    // preprocessor lines
+    let first = skip_ws(s, i);
+    if (i == 0 && first < n && s[first] == '#') {
+        let we = word_end(s, skip_ws(s, first + 1));
+        let dir = s.substring(first, we - first);
+        paint(first, we, S_CONTROL);
+        i = we;
+        let rest = skip_ws(s, i);
+        if (dir.contains("include") && rest < n && (s[rest] == '<' || s[rest] == '"')) {
+            let closer = s[rest] == '<' ? ">" : "\"";
+            let e = s.index_of(closer, rest + 1);
+            if (e < 0) { e = n - 1; }
+            let path = s.substring(rest + 1, e - rest - 1);
+            let ok = true;
+            if (lang == L_NEXA && s[rest] == '<' && path.starts_with("std/")) {
+                ok = STD_MODULES.contains(" " + path.substring(4, -1) + " ");
+            }
+            paint(rest, e + 1, ok ? S_STRING : S_INVALID);
+            i = e + 1;
+        } else if (lang == L_CPP && (dir.contains("define") || dir.contains("ifdef") || dir.contains("ifndef") || dir.contains("undef"))) {
+            let ns = skip_ws(s, i);
+            let ne = word_end(s, ns);
+            paint(ns, ne, S_FUNC);
+            i = ne;
+        }
+    }
+    let prev_word = "";
+    while (i < n) {
+        let c = s[i];
+        let b = ubyte(s, i);
+        if (c == '/' && i + 1 < n && s[i + 1] == '/') {
+            paint_comment(s, i, n);
+            break;
+        }
+        if (c == '/' && i + 1 < n && s[i + 1] == '*') {
+            let e = s.index_of("*/", i + 2);
+            if (e < 0) {
+                paint_comment(s, i, n);
+                mode = HM_BLOCK;
+                break;
+            }
+            paint_comment(s, i, e + 2);
+            i = e + 2;
+            continue;
+        }
+        if (c == 'R' && i + 1 < n && s[i + 1] == '"' && !is_word_at(s, i - 1)) {
+            let p = s.index_of("(", i + 2);
+            if (p >= 0 && p - i - 2 <= 16) {
+                delim = s.substring(i + 2, p - i - 2);
+                let close = ")" + delim + "\"";
+                let e = s.index_of(close, p + 1);
+                if (e < 0) {
+                    paint(i, n, S_STRING);
+                    mode = HM_RAW;
+                    hl_out_delim = delim;
+                    break;
+                }
+                paint(i, e + len(close), S_STRING);
+                i = e + len(close);
+                continue;
+            }
+        }
+        if (c == '"') {
+            i = hl_string(lang, s, i, false);
+            prev_word = "";
+            continue;
+        }
+        if (c == 'f' && lang == L_NEXA && i + 1 < n && s[i + 1] == '"' && !is_word_at(s, i - 1)) {
+            HC[i] = S_KEYWORD;
+            i = hl_string(lang, s, i + 1, true);
+            prev_word = "";
+            continue;
+        }
+        if (c == '\'') {
+            let e = i + 1;
+            if (e < n && s[e] == '\\') { e += 2; } else { e = next_i(s, e); }
+            if (lang == L_CPP) {
+                while (e < n && s[e] != '\'') { e++; }
+            }
+            if (e < n && s[e] == '\'') {
+                paint(i, e + 1, S_STRING);
+                if (i + 1 < n && s[i + 1] == '\\') { paint(i + 1, e, S_ESCAPE); }
+                i = e + 1;
+                continue;
+            }
+            HC[i] = S_PLAIN;
+            i++;
+            continue;
+        }
+        if (is_digit_b(b) || (c == '.' && i + 1 < n && is_digit_b(ubyte(s, i + 1)) && !is_word_at(s, i - 1))) {
+            i = hl_number(s, i);
+            continue;
+        }
+        if (is_word_b(b)) {
+            let e = word_end(s, i);
+            let w = s.substring(i, e - i);
+            let after = skip_ws(s, e);
+            let next_c = ' ';
+            if (after < n) { next_c = s[after]; }
+            let before = prev_non_ws(s, i);
+            let prev_c = ' ';
+            if (before >= 0) { prev_c = s[before]; }
+            let color = S_VAR;
+            let kind = word_kind(lang, w);
+            if (prev_c == '.' && before >= 1 && s[before - 1] != '.') {
+                // a member: method call, enum variant, or field
+                let owner_end = before;
+                let owner_start = owner_end;
+                while (owner_start > 0 && is_word_b(ubyte(s, owner_start - 1))) { owner_start--; }
+                let owner = s.substring(owner_start, owner_end - owner_start);
+                if (next_c == '(') {
+                    color = S_FUNC;
+                } else if (len(owner) > 0 && is_upper_b(ubyte(owner, 0)) && !(nx_words.has(owner))) {
+                    color = S_ENUM;
+                } else {
+                    color = S_PROP;
+                }
+            } else if (lang == L_CPP && before >= 1 && prev_c == ':' && s[before - 1] == ':') {
+                color = next_c == '(' ? S_FUNC : (kind == 3 ? S_TYPE : S_VAR);
+                if (is_upper_b(ubyte(w, 0)) && next_c != '(') { color = S_TYPE; }
+            } else if (kind == 1) {
+                color = S_CONTROL;
+            } else if (kind == 2 || kind == 4) {
+                color = S_KEYWORD;
+            } else if (kind == 3) {
+                color = S_TYPE;
+            } else if (kind == 5) {
+                color = next_c == '.' ? S_TYPE : S_VAR;
+            } else if (w == "inline_cpp" && next_c == '!') {
+                color = S_CONTROL;
+            } else if (prev_word == "fn") {
+                color = S_FUNC;
+            } else if (prev_word == "struct" || prev_word == "enum" || prev_word == "class" || prev_word == "namespace" || prev_word == "union") {
+                color = S_TYPE;
+            } else if (next_c == '(') {
+                color = S_FUNC;
+            } else if (lang == L_CPP && next_c == ':' && after + 1 < n && s[after + 1] == ':') {
+                color = S_TYPE;
+            } else if (is_upper_b(b)) {
+                // ALL_CAPS reads as a constant, Capitalised as a type
+                let caps = true;
+                for (k, len(w)) {
+                    let wb = ubyte(w, k);
+                    if (wb >= 97 && wb <= 122) { caps = false; }
+                }
+                color = caps && len(w) > 1 ? S_ENUM : S_TYPE;
+            } else if (prev_c == ':' && lang == L_NEXA) {
+                color = S_TYPE;
+            }
+            paint(i, e, color);
+            prev_word = w;
+            i = e;
+            continue;
+        }
+        if (c == '(' || c == '[' || c == '{') {
+            HC[i] = bracket_color(depth);
+            depth++;
+        } else if (c == ')' || c == ']' || c == '}') {
+            depth--;
+            if (depth < 0) {
+                HC[i] = S_INVALID;
+                depth = 0;
+            } else {
+                HC[i] = bracket_color(depth);
+            }
+        } else if (c != ' ' && c != '\t') {
+            HC[i] = S_PLAIN;
+            if (c != '*' && c != '&') { prev_word = ""; }
+        }
+        i++;
+    }
+    hl_out_state = mode | (depth << 4);
+    if (mode == HM_RAW) { hl_out_delim = delim; }
+    return HC;
+}
+
+fn hl_json(s: string, st: int): []int {
+    let n = len(s);
+    HC.clear();
+    for (k, n) { HC.push(S_PLAIN); }
+    let depth = st >> 4;
+    let i = 0;
+    while (i < n) {
+        let c = s[i];
+        if (c == '/' && i + 1 < n && s[i + 1] == '/') {
+            paint_comment(s, i, n);
+            break;
+        }
+        if (c == '"') {
+            let e = hl_string(L_JSON, s, i, false);
+            let after = skip_ws(s, e);
+            if (after < n && s[after] == ':') { paint(i, e, S_VAR); }
+            i = e;
+            continue;
+        }
+        if (is_digit_b(ubyte(s, i)) || c == '-') {
+            let e = i + 1;
+            while (e < n && (is_digit_b(ubyte(s, e)) || s[e] == '.' || s[e] == 'e' || s[e] == 'E' || s[e] == '+' || s[e] == '-')) { e++; }
+            paint(i, e, S_NUMBER);
+            i = e;
+            continue;
+        }
+        if (is_word_b(ubyte(s, i))) {
+            let e = word_end(s, i);
+            let w = s.substring(i, e - i);
+            paint(i, e, (w == "true" || w == "false" || w == "null") ? S_KEYWORD : S_INVALID);
+            i = e;
+            continue;
+        }
+        if (c == '{' || c == '[') {
+            HC[i] = bracket_color(depth);
+            depth++;
+        } else if (c == '}' || c == ']') {
+            depth = imax(depth - 1, 0);
+            HC[i] = bracket_color(depth);
+        }
+        i++;
+    }
+    hl_out_state = depth << 4;
+    return HC;
+}
+
+fn fence_lang(tag: string): int {
+    let t = tag.trim().lower();
+    if (t == "nexa" || t == "nxa") { return L_NEXA; }
+    if (t == "cpp" || t == "c++" || t == "c" || t == "h" || t == "hpp") { return L_CPP; }
+    if (t == "json" || t == "jsonc") { return L_JSON; }
+    if (t == "sh" || t == "bash" || t == "bat" || t == "cmd" || t == "powershell" || t == "ps1" || t == "shell" || t == "console" || t == "make" || t == "makefile") { return L_SHELL; }
+    if (t == "ini" || t == "toml" || t == "yaml" || t == "yml") { return L_INI; }
+    return L_PLAIN;
+}
+
+// Markdown. Inside a fence the state is HM_FENCE | lang << 4, and the code is
+// highlighted as that language.
+fn hl_md(s: string, st: int): []int {
+    let n = len(s);
+    HC.clear();
+    for (k, n) { HC.push(S_TEXT); }
+    let t = s.trim();
+    let mode = st & 15;
+    if (t.starts_with("```") || t.starts_with("~~~")) {
+        let at = s.index_of(t.substring(0, 3));
+        paint(0, n, C_MUTED);
+        if (mode == HM_FENCE) {
+            hl_out_state = 0;
+        } else {
+            paint(at + 3, n, S_STRING);
+            hl_out_state = HM_FENCE | (fence_lang(t.substring(3, -1)) << 4);
+        }
+        return HC;
+    }
+    if (mode == HM_FENCE) {
+        let fl = st >> 4;
+        hl_out_state = st;
+        if (fl == L_PLAIN) {
+            paint(0, n, S_STRING);
+            return HC;
+        }
+        let inner = hl_line(fl, s, 0, "");
+        hl_out_state = st;
+        return inner;
+    }
+    hl_out_state = 0;
+    let i = skip_ws(s, 0);
+    if (i < n && s[i] == '#') {
+        paint(i, n, S_HEADING);
+        return HC;
+    }
+    if (i < n && s[i] == '>') {
+        HC[i] = S_COMMENT;
+        i++;
+    }
+    if (t == "---" || t == "***" || t == "___") {
+        paint(0, n, C_MUTED);
+        return HC;
+    }
+    if (i + 1 < n && (s[i] == '-' || s[i] == '*' || s[i] == '+') && s[i + 1] == ' ') {
+        HC[i] = 0x6796E6;
+        i += 2;
+    } else {
+        let d = i;
+        while (d < n && is_digit_b(ubyte(s, d))) { d++; }
+        if (d > i && d + 1 < n && (s[d] == '.' || s[d] == ')') && s[d + 1] == ' ') {
+            paint(i, d + 1, 0x6796E6);
+            i = d + 2;
+        }
+    }
+    while (i < n) {
+        let c = s[i];
+        if (c == '`') {
+            let e = s.index_of("`", i + 1);
+            if (e < 0) { e = n - 1; }
+            paint(i, e + 1, S_STRING);
+            i = e + 1;
+            continue;
+        }
+        if ((c == '*' || c == '_') && i + 1 < n && s[i + 1] == c) {
+            let close = s.substring(i, 2);
+            let e = s.index_of(close, i + 2);
+            if (e > i + 2) {
+                paint(i, e + 2, S_KEYWORD);
+                i = e + 2;
+                continue;
+            }
+        }
+        if (c == '[') {
+            let e = s.index_of("](", i);
+            let f = s.index_of(")", e + 2);
+            if (e > i && f > e) {
+                paint(i, e + 1, S_STRING);
+                paint(e + 1, f + 1, S_LINK);
+                i = f + 1;
+                continue;
+            }
+        }
+        if (c == '<' && s.index_of("http", i) == i + 1) {
+            let e = s.index_of(">", i);
+            if (e > i) {
+                paint(i, e + 1, S_LINK);
+                i = e + 1;
+                continue;
+            }
+        }
+        if (c == '|') { HC[i] = C_MUTED; }
+        i++;
+    }
+    return HC;
+}
+
+fn hl_value(s: string, a: int) {
+    let n = len(s);
+    let i = skip_ws(s, a);
+    if (i >= n) { return; }
+    let rest = s.substring(i, -1).trim();
+    if (s[i] == '"' || s[i] == '\'') {
+        let q = s[i];
+        let e = i + 1;
+        while (e < n && s[e] != q) {
+            if (s[e] == '\\') { e++; }
+            e++;
+        }
+        paint(i, e + 1, S_STRING);
+        let after = s.index_of("#", e);
+        if (after > e) { paint_comment(s, after, n); }
+        return;
+    }
+    if (rest == "true" || rest == "false" || rest == "yes" || rest == "no" || rest == "on" || rest == "off" || rest == "null") {
+        paint(i, n, S_KEYWORD);
+        return;
+    }
+    if (len(rest) > 0 && (is_digit_b(ubyte(rest, 0)) || rest[0] == '-')) {
+        let ok = true;
+        for (k, len(rest)) {
+            let rb = ubyte(rest, k);
+            if (!(is_digit_b(rb) || rest[k] == '.' || rest[k] == '-' || rest[k] == '_' || rest[k] == 'e')) { ok = false; }
+        }
+        if (ok) {
+            paint(i, n, S_NUMBER);
+            return;
+        }
+    }
+    if (rest.starts_with("[") || rest.starts_with("{")) {
+        paint(i, n, S_PLAIN);
+        return;
+    }
+    paint(i, n, S_STRING);
+}
+
+fn hl_ini(s: string): []int {
+    let n = len(s);
+    HC.clear();
+    for (k, n) { HC.push(S_TEXT); }
+    hl_out_state = 0;
+    let i = skip_ws(s, 0);
+    if (i >= n) { return HC; }
+    let c = s[i];
+    if (c == ';' || c == '#') {
+        paint_comment(s, i, n);
+        return HC;
+    }
+    if (c == '[') {
+        paint(i, n, S_KEYWORD);
+        return HC;
+    }
+    if (c == '-' && i + 1 < n && s[i + 1] == ' ') {
+        HC[i] = S_PLAIN;
+        i = skip_ws(s, i + 1);
+    }
+    let eq = s.index_of("=", i);
+    let colon = s.index_of(":", i);
+    let sep = eq;
+    if (sep < 0 || (colon >= 0 && colon < sep && (colon + 1 >= n || s[colon + 1] == ' '))) { sep = colon; }
+    if (sep > i) {
+        paint(i, sep, S_VAR);
+        hl_value(s, sep + 1);
+    } else {
+        hl_value(s, i);
+    }
+    return HC;
+}
+
+fn hl_shell(s: string): []int {
+    let n = len(s);
+    HC.clear();
+    for (k, n) { HC.push(S_TEXT); }
+    hl_out_state = 0;
+    let i = skip_ws(s, 0);
+    let low = s.substring(i, -1).lower();
+    if (low.starts_with("rem ") || low == "rem" || low.starts_with("::") || low.starts_with("@rem")) {
+        paint_comment(s, i, n);
+        return HC;
+    }
+    // a Makefile target or batch label
+    if (i == 0 && n > 0 && s[0] == ':' ) {
+        paint(0, n, S_FUNC);
+        return HC;
+    }
+    let tcolon = s.index_of(":");
+    if (i == 0 && tcolon > 0 && !s.contains("=") && (tcolon + 1 >= n || s[tcolon + 1] != '=') && !s.contains(" :") && is_word_b(ubyte(s, 0))) {
+        paint(0, tcolon, S_FUNC);
+        i = tcolon + 1;
+    }
+    let first_word = true;
+    while (i < n) {
+        let c = s[i];
+        if (c == '#' && (i == 0 || is_space_b(ubyte(s, i - 1)))) {
+            paint_comment(s, i, n);
+            break;
+        }
+        if (c == '"' || c == '\'') {
+            let e = i + 1;
+            while (e < n && s[e] != c) {
+                if (s[e] == '\\' && c == '"') { e++; }
+                e++;
+            }
+            paint(i, e + 1, S_STRING);
+            // variables inside double quotes
+            if (c == '"') {
+                let k = i + 1;
+                while (k < e && k < n) {
+                    if (s[k] == '$' || s[k] == '%') {
+                        let ve = k + 1;
+                        if (ve < n && (s[ve] == '{' || s[ve] == '(')) {
+                            let close = s[ve] == '{' ? "}" : ")";
+                            ve = s.index_of(close, ve);
+                            if (ve < 0) { ve = e; }
+                            ve++;
+                        } else {
+                            while (ve < n && is_word_b(ubyte(s, ve))) { ve++; }
+                            if (s[k] == '%' && ve < n && s[ve] == '%') { ve++; }
+                        }
+                        if (ve > k + 1) { paint(k, imin(ve, e), S_VAR); }
+                        k = ve;
+                    } else {
+                        k++;
+                    }
+                }
+            }
+            i = e + 1;
+            first_word = false;
+            continue;
+        }
+        if (c == '$' || c == '%') {
+            let ve = i + 1;
+            if (ve < n && (s[ve] == '{' || s[ve] == '(')) {
+                let close = s[ve] == '{' ? "}" : ")";
+                ve = s.index_of(close, ve);
+                if (ve < 0) { ve = n - 1; }
+                ve++;
+            } else {
+                while (ve < n && (is_word_b(ubyte(s, ve)) || s[ve] == '~')) { ve++; }
+                if (c == '%' && ve < n && s[ve] == '%') { ve++; }
+            }
+            if (ve > i + 1) {
+                paint(i, ve, S_VAR);
+                i = ve;
+                continue;
+            }
+        }
+        if (c == '-' && i + 1 < n && (is_word_b(ubyte(s, i + 1)) || s[i + 1] == '-') && (i == 0 || is_space_b(ubyte(s, i - 1)))) {
+            let e = i + 1;
+            while (e < n && (is_word_b(ubyte(s, e)) || s[e] == '-')) { e++; }
+            paint(i, e, S_KEYWORD);
+            i = e;
+            continue;
+        }
+        if (is_digit_b(ubyte(s, i)) && !is_word_at(s, i - 1)) {
+            let e = word_end(s, i);
+            paint(i, e, S_NUMBER);
+            i = e;
+            continue;
+        }
+        if (is_word_b(ubyte(s, i)) || c == '@') {
+            let st2 = i;
+            if (c == '@') { i++; }
+            let e = word_end(s, i);
+            let w = s.substring(i, e - i);
+            let lw = w.lower();
+            if (sh_words.has(lw)) {
+                let k = sh_words[lw];
+                paint(st2, e, k == 1 ? S_CONTROL : S_KEYWORD);
+            } else if (first_word && e - st2 > 0) {
+                paint(st2, e, S_FUNC);
+            }
+            first_word = false;
+            i = e;
+            continue;
+        }
+        if (c == '|' || c == ';' || c == '&' || c == '(') { first_word = true; }
+        i++;
+    }
+    return HC;
+}
+
+// The file-type badge in a 14 pixel wide box at x, centred in a row of height h.
+fn draw_badge(x: int, y: int, h: int, name: string) {
+    let b = lang_badge(name);
+    if (len(b) == 0) {
+        draw_glyph("file", x, y + (h - px(14)) / 2, px(14), 0x8B8B8B);
+        return;
+    }
+    let w = tw(b, UI_SMALL);
+    txt_v(x + (px(14) - w) / 2, y, h, b, lang_color(name), UI_SMALL);
+}

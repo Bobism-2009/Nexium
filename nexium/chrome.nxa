@@ -1,0 +1,657 @@
+// Everything around the editor: layout, title bar with menus and the command
+// center, activity bar, side bar, tabs, breadcrumbs, status bar, and the
+// welcome and settings pages.
+
+fn layout() {
+    let top = TOOLBAR_H;
+    let bottom = win_h - STATUS_H;
+    sidebar_w = clamp(sidebar_w, px(170), imax(px(170), win_w / 2));
+    side_x = ACT_W;
+    side_y = top;
+    side_h = bottom - top;
+    main_x = ACT_W + (show_sidebar ? sidebar_w + 1 : 0);
+    main_w = win_w - main_x;
+    panel_h = clamp(panel_h, px(100), imax(px(100), bottom - top - px(140)));
+    panel_y = show_panel ? bottom - panel_h : bottom;
+    ed_x = main_x;
+    ed_w = main_w;
+    ed_y = top + TABS_H + (is_file_tab() ? CRUMB_H : 0);
+    ed_h = panel_y - ed_y;
+    gutter_w = px(18) + digits(imax(len(L), 99)) * CW + px(22);
+    text_x = ed_x + gutter_w;
+    text_w = ed_w - gutter_w - SCROLL_W;
+}
+
+// Wrapped text; returns the height it took.
+fn para(x: int, y: int, w: int, s: string, c: int, size: int): int {
+    let words = s.split(" ");
+    let lh = ui.text_height(size) + px(4);
+    let line_ = "";
+    let yy = y;
+    for (wd in words) {
+        let t = len(line_) == 0 ? wd : line_ + " " + wd;
+        if (tw(t, size) > w && len(line_) > 0) {
+            txt(x, yy, line_, c, size);
+            yy += lh;
+            line_ = wd;
+        } else {
+            line_ = t;
+        }
+    }
+    if (len(line_) > 0) {
+        txt(x, yy, line_, c, size);
+        yy += lh;
+    }
+    return yy - y;
+}
+
+fn section_title(x: int, y: int, w: int, title: string) {
+    fill(x, y, w, HEADER_H, C_CHROME);
+    txt_v(x + px(20), y, HEADER_H, title, C_MUTED, UI_SMALL);
+}
+
+fn tooltip(s: string) {
+    tip_text = s;
+}
+
+fn draw_tooltip() {
+    if (len(tip_text) == 0 || drag != 0) { return; }
+    let w = tw(tip_text, UI_SMALL) + px(14);
+    let h = px(22);
+    let x = clamp(mx + px(10), px(4), win_w - w - px(4));
+    let y = my + px(20);
+    if (y + h > win_h) { y = my - h - px(6); }
+    fill(x, y, w, h, 0x252526);
+    outline(x, y, w, h, 0x454545);
+    txt_v(x + px(7), y, h, tip_text, C_TEXT, UI_SMALL);
+}
+
+// The Nexium logo at (x, y), s pixels square: a white N and a blue caret bar
+// on a dark rounded square.
+fn draw_logo(x: int, y: int, s: int, back: bool) {
+    draw_logo_c(x, y, s, back, C_BRIGHT, 0x2AA1F0);
+}
+
+fn draw_logo_c(x: int, y: int, s: int, back: bool, fg: int, bar: int) {
+    if (back) { rrect(x, y, s, s, s * 13 / 64, 0x1C1D22); }
+    let u = s;
+    fill(x + u * 265 / 1024, y + u * 220 / 1024, imax(1, u * 12 / 1024), u * 568 / 1024, bar);
+    let l = x + u * 292 / 1024;
+    let t = y + u * 235 / 1024;
+    let b = y + u * 778 / 1024;
+    let r = x + u * 758 / 1024;
+    let stem = u * 126 / 1024;
+    fill(l, t, stem, b - t, fg);
+    fill(r - stem, t, stem, b - t, fg);
+    gfx.fill_tri(l, t, l + stem, t, r, b, (fg >> 16) & 255, (fg >> 8) & 255, fg & 255);
+    gfx.fill_tri(l, t, r - stem, b, r, b, (fg >> 16) & 255, (fg >> 8) & 255, fg & 255);
+}
+
+// ---- title bar -------------------------------------------------------------------------------------
+
+fn draw_toolbar() {
+    fill(0, 0, win_w, TOOLBAR_H, C_CHROME);
+    hline(0, TOOLBAR_H - 1, win_w, C_BORDER);
+    draw_logo(px(10), (TOOLBAR_H - px(20)) / 2, px(20), true);
+    let names = MENU_NAMES.split(" ");
+    for (i, len(names)) {
+        let x = menu_label_x(i);
+        let lw = tw(names[i], UI) + px(12);
+        let hov = hovered(x - px(6), px(5), lw, TOOLBAR_H - px(10));
+        if (menu_open == i || hov) {
+            rrect(x - px(6), px(5), lw, TOOLBAR_H - px(10), px(4), 0x2D2E2E);
+            // moving across the titles while a menu is open switches menus
+            if (hov && menu_open >= 0 && menu_open < 100 && menu_open != i) { menu_open = i; }
+        }
+        txt_v(x, 0, TOOLBAR_H, names[i], C_TEXT, UI);
+    }
+    // command center
+    let cw_ = clamp(win_w * 38 / 100, px(200), px(600));
+    let cx_ = (win_w - cw_) / 2;
+    let menus_end = menu_label_x(len(names));
+    if (cx_ < menus_end + px(10)) { cx_ = menus_end + px(10); }
+    let right_w = px(170);
+    if (cx_ + cw_ > win_w - right_w) { cw_ = win_w - right_w - cx_; }
+    if (cw_ > px(120)) {
+        let cy_ = px(6);
+        let ch_ = TOOLBAR_H - px(12);
+        let hov = hovered(cx_, cy_, cw_, ch_);
+        rrect(cx_, cy_, cw_, ch_, px(6), hov ? 0x303030 : 0x262626);
+        rrect_line(cx_, cy_, cw_, ch_, px(6), hov ? 0x4A4A4A : 0x3C3C3C);
+        let label = len(folder) > 0 ? file.basename(folder) : "Nexium";
+        let lw = tw(label, UI);
+        let ix = cx_ + (cw_ - lw) / 2 - px(10);
+        // magnifier
+        circle(ix, cy_ + ch_ / 2 - 1, px(5), C_MUTED);
+        line(ix + px(3), cy_ + ch_ / 2 + px(3), ix + px(7), cy_ + ch_ / 2 + px(7), C_MUTED, 1);
+        txt_v(ix + px(14), cy_, ch_, label, C_MUTED, UI);
+        cmd_center_x = cx_;
+        cmd_center_w = cw_;
+    } else {
+        cmd_center_w = 0;
+    }
+    // run and build
+    let bx = win_w - px(160);
+    let by = px(5);
+    let bh = TOOLBAR_H - px(10);
+    if (task_running()) {
+        if (ui.button(bx + px(76), by, px(76), bh, "Stop", "danger")) { stop_task(); }
+        let spin = (now_ms / 120) % 8;
+        let sx_ = bx + px(40);
+        for (k, 8) {
+            let a = k * 45;
+            let c = k == spin ? C_BRIGHT : 0x555555;
+            disc(sx_ + (int)(math.cos(a * 3.14159 / 180.0) * px(7)), by + bh / 2 + (int)(math.sin(a * 3.14159 / 180.0) * px(7)), px(1) + 1, c);
+        }
+    } else {
+        if (ui.button(bx, by, px(72), bh, "Build", "secondary")) { run_cmd("run.build"); }
+        if (ui.button(bx + px(78), by, px(76), bh, "Run", "primary")) { run_cmd("run.run"); }
+    }
+    if (hovered(bx, by, px(154), bh)) { tooltip(task_running() ? "Stop (Shift+F5)" : "Build (Ctrl+Shift+B) / Build and Run (F5)"); }
+}
+
+fn toolbar_mouse(x: int, y: int) {
+    let names = MENU_NAMES.split(" ");
+    for (i, len(names)) {
+        let lx = menu_label_x(i);
+        let lw = tw(names[i], UI) + px(12);
+        if (x >= lx - px(6) && x < lx - px(6) + lw) {
+            menu_open = menu_open == i ? -1 : i;
+            menu_hover = -1;
+            return;
+        }
+    }
+    if (cmd_center_w > 0 && x >= cmd_center_x && x < cmd_center_x + cmd_center_w) { open_quick(""); }
+}
+
+// ---- activity bar ---------------------------------------------------------------------------------------
+
+fn icon_files(x: int, y: int, c: int) {
+    // two sheets of paper
+    outline(x + px(4), y + px(1), px(11), px(15), c);
+    fill(x + px(1), y + px(5), px(11), px(15), C_CHROME);
+    outline(x + px(1), y + px(5), px(11), px(15), c);
+    hline(x + px(4), y + px(10), px(5), c);
+    hline(x + px(4), y + px(13), px(5), c);
+}
+
+fn icon_search(x: int, y: int, c: int) {
+    circle(x + px(10), y + px(8), px(6), c);
+    circle(x + px(10), y + px(8), px(6) - 1, c);
+    line(x + px(5), y + px(13), x + px(1), y + px(18), c, 2);
+}
+
+fn icon_gear(x: int, y: int, c: int) {
+    gear(x + px(10), y + px(10), px(9), c);
+}
+
+// A gear with outer radius r centred at (cx_, cy_).
+fn gear(cx_: int, cy_: int, r: int, c: int) {
+    let inner = r * 2 / 3;
+    for (k, 8) {
+        let a = k * 45 * 3.14159 / 180.0;
+        let x1 = cx_ + (int)(math.cos(a) * inner);
+        let y1 = cy_ + (int)(math.sin(a) * inner);
+        let x2 = cx_ + (int)(math.cos(a) * r);
+        let y2 = cy_ + (int)(math.sin(a) * r);
+        line(x1, y1, x2, y2, c, r >= px(8) ? 2 : 1);
+    }
+    circle(cx_, cy_, inner, c);
+    circle(cx_, cy_, imax(1, r / 3), c);
+}
+
+fn draw_activity() {
+    fill(0, TOOLBAR_H, ACT_W, win_h - TOOLBAR_H - STATUS_H, C_CHROME);
+    vline(ACT_W - 1, TOOLBAR_H, win_h - TOOLBAR_H - STATUS_H, C_BORDER);
+    let items = 2;
+    for (i, items) {
+        let y = TOOLBAR_H + i * ACT_W;
+        let on = show_sidebar && view == i;
+        let hov = hovered(0, y, ACT_W, ACT_W);
+        let c = on || hov ? C_BRIGHT : 0x868686;
+        if (on) { fill(0, y, px(2), ACT_W, C_BRIGHT); }
+        let ix = (ACT_W - px(20)) / 2;
+        let iy = y + (ACT_W - px(20)) / 2;
+        if (i == 0) { icon_files(ix, iy, c); } else { icon_search(ix, iy, c); }
+        if (hov) { tooltip(i == 0 ? "Explorer (Ctrl+Shift+E)" : "Search (Ctrl+Shift+F)"); }
+    }
+    let gy = win_h - STATUS_H - ACT_W;
+    let ghov = hovered(0, gy, ACT_W, ACT_W);
+    let gon = active_kind() == 1;
+    icon_gear((ACT_W - px(20)) / 2, gy + (ACT_W - px(20)) / 2, ghov || gon ? C_BRIGHT : 0x868686);
+    if (ghov) { tooltip("Settings (Ctrl+,)"); }
+}
+
+fn activity_mouse(x: int, y: int) {
+    let gy = win_h - STATUS_H - ACT_W;
+    if (y >= gy) {
+        open_special(1);
+        return;
+    }
+    let i = (y - TOOLBAR_H) / ACT_W;
+    if (i < 0 || i > 1) { return; }
+    if (show_sidebar && view == i) {
+        show_sidebar = false;
+    } else {
+        show_sidebar = true;
+        view = i;
+        if (i == 1) {
+            focus = F_SEARCH;
+            fld_select_all(FLD_SEARCH);
+        }
+    }
+}
+
+fn draw_sidebar() {
+    if (!show_sidebar) { return; }
+    fill(side_x, side_y, sidebar_w, side_h, C_CHROME);
+    if (view == 0) { draw_explorer(); } else { draw_search_view(); }
+    vline(side_x + sidebar_w, side_y, side_h, C_BORDER);
+    if (drag == 1 || (hovered(side_x + sidebar_w - px(2), side_y, px(5), side_h) && drag == 0)) {
+        fill(side_x + sidebar_w - 1, side_y, px(3), side_h, C_ACCENT);
+    }
+}
+
+// ---- tabs ---------------------------------------------------------------------------------------------------
+
+fn tab_width(i: int): int {
+    let nm: string = bufs[i].name;
+    return tw(nm, UI) + px(64);
+}
+
+fn draw_tabs() {
+    let x0 = main_x;
+    let y = TOOLBAR_H;
+    fill(x0, y, main_w, TABS_H, C_CHROME);
+    hline(x0, y + TABS_H - 1, main_w, C_BORDER);
+    tab_xs.clear();
+    tab_ws.clear();
+    // keep the active tab in view
+    let total = 0;
+    let act_x = 0;
+    let act_w = 0;
+    for (i, len(bufs)) {
+        let w = tab_width(i);
+        if (i == active) {
+            act_x = total;
+            act_w = w;
+        }
+        total += w;
+    }
+    if (active >= 0 && tab_follow) {
+        if (act_x < tab_scroll) { tab_scroll = act_x; }
+        if (act_x + act_w > tab_scroll + main_w) { tab_scroll = act_x + act_w - main_w; }
+        tab_follow = false;
+    }
+    tab_scroll = clamp(tab_scroll, 0, imax(0, total - main_w));
+    let x = x0 - tab_scroll;
+    for (i, len(bufs)) {
+        let w = tab_width(i);
+        tab_xs.push(x);
+        tab_ws.push(w);
+        if (x + w > x0 && x < x0 + main_w) {
+            let on = i == active;
+            let hov = hovered(x, y, w, TABS_H) && drag == 0;
+            if (on) {
+                fill(x, y, w, TABS_H, C_EDITOR);
+                fill(x, y, w, 1, C_ACCENT);
+            } else if (hov) {
+                fill(x, y, w, TABS_H - 1, 0x1F1F1F);
+            }
+            vline(x + w - 1, y, TABS_H - 1, C_BORDER);
+            let nm: string = bufs[i].name;
+            let kind: int = bufs[i].kind;
+            let ix = x + px(12);
+            if (kind == 0) {
+                draw_badge(ix, y, TABS_H, nm);
+            } else if (kind == 1) {
+                gear(ix + px(7), y + TABS_H / 2, px(7), 0x868686);
+            } else {
+                draw_logo(ix, y + (TABS_H - px(14)) / 2, px(14), true);
+            }
+            let tc = on ? C_BRIGHT : C_MUTED;
+            let preview: bool = bufs[i].preview;
+            txt_v(ix + px(20), y, TABS_H, nm, preview && !on ? 0x8B8B8B : tc, UI);
+            // close button, or a dot for unsaved changes
+            let bx = x + w - px(28);
+            let by = y + (TABS_H - px(20)) / 2;
+            let dirty = buf_dirty(i);
+            let bh = hovered(bx, by, px(20), px(20));
+            if (bh) { rrect(bx, by, px(20), px(20), px(4), 0x3A3D41); }
+            if (dirty && !bh) {
+                disc(bx + px(10), by + px(10), px(4), on ? C_BRIGHT : C_MUTED);
+            } else if (on || hov || bh) {
+                let c = on || bh ? C_BRIGHT : C_MUTED;
+                line(bx + px(6), by + px(6), bx + px(14), by + px(14), c, 1);
+                line(bx + px(14), by + px(6), bx + px(6), by + px(14), c, 1);
+            }
+        }
+        x += w;
+    }
+}
+
+fn tabs_mouse(x: int, y: int, btn: int, clicks: int) {
+    for (i, len(tab_xs)) {
+        let tx: int = tab_xs[i];
+        let w: int = tab_ws[i];
+        if (x >= tx && x < tx + w && x >= main_x) {
+            let bx = tx + w - px(28);
+            if (btn == 2 || (btn == 0 && x >= bx && x < bx + px(20))) {
+                close_tab(i);
+                return;
+            }
+            if (btn == 1) {
+                tab_ctx = i;
+                menu_open = 101;
+                menu_x = x;
+                menu_y = y + px(10);
+                return;
+            }
+            switch_to(i);
+            if (clicks >= 2 && i < len(bufs)) { bufs[i].preview = false; }
+            focus = F_EDITOR;
+            tab_follow = true;
+            return;
+        }
+    }
+    if (clicks >= 2 && btn == 0) { new_untitled(); }
+}
+
+fn draw_crumbs() {
+    if (!is_file_tab()) { return; }
+    let y = TOOLBAR_H + TABS_H;
+    fill(main_x, y, main_w, CRUMB_H, C_EDITOR);
+    let x = main_x + px(16);
+    let parts: []string;
+    if (len(doc_path) == 0) {
+        parts.push(bufs[active].name);
+    } else {
+        let rp = rel_path(doc_path);
+        for (p in rp.replace("/", "\\").split("\\")) {
+            if (len(p) > 0) { parts.push(p); }
+        }
+    }
+    let sym = enclosing_symbol();
+    for (i, len(parts)) {
+        let last = i == len(parts) - 1;
+        if (last) {
+            draw_badge(x, y, CRUMB_H, parts[i]);
+            x += px(20);
+        }
+        x += txt_v(x, y, CRUMB_H, parts[i], C_MUTED, UI);
+        if (!last || len(sym) > 0) {
+            chevron(x + px(8), y + CRUMB_H / 2, false, C_MUTED);
+            x += px(16);
+        }
+        if (x > main_x + main_w - px(40)) { break; }
+    }
+    if (len(sym) > 0) {
+        draw_glyph("symbol", x - px(2), y + (CRUMB_H - px(16)) / 2, px(16), 0xB180D7);
+        txt_v(x + px(18), y, CRUMB_H, sym, C_MUTED, UI);
+    }
+}
+
+// ---- status bar ---------------------------------------------------------------------------------------------
+
+fn status_item(x: int, s: string, id: string, right: bool): int {
+    let w = tw(s, UI_SMALL) + px(16);
+    let ix = right ? x - w : x;
+    if (hovered(ix, win_h - STATUS_H, w, STATUS_H) && len(id) > 0) { fill(ix, win_h - STATUS_H + 1, w, STATUS_H - 1, 0x2B2B2B); }
+    txt_v(ix + px(8), win_h - STATUS_H, STATUS_H, s, C_TEXT, UI_SMALL);
+    status_items_x.push(ix);
+    status_items_w.push(w);
+    status_items_id.push(id);
+    return w;
+}
+
+fn draw_status() {
+    let y = win_h - STATUS_H;
+    fill(0, y, win_w, STATUS_H, C_CHROME);
+    hline(0, y, win_w, C_BORDER);
+    status_items_x.clear();
+    status_items_w.clear();
+    status_items_id.clear();
+    // the remote-style block at the far left
+    let bw = px(34);
+    fill(0, y, bw, STATUS_H, C_ACCENT);
+    draw_logo((bw - px(14)) / 2, y + (STATUS_H - px(14)) / 2, px(14), false);
+    let x = bw + px(4);
+    if (len(git_branch) > 0) {
+        // a branch glyph: two dots and a line
+        let gx = x + px(8);
+        let cyy = y + STATUS_H / 2;
+        circle(gx + px(2), cyy - px(4), px(2), C_TEXT);
+        circle(gx + px(2), cyy + px(4), px(2), C_TEXT);
+        circle(gx + px(8), cyy - px(2), px(2), C_TEXT);
+        vline(gx + px(2), cyy - px(2), px(4), C_TEXT);
+        x += px(12);
+        x += status_item(x, git_branch, "", false);
+    }
+    // problems
+    let errs = problem_counts_err();
+    let warns = len(prob_file) - errs;
+    let px0 = x;
+    let pw = tw((string)errs, UI_SMALL) + tw((string)warns, UI_SMALL) + px(52);
+    if (hovered(px0, y, pw, STATUS_H)) { fill(px0, y + 1, pw, STATUS_H - 1, 0x2B2B2B); }
+    let cyy = y + STATUS_H / 2;
+    circle(px0 + px(14), cyy, px(5), C_TEXT);
+    line(px0 + px(12), cyy - px(2), px0 + px(16), cyy + px(2), C_TEXT, 1);
+    line(px0 + px(16), cyy - px(2), px0 + px(12), cyy + px(2), C_TEXT, 1);
+    let tx = px0 + px(22);
+    tx += txt_v(tx, y, STATUS_H, (string)errs, C_TEXT, UI_SMALL) + px(8);
+    gfx.tri(tx + px(5), cyy - px(5), tx, cyy + px(4), tx + px(10), cyy + px(4), 204, 204, 204);
+    txt_v(tx + px(14), y, STATUS_H, (string)warns, C_TEXT, UI_SMALL);
+    status_items_x.push(px0);
+    status_items_w.push(pw);
+    status_items_id.push("view.problems");
+    x = px0 + pw;
+    if (task_running()) {
+        x += status_item(x, task_label + "ing...", "view.output", false);
+    }
+    if (now_ms < flash_until) {
+        x += status_item(x, flash_msg, "", false);
+    }
+    // right side
+    let rx = win_w - px(8);
+    if (len(nexac_version) > 0) {
+        rx -= status_item(rx, nexac_version, "help.about", true);
+    }
+    if (is_file_tab()) {
+        rx -= status_item(rx, lang_name(doc_lang), "", true);
+        rx -= status_item(rx, doc_crlf ? "CRLF" : "LF", "status.eol", true);
+        rx -= status_item(rx, "UTF-8", "", true);
+        rx -= status_item(rx, "Spaces: 4", "", true);
+        let label = f"Ln {cy + 1}, Col {vcol(L[cy], cx) + 1}";
+        if (has_sel()) {
+            let t = sel_text();
+            label += f" ({len(t)} selected)";
+        }
+        rx -= status_item(rx, label, "go.line", true);
+    }
+}
+
+fn status_mouse(x: int, y: int) {
+    for (i, len(status_items_x)) {
+        let ix: int = status_items_x[i];
+        let w: int = status_items_w[i];
+        if (x >= ix && x < ix + w) {
+            let id: string = status_items_id[i];
+            if (id == "status.eol") {
+                if (is_file_tab()) {
+                    doc_crlf = !doc_crlf;
+                    doc_ver = ver_seq;
+                    ver_seq++;
+                }
+            } else if (len(id) > 0) {
+                run_cmd(id);
+            }
+            return;
+        }
+    }
+}
+
+// ---- welcome and empty editor ---------------------------------------------------------------------------------
+
+fn shortcut_row(x: int, y: int, label: string, keys: string) {
+    let lw = tw(label, UI);
+    txt_v(x - lw - px(12), y, px(24), label, C_MUTED, UI);
+    let kx = x + px(4);
+    for (k in keys.split(" ")) {
+        let parts = k.split("+");
+        for (j, len(parts)) {
+            kx += keycap(kx, y + px(2), parts[j]) + px(3);
+            if (j < len(parts) - 1) {
+                txt_v(kx, y, px(24), "+", C_MUTED, UI_SMALL);
+                kx += px(10);
+            }
+        }
+        kx += px(6);
+    }
+}
+
+fn draw_watermark() {
+    fill(main_x, TOOLBAR_H + TABS_H, main_w, panel_y - TOOLBAR_H - TABS_H, C_EDITOR);
+    let top = TOOLBAR_H + (len(bufs) > 0 ? TABS_H : 0);
+    if (len(bufs) == 0) { fill(main_x, TOOLBAR_H, main_w, TABS_H, C_EDITOR); }
+    let h = panel_y - top;
+    let cx_ = main_x + main_w / 2;
+    let size = imin(px(140), h / 3);
+    let y = top + imax(px(20), (h - size - px(190)) / 2);
+    if (size > px(40)) {
+        draw_logo_c(cx_ - size / 2, y, size, false, 0x2C2C2C, 0x1F3A52);
+        y += size + px(30);
+    }
+    shortcut_row(cx_, y, "Show All Commands", "Ctrl+Shift+P");
+    shortcut_row(cx_, y + px(30), "Go to File", "Ctrl+P");
+    shortcut_row(cx_, y + px(60), "Find in Files", "Ctrl+Shift+F");
+    shortcut_row(cx_, y + px(90), "Build and Run", "F5");
+    shortcut_row(cx_, y + px(120), "Toggle Terminal", "Ctrl+`");
+    if (len(folder) == 0) { shortcut_row(cx_, y + px(150), "Open Folder", "Ctrl+K Ctrl+O"); }
+}
+
+fn link_button(x: int, y: int, label: string): bool {
+    let w = tw(label, UI) + px(4);
+    let h = px(22);
+    let hov = hovered(x, y, w, h);
+    txt_v(x, y, h, label, hov ? 0x4DAAFC : S_LINK, UI);
+    if (hov) { hline(x, y + h - px(3), w - px(4), 0x4DAAFC); }
+    return clicked_in(x, y, w, h);
+}
+
+fn clamp_page(content: int) {
+    let view_h = panel_y - TOOLBAR_H - TABS_H;
+    page_scroll = clamp(page_scroll, 0, imax(0, content - view_h));
+}
+
+fn draw_welcome() {
+    let top = TOOLBAR_H + TABS_H;
+    fill(main_x, top, main_w, panel_y - top, C_EDITOR);
+    clamp_page(px(640));
+    let x = main_x + imax(px(40), (main_w - px(860)) / 2);
+    let y = top + px(60) - page_scroll;
+    draw_logo(x, y, px(64), true);
+    ui.heading(x + px(84), y + px(2), "Nexium", px(34));
+    txt(x + px(86), y + px(44), "A code editor for the Nexa language, written in Nexa.", C_MUTED, UI);
+    y += px(110);
+    let col2 = x + px(420);
+    ui.heading(x, y, "Start", px(19));
+    let ly = y + px(36);
+    if (link_button(x, ly, "New File...")) { run_cmd("file.new"); }
+    if (link_button(x, ly + px(26), "Open File...")) { run_cmd("file.open"); }
+    if (link_button(x, ly + px(52), "Open Folder...")) { run_cmd("file.openFolder"); }
+    if (link_button(x, ly + px(78), "Settings")) { run_cmd("app.settings"); }
+    ui.heading(x, ly + px(122), "Recent", px(19));
+    let ry = ly + px(158);
+    if (len(recent) == 0) {
+        txt(x, ry, "You have no recent folders.", C_MUTED, UI);
+    }
+    for (i, imin(len(recent), 8)) {
+        let r: string = recent[i];
+        if (link_button(x, ry, file.basename(r))) {
+            set_folder(r);
+            return;
+        }
+        let nw = tw(file.basename(r), UI);
+        txt_v(x + nw + px(14), ry, px(22), fit(r, col2 - x - nw - px(30), UI), C_MUTED, UI);
+        ry += px(26);
+    }
+    // right column: a card per topic, drawn with std/ui panels
+    ui.heading(col2, y, "Walkthroughs", px(19));
+    let cy_ = y + px(36);
+    let cards = ["Build and run|Press F5 to build the project with NexaC and run it. Output and errors show in the panel below.",
+                 "Find your way|Ctrl+P opens any file; type > for commands, @ for symbols in the file, or : and a line number.",
+                 "Check as you save|Saving a .nxa file runs the Nexa parser on it; problems appear as squiggles and in PROBLEMS."];
+    for (c in cards) {
+        let parts = c.split("|");
+        ui.panel(col2, cy_, px(400), px(92));
+        ui.heading(col2 + px(16), cy_ + px(12), parts[0], px(15));
+        para(col2 + px(16), cy_ + px(40), px(368), parts[1], C_MUTED, UI);
+        cy_ += px(104);
+    }
+}
+
+// ---- settings page -------------------------------------------------------------------------------------------
+
+fn draw_settings_page() {
+    let top = TOOLBAR_H + TABS_H;
+    fill(main_x, top, main_w, panel_y - top, C_EDITOR);
+    if (!set_loaded) {
+        set_compiler = nexac;
+        set_args = run_args;
+        set_loaded = true;
+    }
+    clamp_page(px(780));
+    let x = main_x + imax(px(40), (main_w - px(720)) / 2);
+    let w = imin(px(720), main_w - px(80));
+    let y = top + px(36) - page_scroll;
+    ui.heading(x, y, "Settings", px(28));
+    y += px(56);
+
+    ui.panel(x, y, w, px(206), "Text Editor");
+    let iy = y + px(56);
+    txt(x + px(20), iy, "Font Size", C_TEXT, UI);
+    txt(x + px(20), iy + px(20), "Size of the code font, in pixels.", C_MUTED, UI_SMALL);
+    let fs = ui.slider(x + w - px(300), iy + px(8), px(220), font_size, 8, 32);
+    txt(x + w - px(64), iy + px(8), (string)fs + " px", C_TEXT, UI);
+    if (fs != font_size && drag == 0) { set_font_size(fs); }
+    iy += px(52);
+    let ws = ui.toggle(x + px(20), iy, "Render whitespace (dots for spaces, arrows for tabs)", show_ws);
+    if (ws != show_ws) {
+        show_ws = ws;
+        save_settings();
+    }
+    iy += px(40);
+    let asv = ui.toggle(x + px(20), iy, "Auto save when switching tabs or windows", auto_save);
+    if (asv != auto_save) {
+        auto_save = asv;
+        save_settings();
+    }
+    y += px(226);
+
+    ui.panel(x, y, w, px(250), "Nexa");
+    iy = y + px(56);
+    txt(x + px(20), iy, "Compiler", C_TEXT, UI);
+    txt(x + px(20), iy + px(20), "Name on PATH or full path of NexaC. Empty finds NexaC, Nexa or nexac.", C_MUTED, UI_SMALL);
+    set_compiler = ui.textbox(x + px(20), iy + px(42), w - px(160), set_compiler, "NexaC");
+    if (ui.button(x + w - px(128), iy + px(42), px(108), ui.text_height(UI) + px(16), "Apply", "secondary")) {
+        nexac = set_compiler.trim();
+        detect_compiler_version();
+        save_settings();
+        flash(len(nexac_version) > 0 ? "Using " + nexac_version : "Compiler not found");
+    }
+    iy += px(92);
+    txt(x + px(20), iy, "Run arguments", C_TEXT, UI);
+    txt(x + px(20), iy + px(20), "Passed to your program when you press F5.", C_MUTED, UI_SMALL);
+    let na = ui.textbox(x + px(20), iy + px(42), w - px(40), set_args, "--flag value");
+    if (na != set_args) {
+        set_args = na;
+        run_args = na;
+        save_settings();
+    }
+    y += px(270);
+
+    ui.panel(x, y, w, px(120), "About");
+    txt(x + px(20), y + px(56), "Nexium " + VERSION + ", written in Nexa and drawn with std/ui.", C_TEXT, UI);
+    let cv = len(nexac_version) > 0 ? nexac_version : "NexaC not found on PATH";
+    txt(x + px(20), y + px(80), cv + "   ·   settings: " + settings_path, C_MUTED, UI_SMALL);
+}

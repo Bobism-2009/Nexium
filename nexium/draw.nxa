@@ -1,0 +1,235 @@
+// Drawing helpers over std/gfx and std/ui: colours are 0xRRGGBB ints.
+
+fn px(v: int): int {
+    return (int)(v * SCALE + 0.5);
+}
+
+fn fill(x: int, y: int, w: int, h: int, c: int) {
+    if (w <= 0 || h <= 0) { return; }
+    gfx.fill(x, y, w, h, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+}
+
+// A fill at alpha a (0..255) over what is already there.
+fn fill_a(x: int, y: int, w: int, h: int, c: int, a: int) {
+    if (w <= 0 || h <= 0) { return; }
+    gfx.alpha(a);
+    gfx.fill(x, y, w, h, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+    gfx.alpha(255);
+}
+
+fn rrect(x: int, y: int, w: int, h: int, r: int, c: int) {
+    if (w <= 0 || h <= 0) { return; }
+    gfx.fill_round_rect(x, y, w, h, r, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+}
+
+fn rrect_line(x: int, y: int, w: int, h: int, r: int, c: int) {
+    if (w <= 0 || h <= 0) { return; }
+    gfx.round_rect(x, y, w, h, r, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+}
+
+fn outline(x: int, y: int, w: int, h: int, c: int) {
+    gfx.rect(x, y, w, h, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+}
+
+fn hline(x: int, y: int, w: int, c: int) {
+    fill(x, y, w, 1, c);
+}
+
+fn vline(x: int, y: int, h: int, c: int) {
+    fill(x, y, 1, h, c);
+}
+
+fn line(x1: int, y1: int, x2: int, y2: int, c: int, t: int) {
+    gfx.line(x1, y1, x2, y2, (c >> 16) & 255, (c >> 8) & 255, c & 255, t);
+}
+
+fn circle(x: int, y: int, r: int, c: int) {
+    gfx.circle(x, y, r, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+}
+
+fn disc(x: int, y: int, r: int, c: int) {
+    gfx.fill_circle(x, y, r, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+}
+
+// Interface text with its top-left at (x, y); returns its width.
+fn txt(x: int, y: int, s: string, c: int, size: int): int {
+    if (len(s) == 0) { return 0; }
+    return ui.text(x, y, s, size, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+}
+
+// Text centred vertically in a row of height h.
+fn txt_v(x: int, y: int, h: int, s: string, c: int, size: int): int {
+    return txt(x, y + (h - ui.text_height(size)) / 2, s, c, size);
+}
+
+fn txt_bold(x: int, y: int, h: int, s: string, size: int): int {
+    return ui.heading(x, y + (h - ui.text_height(size)) / 2, s, size);
+}
+
+fn tw(s: string, size: int): int {
+    if (len(s) == 0) { return 0; }
+    return ui.text_width(s, size);
+}
+
+// s cut down with an ellipsis so it fits in w pixels.
+fn fit(s: string, w: int, size: int): string {
+    if (tw(s, size) <= w) { return s; }
+    let n = len(s);
+    while (n > 0) {
+        n--;
+        while (n > 0 && ((int)(unsigned char)s[n] & 0xC0) == 0x80) { n--; }
+        let t = s.substring(0, n) + "…";
+        if (tw(t, size) <= w) { return t; }
+    }
+    return "";
+}
+
+// Same, but keeps the end (for paths).
+fn fit_left(s: string, w: int, size: int): string {
+    if (tw(s, size) <= w) { return s; }
+    let n = 0;
+    while (n < len(s)) {
+        n++;
+        while (n < len(s) && ((int)(unsigned char)s[n] & 0xC0) == 0x80) { n++; }
+        let t = "…" + s.substring(n, -1);
+        if (tw(t, size) <= w) { return t; }
+    }
+    return "";
+}
+
+fn inside(x: int, y: int, rx: int, ry: int, rw: int, rh: int): bool {
+    return x >= rx && y >= ry && x < rx + rw && y < ry + rh;
+}
+
+fn hovered(rx: int, ry: int, rw: int, rh: int): bool {
+    return inside(mx, my, rx, ry, rw, rh);
+}
+
+fn clamp(v: int, lo: int, hi: int): int {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+fn imin(a: int, b: int): int {
+    if (a < b) { return a; }
+    return b;
+}
+
+fn imax(a: int, b: int): int {
+    if (a > b) { return a; }
+    return b;
+}
+
+// A keycap, as on the welcome page: returns its width.
+fn keycap(x: int, y: int, s: string): int {
+    let w = tw(s, UI_SMALL) + px(10);
+    let h = px(20);
+    rrect(x, y, w, h, px(3), 0x2F2F2F);
+    hline(x + px(2), y + h - 1, w - px(4), 0x444444);
+    txt_v(x + px(5), y, h, s, C_TEXT, UI_SMALL);
+    return w;
+}
+
+// Sizes everything from the DPI scale and the code font size.
+fn metrics_init() {
+    UI = px(13);
+    UI_SMALL = px(11);
+    FS = px(font_size);
+    TOOLBAR_H = px(35);
+    ACT_W = px(48);
+    TABS_H = px(35);
+    CRUMB_H = px(22);
+    STATUS_H = px(22);
+    ROW_H = px(22);
+    HEADER_H = px(35);
+    SCROLL_W = px(14);
+    LH = ui.text_height(FS) + px(5);
+    // Code is drawn one character per cell so columns line up: the cell is as
+    // wide as a digit, and each glyph is centred in it.
+    CW = (ui.text_width("0000000000", FS) + 5) / 10;
+    if (CW < 4) { CW = 4; }
+    glyph_s.clear();
+    for (i, 128) {
+        if (i < 33 || i == 127) {
+            glyph_s.push("");
+            glyph_w[i] = 0;
+            glyph_off[i] = 0;
+        } else {
+            let ch = " ";
+            ch[0] = (char)i;
+            glyph_s.push(ch);
+            let w = ui.text_width(ch, FS);
+            glyph_w[i] = w;
+            glyph_off[i] = (CW - w) / 2;
+        }
+    }
+}
+
+// Small line icons, s pixels square, for places where the font has no glyph.
+fn draw_glyph(kind: string, x: int, y: int, s: int, c: int) {
+    let m = x + s / 2;
+    let n = y + s / 2;
+    let u = imax(1, s / 20);
+    if (kind == "close") {
+        line(m - px(4), n - px(4), m + px(4), n + px(4), c, 1);
+        line(m + px(4), n - px(4), m - px(4), n + px(4), c, 1);
+    } else if (kind == "stop") {
+        fill(m - px(4), n - px(4), px(8), px(8), c);
+    } else if (kind == "plus") {
+        fill(m - px(5), n, px(11), 1, c);
+        fill(m, n - px(5), 1, px(11), c);
+    } else if (kind == "copy") {
+        outline(m - px(5), n - px(2), px(8), px(8), c);
+        outline(m - px(2), n - px(5), px(8), px(8), c);
+    } else if (kind == "clear") {
+        fill(m - px(6), n - px(4), px(8), 1, c);
+        fill(m - px(6), n, px(8), 1, c);
+        fill(m - px(6), n + px(4), px(5), 1, c);
+        line(m + px(2), n + px(1), m + px(6), n + px(5), c, 1);
+        line(m + px(6), n + px(1), m + px(2), n + px(5), c, 1);
+    } else if (kind == "newfile") {
+        outline(m - px(5), n - px(6), px(9), px(12), c);
+        fill(m + px(1), n + px(1), px(7), 1, c);
+        fill(m + px(4), n - px(2), 1, px(7), c);
+    } else if (kind == "newfolder") {
+        outline(m - px(7), n - px(4), px(12), px(9), c);
+        fill(m - px(7), n - px(6), px(5), px(2), c);
+        fill(m + px(1), n + px(3), px(7), 1, c);
+        fill(m + px(4), n, 1, px(7), c);
+    } else if (kind == "refresh") {
+        circle(m, n, px(5), c);
+        fill(m + px(2), n - px(6), px(4), px(4), C_CHROME);
+        gfx.fill_tri(m + px(1), n - px(7), m + px(6), n - px(5), m + px(2), n - px(1), (c >> 16) & 255, (c >> 8) & 255, c & 255);
+    } else if (kind == "collapse") {
+        outline(m - px(6), n - px(6), px(10), px(10), c);
+        fill(m - px(4), n - px(1), px(6), 1, c);
+        fill(m - px(3), n + px(6), px(10), 1, c);
+        fill(m + px(6), n - px(3), 1, px(10), c);
+    } else if (kind == "up") {
+        fill(m, n - px(5), 1, px(11), c);
+        line(m - px(4), n - px(1), m, n - px(5), c, 1);
+        line(m + px(4), n - px(1), m, n - px(5), c, 1);
+    } else if (kind == "down") {
+        fill(m, n - px(5), 1, px(11), c);
+        line(m - px(4), n + px(1), m, n + px(5), c, 1);
+        line(m + px(4), n + px(1), m, n + px(5), c, 1);
+    } else if (kind == "chevdown") {
+        line(m - px(4), n - px(2), m, n + px(2), c, 1);
+        line(m, n + px(2), m + px(4), n - px(2), c, 1);
+    } else if (kind == "chevright") {
+        line(m - px(2), n - px(4), m + px(2), n, c, 1);
+        line(m + px(2), n, m - px(2), n + px(4), c, 1);
+    } else if (kind == "symbol") {
+        // a cube, as VS Code marks functions and methods
+        gfx.fill_tri(m - px(5), n - px(2), m, n - px(5), m + px(5), n - px(2), (c >> 16) & 255, (c >> 8) & 255, c & 255);
+        gfx.fill_tri(m - px(5), n - px(2), m + px(5), n - px(2), m, n + px(1), (c >> 16) & 255, (c >> 8) & 255, c & 255);
+        outline(m - px(5), n - px(2), px(11), px(8), c);
+        fill(m, n + px(1), 1, px(5), c);
+    } else if (kind == "file") {
+        outline(m - px(4), n - px(6), px(9), px(12), c);
+        fill(m - px(2), n - px(2), px(5), 1, c);
+        fill(m - px(2), n + px(1), px(5), 1, c);
+    }
+    if (u > 99) { fill(x, y, u, u, c); }
+}

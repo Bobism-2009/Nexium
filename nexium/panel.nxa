@@ -1,0 +1,538 @@
+// The bottom panel: PROBLEMS, OUTPUT (build and run) and TERMINAL (cmd.exe),
+// and the background check that fills in problems for the active file.
+
+fn log_out(s: string) {
+    for (l in split_lines(s)) { out_lines.push(l); }
+    while (len(out_lines) > 20000) { out_lines.remove(0); }
+    out_follow = true;
+    frame_dirty = true;
+}
+
+// A short message in the status bar.
+fn flash(s: string) {
+    flash_msg = s;
+    flash_until = now_ms + 3500;
+    frame_dirty = true;
+}
+
+// Appends process output to the output (which 1) or terminal (2) lines,
+// keeping the unfinished last line apart.
+fn feed_lines(which: int, chunk: string) {
+    let partial = which == 1 ? out_partial : term_partial;
+    let t = partial + strip_ansi(chunk).replace("\r\n", "\n");
+    let parts = t.split("\n");
+    let k = 0;
+    while (k < len(parts) - 1) {
+        let p = parts[k];
+        // a bare CR rewrites the line (progress output)
+        let cr = p.last_index_of("\r");
+        if (cr >= 0) { p = p.substring(cr + 1, -1); }
+        if (which == 1) { out_lines.push(p.replace("\t", "    ")); } else { term_lines.push(p.replace("\t", "    ")); }
+        k++;
+    }
+    if (which == 1) {
+        out_partial = parts[len(parts) - 1];
+        while (len(out_lines) > 20000) { out_lines.remove(0); }
+    } else {
+        term_partial = parts[len(parts) - 1];
+        while (len(term_lines) > 20000) { term_lines.remove(0); }
+    }
+}
+
+fn poll_processes() {
+    if (task_proc >= 0) {
+        let chunk: string = nx_proc_read(task_proc);
+        if (len(chunk) > 0) {
+            feed_lines(1, chunk);
+            frame_dirty = true;
+        }
+        if (task_exit == -2 && nx_proc_running(task_proc) == 0) {
+            task_exit = nx_proc_exit_code(task_proc);
+            if (len(out_partial) > 0) {
+                out_lines.push(out_partial);
+                out_partial = "";
+            }
+            let secs = (now_ms - task_start_ms) / 100;
+            log_out("");
+            if (task_exit == 0) {
+                log_out(f"[{task_label} finished in {secs / 10}.{secs % 10}s]");
+            } else {
+                log_out(f"[{task_label} failed with exit code {task_exit}]");
+            }
+            parse_problems(out_lines.join("\n"), "build");
+            nx_proc_free(task_proc);
+            task_proc = -1;
+        }
+    }
+    if (term_proc >= 0) {
+        let chunk: string = nx_proc_read(term_proc);
+        if (len(chunk) > 0) {
+            feed_lines(2, chunk);
+            term_follow = true;
+            frame_dirty = true;
+        }
+        if (nx_proc_running(term_proc) == 0) {
+            term_lines.push(term_partial);
+            term_lines.push("[terminal exited: press Enter to start a new one]");
+            term_partial = "";
+            nx_proc_free(term_proc);
+            term_proc = -1;
+        }
+    }
+    if (check_proc >= 0) {
+        let more: string = nx_proc_read(check_proc);
+        check_out += more;
+        if (nx_proc_running(check_proc) == 0) {
+            nx_proc_free(check_proc);
+            check_proc = -1;
+            clear_problems_from("check");
+            parse_problems(check_out, "check");
+            frame_dirty = true;
+        }
+    }
+}
+
+// ---- problems ------------------------------------------------------------------------------------
+
+fn clear_problems_for(p: string) {
+    let i = len(prob_file) - 1;
+    while (i >= 0) {
+        if (same_path(prob_file[i], p)) {
+            prob_file.remove(i);
+            prob_line.remove(i);
+            prob_msg.remove(i);
+            prob_err.remove(i);
+            prob_src.remove(i);
+        }
+        i--;
+    }
+}
+
+fn clear_problems_from(src: string) {
+    let i = len(prob_file) - 1;
+    while (i >= 0) {
+        if (prob_src[i] == src) {
+            prob_file.remove(i);
+            prob_line.remove(i);
+            prob_msg.remove(i);
+            prob_err.remove(i);
+            prob_src.remove(i);
+        }
+        i--;
+    }
+}
+
+fn add_problem(f: string, ln: int, msg: string, err: bool, src: string) {
+    for (i, len(prob_file)) {
+        if (same_path(prob_file[i], f) && prob_line[i] == ln && prob_msg[i] == msg) { return; }
+    }
+    prob_file.push(f);
+    prob_line.push(ln);
+    prob_msg.push(msg);
+    prob_err.push(err);
+    prob_src.push(src);
+}
+
+// Reads NexaC's "[Nexa] Error: <file>: <message> at line N" lines, and the
+// C++ compiler's "<file>:<line>:<col>: error: <message>" lines.
+fn parse_problems(text: string, src: string) {
+    for (raw in split_lines(text)) {
+        let l = raw.trim();
+        let at = l.index_of("[Nexa] Error: ");
+        let warn = false;
+        if (at < 0) {
+            at = l.index_of("[Nexa] Warning: ");
+            warn = at >= 0;
+        }
+        if (at >= 0) {
+            let rest = l.substring(at + (warn ? 16 : 14), -1);
+            let ln_at = rest.last_index_of(" at line ");
+            // "main.nxa: lib.nxa: message": the innermost file is the one at fault
+            let sep = -1;
+            let prev = -1;
+            let k = rest.index_of(".nxa: ");
+            while (k >= 0 && (ln_at < 0 || k < ln_at)) {
+                prev = sep;
+                sep = k;
+                k = rest.index_of(".nxa: ", k + 6);
+            }
+            if (sep > 0) {
+                let fstart = prev >= 0 ? prev + 6 : 0;
+                let f = rest.substring(fstart, sep + 4 - fstart);
+                let msg = rest.substring(sep + 6, -1);
+                let ln = 1;
+                if (ln_at > sep) {
+                    ln = (int)rest.substring(ln_at + 9, -1).trim();
+                    msg = rest.substring(sep + 6, ln_at - sep - 6);
+                } else {
+                    let lp = msg.index_of("line ");
+                    if (lp >= 0) { ln = (int)msg.substring(lp + 5, -1); }
+                }
+                if (ln < 1) { ln = 1; }
+                add_problem(f, ln, msg, !warn, src);
+            }
+            continue;
+        }
+        let e = l.index_of(": error: ");
+        let isw = false;
+        if (e < 0) {
+            e = l.index_of(": warning: ");
+            isw = e >= 0;
+        }
+        if (e > 2) {
+            let loc = l.substring(0, e);
+            let msg = l.substring(e + (isw ? 11 : 9), -1);
+            let parts = loc.split(":");
+            if (len(parts) >= 3) {
+                let ln = (int)parts[len(parts) - 2];
+                let f = loc.substring(0, len(loc) - len(parts[len(parts) - 1]) - len(parts[len(parts) - 2]) - 2);
+                if (ln > 0 && (f.lower().ends_with(".nxa") || f.lower().ends_with(".hpp") || f.lower().ends_with(".h") || f.lower().ends_with(".cpp"))) {
+                    add_problem(f, ln, msg, !isw, src);
+                }
+            }
+        }
+    }
+}
+
+// Starts a check of the active file when it is saved and the compiler is idle.
+fn maybe_check() {
+    if (check_due == 0 || now_ms < check_due || check_proc >= 0) { return; }
+    check_due = 0;
+    if (!is_file_tab() || doc_lang != L_NEXA || len(doc_path) == 0 || doc_ver != doc_saved) { return; }
+    let c = find_compiler();
+    if (len(c) == 0) { return; }
+    let out = path_join(os.tempdir(), "nexium-check.cpp");
+    // A file without fn main() is part of a program; check the program.
+    let target = doc_path;
+    let has_main = false;
+    for (s in L) {
+        if (s.trim().starts_with("fn main(")) { has_main = true; }
+    }
+    if (!has_main) {
+        let entry = entry_file(project_dir());
+        if (len(entry) > 0) { target = entry; }
+    }
+    check_file = target;
+    check_out = "";
+    check_proc = nx_proc_start("\"" + c + "\" \"" + target + "\" --source \"" + out + "\"", file.dirname(target));
+}
+
+fn problem_counts_err(): int {
+    let n = 0;
+    for (e in prob_err) {
+        if (e) { n++; }
+    }
+    return n;
+}
+
+// ---- terminal ---------------------------------------------------------------------------------------
+
+fn ensure_terminal() {
+    if (term_proc >= 0) { return; }
+    let dir = folder;
+    if (len(dir) == 0) { dir = os.home(); }
+    term_proc = nx_proc_start("", dir);
+    term_follow = true;
+}
+
+fn term_key(vk: int, mods: int) {
+    let ctrl = (mods & M_CTRL) != 0;
+    if (vk == K_ENTER) {
+        let line: string = fld_text[FLD_TERM];
+        if (term_proc < 0) {
+            ensure_terminal();
+            return;
+        }
+        // cmd does not echo what it reads from a pipe, so show it here
+        term_partial += line;
+        term_lines.push(term_partial);
+        term_partial = "";
+        if (line.trim() == "cls" || line.trim() == "clear") {
+            term_lines.clear();
+        }
+        if (len(line.trim()) > 0) {
+            term_history.push(line);
+        }
+        term_hist_i = len(term_history);
+        nx_proc_write(term_proc, line + "\r\n");
+        fld_set(FLD_TERM, "");
+        term_follow = true;
+        return;
+    }
+    if (ctrl && vk == 67 && !fld_has_sel(FLD_TERM)) {
+        // Ctrl+C: a pipe cannot carry the signal, so stop what the shell runs
+        term_lines.push(term_partial + fld_text[FLD_TERM] + "^C");
+        term_partial = "";
+        fld_set(FLD_TERM, "");
+        nx_proc_free(term_proc);
+        term_proc = -1;
+        ensure_terminal();
+        return;
+    }
+    if (ctrl && vk == 76) {
+        term_lines.clear();
+        return;
+    }
+    if (vk == K_UP) {
+        if (term_hist_i > 0) {
+            term_hist_i--;
+            fld_set(FLD_TERM, term_history[term_hist_i]);
+        }
+        return;
+    }
+    if (vk == K_DOWN) {
+        if (term_hist_i < len(term_history) - 1) {
+            term_hist_i++;
+            fld_set(FLD_TERM, term_history[term_hist_i]);
+        } else {
+            term_hist_i = len(term_history);
+            fld_set(FLD_TERM, "");
+        }
+        return;
+    }
+    if (vk == K_ESC) {
+        focus = F_EDITOR;
+        return;
+    }
+    fld_key(FLD_TERM, vk, mods);
+    term_follow = true;
+}
+
+// ---- drawing -----------------------------------------------------------------------------------------
+
+// Monospaced text in the code font, cut at max_w; returns the width used.
+fn mono(x: int, y: int, s: string, c: int, max_w: int): int {
+    let v = 0;
+    let j = 0;
+    let n = len(s);
+    let cols = max_w / CW;
+    while (j < n && v < cols) {
+        let b = ubyte(s, j);
+        if (b < 128) {
+            if (b > 32) {
+                ui.text(x + v * CW + glyph_off[b], y, glyph_s[b], FS, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+            }
+            j++;
+        } else {
+            let cl = cp_len(s, j);
+            let ch = s.substring(j, cl);
+            ui.text(x + v * CW + (CW - tw(ch, FS)) / 2, y, ch, FS, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+            j += cl;
+        }
+        v++;
+    }
+    return v * CW;
+}
+
+fn out_color(s: string): int {
+    let l = s.lower();
+    if (l.contains("error") || l.contains("failed")) { return 0xF48771; }
+    if (l.contains("warning")) { return 0xCCA700; }
+    if (s.starts_with("[Nexa] Build successful") || s.contains("finished in")) { return C_OK; }
+    if (s.starts_with("> ")) { return C_MUTED; }
+    if (s.starts_with("[Nexa]")) { return C_MUTED; }
+    return C_TEXT;
+}
+
+fn panel_tabs_draw(x: int, y: int, w: int) {
+    let names = ["PROBLEMS", "OUTPUT", "TERMINAL"];
+    let tx = x + px(12);
+    let th = px(35);
+    for (i, 3) {
+        let label: string = names[i];
+        let lw = tw(label, UI_SMALL);
+        let extra = 0;
+        let count = len(prob_file);
+        if (i == 0 && count > 0) { extra = tw((string)count, UI_SMALL) + px(14); }
+        let wtab = lw + extra + px(16);
+        let on = panel_tab == i;
+        let c = on ? C_BRIGHT : C_MUTED;
+        if (hovered(tx, y, wtab, th) && !on) { c = C_TEXT; }
+        txt_v(tx + px(8), y, th, label, c, UI_SMALL);
+        if (i == 0 && count > 0) {
+            let bx = tx + px(8) + lw + px(6);
+            let bw = tw((string)count, UI_SMALL) + px(10);
+            rrect(bx, y + px(9), bw, px(17), px(8), 0x616161);
+            txt_v(bx + px(5), y + px(9), px(17), (string)count, C_BRIGHT, UI_SMALL);
+        }
+        if (on) { fill(tx + px(8), y + th - px(3), wtab - px(16), px(1), C_BRIGHT); }
+        if (clicked_in(tx, y, wtab, th)) {
+            show_panel_tab(i);
+            focus = i == 2 ? F_TERM : F_EDITOR;
+        }
+        tx += wtab;
+    }
+    // actions on the right
+    let bx = x + w - px(30);
+    if (icon_button(bx, y + px(7), "close", "Close Panel")) {
+        show_panel = false;
+        if (focus == F_TERM) { focus = F_EDITOR; }
+    }
+    if (panel_tab == 1) {
+        if (task_running()) {
+            if (icon_button(bx - px(26), y + px(7), "stop", "Stop")) { stop_task(); }
+        }
+        if (icon_button(bx - px(52), y + px(7), "copy", "Copy Output")) { nx_clip_set(out_lines.join("\n")); }
+        if (icon_button(bx - px(78), y + px(7), "clear", "Clear Output")) { out_lines.clear(); }
+    } else if (panel_tab == 2) {
+        if (icon_button(bx - px(26), y + px(7), "plus", "New Terminal")) { run_cmd("term.new"); }
+        if (icon_button(bx - px(52), y + px(7), "clear", "Clear")) { term_lines.clear(); }
+    }
+}
+
+fn draw_panel() {
+    if (!show_panel) { return; }
+    let x = main_x;
+    let w = main_w;
+    let y = panel_y;
+    let h = win_h - STATUS_H - panel_y;
+    fill(x, y, w, h, C_CHROME);
+    hline(x, y, w, C_BORDER);
+    panel_tabs_draw(x, y, w);
+    let by = y + px(35);
+    let bh = h - px(35);
+    panel_body_y = by;
+    panel_body_h = bh;
+    if (panel_tab == 0) {
+        draw_problems(x, by, w, bh);
+    } else if (panel_tab == 1) {
+        draw_lines(x, by, w, bh, 1);
+    } else {
+        draw_lines(x, by, w, bh, 2);
+    }
+}
+
+fn draw_problems(x: int, y: int, w: int, h: int) {
+    if (len(prob_file) == 0) {
+        txt(x + px(20), y + px(6), "No problems have been detected in the workspace.", C_MUTED, UI);
+        return;
+    }
+    let rh = ROW_H;
+    let content = len(prob_file) * rh;
+    prob_scroll = clamp(prob_scroll, 0, imax(0, content - h));
+    let i = prob_scroll / rh;
+    while (i < len(prob_file)) {
+        let ry = y + i * rh - prob_scroll;
+        if (ry >= y + h) { break; }
+        if (hovered(x, ry, w, rh)) { fill(x, ry, w, rh, C_HOVER); }
+        let err: bool = prob_err[i];
+        let ic = err ? C_ERROR : C_WARNING;
+        circle(x + px(24), ry + rh / 2, px(5), ic);
+        if (err) {
+            line(x + px(22), ry + rh / 2 - px(2), x + px(26), ry + rh / 2 + px(2), ic, 1);
+            line(x + px(26), ry + rh / 2 - px(2), x + px(22), ry + rh / 2 + px(2), ic, 1);
+        } else {
+            fill(x + px(24), ry + rh / 2 - px(3), 1, px(4), ic);
+        }
+        let msg: string = prob_msg[i];
+        let mw = txt_v(x + px(38), ry, rh, fit(msg, w - px(260), UI), C_TEXT, UI);
+        let f: string = prob_file[i];
+        txt_v(x + px(46) + mw, ry, rh, fit(file.basename(f) + " [Ln " + (string)prob_line[i] + "]", px(200), UI_SMALL), C_MUTED, UI_SMALL);
+        i++;
+    }
+}
+
+fn draw_lines(x: int, y: int, w: int, h: int, which: int) {
+    let n = which == 1 ? len(out_lines) : len(term_lines);
+    let extra = which == 2 ? 1 : (len(out_partial) > 0 ? 1 : 0);
+    let total = n + extra;
+    let rows = imax(1, (h - px(8)) / LH);
+    let scroll = which == 1 ? out_scroll : term_scroll;
+    let follow = which == 1 ? out_follow : term_follow;
+    let max_scroll = imax(0, total - rows);
+    if (follow) { scroll = max_scroll; }
+    scroll = clamp(scroll, 0, max_scroll);
+    if (which == 1) { out_scroll = scroll; } else { term_scroll = scroll; }
+    let tx = x + px(20);
+    let maxw = w - px(40);
+    let ty = (LH - ui.text_height(FS)) / 2;
+    let r = 0;
+    while (r < rows && scroll + r < total) {
+        let i = scroll + r;
+        let ly = y + px(4) + r * LH;
+        if (i < n) {
+            let s: string = which == 1 ? out_lines[i] : term_lines[i];
+            mono(tx, ly + ty, s, which == 1 ? out_color(s) : C_TEXT, maxw);
+        } else if (which == 1) {
+            mono(tx, ly + ty, out_partial, C_TEXT, maxw);
+        } else {
+            // the prompt line with what is being typed after it
+            let pw = mono(tx, ly + ty, term_partial, C_TEXT, maxw);
+            let inp: string = fld_text[FLD_TERM];
+            let iw = mono(tx + pw, ly + ty, inp, C_BRIGHT, maxw - pw);
+            if (focus == F_TERM && caret_on()) {
+                let cv = vcol(inp, fld_caret[FLD_TERM]);
+                fill(tx + pw + cv * CW, ly, px(2), LH, C_TEXT);
+            }
+            if (term_proc < 0 && len(term_lines) == 0) {
+                txt(tx, ly + ty, "Starting terminal...", C_MUTED, UI);
+            }
+        }
+        r++;
+    }
+    if (total > rows) {
+        let sbh = h - px(4);
+        let th = imax(px(20), sbh * rows / total);
+        let tyy = y + (sbh - th) * scroll / imax(1, max_scroll);
+        fill_a(x + w - px(12), tyy, px(10), th, 0x797979, 70);
+    }
+}
+
+fn panel_mouse(x: int, y: int, btn: int, clicks: int) {
+    if (y < panel_body_y) { return; }
+    if (panel_tab == 0) {
+        let i = (y - panel_body_y + prob_scroll) / ROW_H;
+        if (i >= 0 && i < len(prob_file)) {
+            let f: string = prob_file[i];
+            if (open_file(f, false)) {
+                let ln = clamp(prob_line[i] - 1, 0, len(L) - 1);
+                set_cursor(ln, len(leading_ws(L[ln])), false);
+                reveal(true);
+                focus = F_EDITOR;
+            }
+        }
+    } else if (panel_tab == 2) {
+        focus = F_TERM;
+        ensure_terminal();
+    } else if (panel_tab == 1 && clicks >= 2) {
+        // double-click an error line to jump to it
+        let rows = imax(1, (panel_body_h - px(8)) / LH);
+        let i = out_scroll + (y - panel_body_y - px(4)) / LH;
+        if (i >= 0 && i < len(out_lines)) {
+            let before = len(prob_file);
+            parse_problems(out_lines[i], "build");
+            if (len(prob_file) > 0) {
+                let k = len(prob_file) - 1;
+                for (j, len(prob_file)) {
+                    if (out_lines[i].contains(prob_msg[j])) { k = j; }
+                }
+                let f: string = prob_file[k];
+                if (open_file(f, false)) {
+                    let ln = clamp(prob_line[k] - 1, 0, len(L) - 1);
+                    set_cursor(ln, len(leading_ws(L[ln])), false);
+                    reveal(true);
+                    focus = F_EDITOR;
+                }
+            }
+        }
+    }
+}
+
+fn panel_wheel(delta: int) {
+    let n = delta / 40;
+    if (n == 0) { n = delta > 0 ? 1 : -1; }
+    if (panel_tab == 0) {
+        prob_scroll = imax(0, prob_scroll - n * ROW_H);
+    } else if (panel_tab == 1) {
+        out_scroll = imax(0, out_scroll - n);
+        out_follow = false;
+        let rows = imax(1, (panel_body_h - px(8)) / LH);
+        if (out_scroll >= len(out_lines) - rows) { out_follow = true; }
+    } else {
+        term_scroll = imax(0, term_scroll - n);
+        term_follow = false;
+        let rows = imax(1, (panel_body_h - px(8)) / LH);
+        if (term_scroll >= len(term_lines) + 1 - rows) { term_follow = true; }
+    }
+    frame_dirty = true;
+}

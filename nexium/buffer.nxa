@@ -1,0 +1,555 @@
+// Documents: open, save, switch, and the editing primitives with undo. The
+// active document lives unpacked in globals (L, cy, cx, ...) while it is
+// being edited; doc_store and doc_load move it in and out of bufs.
+
+fn doc_store() {
+    if (active < 0 || active >= len(bufs)) { return; }
+    bufs[active].lines = L;
+    bufs[active].cy = cy;
+    bufs[active].cx = cx;
+    bufs[active].ay = ay;
+    bufs[active].ax = ax;
+    bufs[active].want = want;
+    bufs[active].sy = sy;
+    bufs[active].sx = sx;
+    bufs[active].ver = doc_ver;
+    bufs[active].saved = doc_saved;
+    bufs[active].lang = doc_lang;
+    bufs[active].path = doc_path;
+    bufs[active].crlf = doc_crlf;
+    bufs[active].undo = U;
+    bufs[active].redo = R;
+    bufs[active].hl_st = hl_st;
+    bufs[active].hl_dl = hl_dl;
+    bufs[active].hl_valid = hl_valid;
+}
+
+fn doc_load(i: int) {
+    active = i;
+    if (i < 0 || i >= len(bufs)) {
+        active = -1;
+        L = [""];
+        cy = 0;
+        cx = 0;
+        ay = 0;
+        ax = 0;
+        doc_path = "";
+        doc_lang = 0;
+        U = [];
+        R = [];
+        hl_st = [];
+        hl_dl = [];
+        hl_valid = 0;
+        return;
+    }
+    L = bufs[i].lines;
+    cy = bufs[i].cy;
+    cx = bufs[i].cx;
+    ay = bufs[i].ay;
+    ax = bufs[i].ax;
+    want = bufs[i].want;
+    sy = bufs[i].sy;
+    sx = bufs[i].sx;
+    doc_ver = bufs[i].ver;
+    doc_saved = bufs[i].saved;
+    doc_lang = bufs[i].lang;
+    doc_path = bufs[i].path;
+    doc_crlf = bufs[i].crlf;
+    U = bufs[i].undo;
+    R = bufs[i].redo;
+    hl_st = bufs[i].hl_st;
+    hl_dl = bufs[i].hl_dl;
+    hl_valid = bufs[i].hl_valid;
+    if (len(L) == 0) { L = [""]; }
+}
+
+fn switch_to(i: int) {
+    if (i == active) { return; }
+    page_scroll = 0;
+    doc_store();
+    doc_load(i);
+    comp_open = false;
+    last_edit_kind = "";
+    find_hits_ver = -1;
+    check_due = now_ms + 300;
+    frame_dirty = true;
+    update_title();
+}
+
+fn active_kind(): int {
+    if (active < 0) { return -1; }
+    return bufs[active].kind;
+}
+
+fn is_file_tab(): bool {
+    return active >= 0 && bufs[active].kind == 0;
+}
+
+fn buf_dirty(i: int): bool {
+    if (i == active) { return doc_ver != doc_saved; }
+    return bufs[i].ver != bufs[i].saved;
+}
+
+fn any_dirty(): bool {
+    for (i, len(bufs)) {
+        if (buf_dirty(i)) { return true; }
+    }
+    return false;
+}
+
+fn same_path(a: string, b: string): bool {
+    return a.replace("/", "\\").lower() == b.replace("/", "\\").lower();
+}
+
+fn find_buf(path: string): int {
+    for (i, len(bufs)) {
+        let p: string = bufs[i].path;
+        if (bufs[i].kind == 0 && len(p) > 0 && same_path(p, path)) { return i; }
+    }
+    return -1;
+}
+
+fn new_buf(path: string, name: string, kind: int): Buf {
+    let b: Buf;
+    b.path = path;
+    b.name = name;
+    b.kind = kind;
+    b.lines = [""];
+    b.lang = lang_for(name);
+    b.want = -1;
+    b.ver = ver_seq;
+    b.saved = ver_seq;
+    ver_seq++;
+    return b;
+}
+
+// Opens a file (or switches to it if it is already open). preview: opened
+// from a single click in the explorer, replaced by the next preview.
+fn open_file(path: string, preview: bool): bool {
+    let at = find_buf(path);
+    if (at >= 0) {
+        if (!preview) { bufs[at].preview = false; }
+        switch_to(at);
+        return true;
+    }
+    if (!file.isfile(path)) {
+        log_out("Cannot open " + path);
+        return false;
+    }
+    let size: int = file.size(path);
+    if (size > 16 * 1024 * 1024) {
+        log_out("Not opening " + path + ": larger than 16 MB");
+        return false;
+    }
+    let text: string = file.read(path);
+    // Binary files (a NUL in the first 8 KB) are not opened as text.
+    if (text.substring(0, 8192).contains("\x00")) {
+        log_out("Not opening " + file.basename(path) + ": it looks like a binary file");
+        return false;
+    }
+    if (text.starts_with("\xEF\xBB\xBF")) { text = text.substring(3, -1); }
+    let b = new_buf(path, file.basename(path), 0);
+    b.crlf = text.contains("\r\n");
+    b.lines = split_lines(text);
+    b.mtime = nx_mtime(path);
+    b.preview = preview;
+    doc_store();
+    // A preview tab is reused by the next preview.
+    let slot = -1;
+    if (preview) {
+        for (i, len(bufs)) {
+            if (bufs[i].preview && !buf_dirty(i)) { slot = i; }
+        }
+    }
+    if (slot >= 0) {
+        bufs[slot] = b;
+        active = -1;
+        doc_load(slot);
+    } else {
+        let at2 = active + 1;
+        if (at2 <= 0) { at2 = len(bufs); }
+        bufs.insert(at2, b);
+        active = -1;
+        doc_load(at2);
+    }
+    remember_files();
+    after_switch();
+    return true;
+}
+
+fn after_switch() {
+    page_scroll = 0;
+    comp_open = false;
+    find_hits_ver = -1;
+    last_edit_kind = "";
+    check_due = now_ms + 200;
+    frame_dirty = true;
+    reveal(true);
+    update_title();
+}
+
+fn new_untitled() {
+    let n = 1;
+    let name = "Untitled-1";
+    let taken = true;
+    while (taken) {
+        taken = false;
+        name = "Untitled-" + (string)n;
+        for (i, len(bufs)) {
+            if (bufs[i].name == name) { taken = true; }
+        }
+        n++;
+    }
+    let b = new_buf("", name, 0);
+    b.lang = L_NEXA;
+    doc_store();
+    let at = active + 1;
+    bufs.insert(at, b);
+    active = -1;
+    doc_load(at);
+    after_switch();
+    focus = F_EDITOR;
+}
+
+fn find_name(name: string): int {
+    for (i, len(bufs)) {
+        if (bufs[i].name == name) { return i; }
+    }
+    return -1;
+}
+
+// Opens (or shows) a special tab: 1 settings, 2 welcome.
+fn open_special(kind: int) {
+    for (i, len(bufs)) {
+        if (bufs[i].kind == kind) {
+            switch_to(i);
+            return;
+        }
+    }
+    let b = new_buf("", kind == 1 ? "Settings" : "Welcome", kind);
+    doc_store();
+    bufs.push(b);
+    active = -1;
+    doc_load(len(bufs) - 1);
+    after_switch();
+}
+
+fn text_of_doc(): string {
+    let nl = doc_crlf ? "\r\n" : "\n";
+    return L.join(nl);
+}
+
+fn save_doc(): bool {
+    if (!is_file_tab()) { return false; }
+    if (len(doc_path) == 0) { return save_doc_as(); }
+    if (!file.write(doc_path, text_of_doc())) {
+        nx_message("Could not save " + doc_path + ".");
+        return false;
+    }
+    doc_saved = doc_ver;
+    bufs[active].preview = false;
+    bufs[active].mtime = nx_mtime(doc_path);
+    doc_store();
+    check_due = now_ms;
+    frame_dirty = true;
+    return true;
+}
+
+fn save_doc_as(): bool {
+    if (!is_file_tab()) { return false; }
+    let name: string = bufs[active].name;
+    if (len(doc_path) > 0) { name = file.basename(doc_path); }
+    let p: string = nx_save_file(name);
+    if (len(p) == 0) { return false; }
+    doc_path = p;
+    bufs[active].path = p;
+    bufs[active].name = file.basename(p);
+    doc_lang = lang_for(p);
+    hl_valid = 0;
+    let ok = save_doc();
+    refresh_tree();
+    remember_files();
+    update_title();
+    return ok;
+}
+
+fn save_all() {
+    let keep = active;
+    for (i, len(bufs)) {
+        if (bufs[i].kind == 0 && buf_dirty(i)) {
+            switch_to(i);
+            save_doc();
+        }
+    }
+    switch_to(keep);
+}
+
+// Closes tab i, asking first if it has unsaved changes. false if cancelled.
+fn close_tab(i: int): bool {
+    if (i < 0 || i >= len(bufs)) { return false; }
+    if (buf_dirty(i)) {
+        switch_to(i);
+        let r: int = nx_ask_save(bufs[i].name);
+        if (r == 0) { return false; }
+        if (r == 1 && !save_doc()) { return false; }
+    }
+    doc_store();
+    let was = active;
+    bufs.remove(i);
+    let next = was;
+    if (i < was) { next = was - 1; }
+    if (i == was) { next = imin(i, len(bufs) - 1); }
+    active = -1;
+    doc_load(next);
+    remember_files();
+    after_switch();
+    return true;
+}
+
+fn close_all(): bool {
+    while (len(bufs) > 0) {
+        if (!close_tab(len(bufs) - 1)) { return false; }
+    }
+    return true;
+}
+
+fn close_others(keep: int) {
+    let target: string = bufs[keep].name;
+    let i = len(bufs) - 1;
+    while (i >= 0) {
+        if (bufs[i].name != target) {
+            if (!close_tab(i)) { return; }
+        }
+        i--;
+    }
+}
+
+// Reloads files changed on disk, unless they have unsaved edits.
+fn check_disk_changes() {
+    doc_store();
+    for (i, len(bufs)) {
+        let p: string = bufs[i].path;
+        if (bufs[i].kind != 0 || len(p) == 0 || buf_dirty(i)) { continue; }
+        let m: long = nx_mtime(p);
+        if (m == 0 || m == bufs[i].mtime) { continue; }
+        let text: string = file.read(p);
+        if (text.starts_with("\xEF\xBB\xBF")) { text = text.substring(3, -1); }
+        bufs[i].lines = split_lines(text);
+        bufs[i].mtime = m;
+        bufs[i].hl_valid = 0;
+        bufs[i].undo = [];
+        bufs[i].redo = [];
+        let nl: int = len(bufs[i].lines);
+        bufs[i].cy = imin(bufs[i].cy, nl - 1);
+        bufs[i].ay = bufs[i].cy;
+        bufs[i].cx = 0;
+        bufs[i].ax = 0;
+    }
+    let keep = active;
+    active = -1;
+    doc_load(keep);
+    frame_dirty = true;
+}
+
+// ---- positions and selection -------------------------------------------------------------------
+
+fn has_sel(): bool {
+    return ay != cy || ax != cx;
+}
+
+// Selection bounds, start before end, in sel_y1/sel_x1 .. sel_y2/sel_x2.
+fn sel_bounds() {
+    if (ay < cy || (ay == cy && ax <= cx)) {
+        sel_y1 = ay;
+        sel_x1 = ax;
+        sel_y2 = cy;
+        sel_x2 = cx;
+    } else {
+        sel_y1 = cy;
+        sel_x1 = cx;
+        sel_y2 = ay;
+        sel_x2 = ax;
+    }
+}
+
+fn get_text(y1: int, x1: int, y2: int, x2: int): string {
+    if (y1 == y2) { return L[y1].substring(x1, x2 - x1); }
+    let out = L[y1].substring(x1, -1);
+    let y = y1 + 1;
+    while (y < y2) {
+        out += "\n" + L[y];
+        y++;
+    }
+    out += "\n" + L[y2].substring(0, x2);
+    return out;
+}
+
+fn sel_text(): string {
+    if (!has_sel()) { return ""; }
+    sel_bounds();
+    return get_text(sel_y1, sel_x1, sel_y2, sel_x2);
+}
+
+fn clamp_cursor() {
+    cy = clamp(cy, 0, len(L) - 1);
+    cx = clamp(cx, 0, len(L[cy]));
+    ay = clamp(ay, 0, len(L) - 1);
+    ax = clamp(ax, 0, len(L[ay]));
+}
+
+fn set_cursor(y: int, x: int, extend: bool) {
+    cy = clamp(y, 0, len(L) - 1);
+    cx = clamp(x, 0, len(L[cy]));
+    if (!extend) {
+        ay = cy;
+        ax = cx;
+    }
+    blink_ms = now_ms;
+    frame_dirty = true;
+}
+
+// ---- undo ---------------------------------------------------------------------------------------------
+
+// Records the state before an edit. Typing of the same kind on the same line
+// within a second joins the previous step, the way editors group keystrokes.
+fn begin_edit(kind: string) {
+    let merge = kind == last_edit_kind && (kind == "type" || kind == "delete") && now_ms - last_edit_ms < 1000 && cy == last_edit_y && len(U) > 0;
+    if (!merge) {
+        let s = snap_now();
+        U.push(s);
+        // each step holds a copy of the file, so big files keep fewer steps
+        let cap = clamp(4000000 / imax(len(L), 1), 20, 300);
+        while (len(U) > cap) { U.remove(0); }
+    }
+    R.clear();
+    last_edit_kind = kind;
+    last_edit_ms = now_ms;
+}
+
+fn end_edit(from_line: int) {
+    doc_ver = ver_seq;
+    ver_seq++;
+    last_edit_y = cy;
+    if (from_line < hl_valid) { hl_valid = imax(from_line, 0); }
+    blink_ms = now_ms;
+    frame_dirty = true;
+    check_due = now_ms + 700;
+    if (active >= 0) { bufs[active].preview = false; }
+}
+
+fn undo() {
+    if (len(U) == 0) { return; }
+    let s: Snap = U.pop();
+    let cur = snap_now();
+    R.push(cur);
+    restore_snap(s);
+}
+
+fn redo() {
+    if (len(R) == 0) { return; }
+    let s: Snap = R.pop();
+    let cur = snap_now();
+    U.push(cur);
+    restore_snap(s);
+}
+
+fn restore_snap(s: Snap) {
+    // the first line that differs is where highlighting has to restart
+    let n: int = imin(len(L), len(s.lines));
+    let first = 0;
+    while (first < n && L[first] == s.lines[first]) { first++; }
+    L = s.lines;
+    cy = s.cy;
+    cx = s.cx;
+    ay = s.ay;
+    ax = s.ax;
+    doc_ver = s.ver;
+    clamp_cursor();
+    if (first < hl_valid) { hl_valid = first; }
+    last_edit_kind = "";
+    comp_open = false;
+    frame_dirty = true;
+    check_due = now_ms + 700;
+    reveal(false);
+}
+
+// ---- primitives (no undo of their own; callers wrap them in begin/end_edit) ---------
+
+fn delete_range(y1: int, x1: int, y2: int, x2: int) {
+    if (y1 == y2) {
+        let s: string = L[y1];
+        L[y1] = s.substring(0, x1) + s.substring(x2, -1);
+    } else {
+        let head: string = L[y1].substring(0, x1);
+        let tail: string = L[y2].substring(x2, -1);
+        L[y1] = head + tail;
+        let k = y2;
+        while (k > y1) {
+            L.remove(k);
+            k--;
+        }
+    }
+    cy = y1;
+    cx = x1;
+    ay = cy;
+    ax = cx;
+}
+
+fn delete_sel() {
+    if (!has_sel()) { return; }
+    sel_bounds();
+    delete_range(sel_y1, sel_x1, sel_y2, sel_x2);
+}
+
+// Inserts text (which may hold newlines) at the cursor, replacing the selection.
+fn insert_text(t: string) {
+    delete_sel();
+    let parts = t.split("\n");
+    let s: string = L[cy];
+    let head = s.substring(0, cx);
+    let tail = s.substring(cx, -1);
+    if (len(parts) == 1) {
+        L[cy] = head + t + tail;
+        cx += len(t);
+    } else {
+        L[cy] = head + parts[0];
+        let k = 1;
+        while (k < len(parts)) {
+            let p = parts[k];
+            if (k == len(parts) - 1) {
+                L.insert(cy + k, p + tail);
+            } else {
+                L.insert(cy + k, p);
+            }
+            k++;
+        }
+        cy += len(parts) - 1;
+        cx = len(parts[len(parts) - 1]);
+    }
+    ay = cy;
+    ax = cx;
+}
+
+fn edit_insert(t: string, kind: string) {
+    sel_bounds();
+    let from = has_sel() ? sel_y1 : cy;
+    begin_edit(kind);
+    insert_text(t);
+    end_edit(from);
+    reveal(false);
+}
+
+fn replace_line(y: int, s: string) {
+    L[y] = s;
+}
+
+fn snap_now(): Snap {
+    let s: Snap;
+    s.lines = L;
+    s.cy = cy;
+    s.cx = cx;
+    s.ay = ay;
+    s.ax = ax;
+    s.ver = doc_ver;
+    return s;
+}

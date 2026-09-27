@@ -1,0 +1,461 @@
+// Every global the IDE shares, in one place: NexaC emits globals in file order,
+// so they have to be declared before the functions that use them.
+
+let const VERSION: string = "2.0.0";
+
+// ---- colours (VS Code Dark Modern) ------------------------------------------------
+
+let const C_EDITOR = 0x1F1F1F;
+let const C_CHROME = 0x181818;
+let const C_BORDER = 0x2B2B2B;
+let const C_ACCENT = 0x0078D4;
+let const C_TEXT = 0xCCCCCC;
+let const C_BRIGHT = 0xFFFFFF;
+let const C_MUTED = 0x9D9D9D;
+let const C_DIM = 0x6E7681;
+let const C_HOVER = 0x2A2D2E;
+let const C_ACTIVE = 0x37373D;
+let const C_INPUT = 0x313131;
+let const C_INPUT_BORDER = 0x3C3C3C;
+let const C_WIDGET = 0x202020;
+let const C_SELECTION = 0x264F78;
+let const C_SEL_INACTIVE = 0x3A3D41;
+let const C_LINE = 0x282828;
+let const C_ERROR = 0xF14C4C;
+let const C_WARNING = 0xCCA700;
+let const C_OK = 0x89D185;
+let const C_FIND = 0x623315;
+let const C_FIND_CUR = 0x9E6A03;
+
+// syntax
+let const S_TEXT = 0xCCCCCC;
+let const S_PLAIN = 0xD4D4D4;
+let const S_KEYWORD = 0x569CD6;
+let const S_CONTROL = 0xC586C0;
+let const S_TYPE = 0x4EC9B0;
+let const S_FUNC = 0xDCDCAA;
+let const S_VAR = 0x9CDCFE;
+let const S_PROP = 0x9CDCFE;
+let const S_ENUM = 0x4FC1FF;
+let const S_STRING = 0xCE9178;
+let const S_ESCAPE = 0xD7BA7D;
+let const S_NUMBER = 0xB5CEA8;
+let const S_COMMENT = 0x6A9955;
+let const S_INVALID = 0xF44747;
+let const S_TODO = 0xFFD700;
+let const S_HEADING = 0x569CD6;
+let const S_LINK = 0x3794FF;
+let const S_BR1 = 0xFFD700;
+let const S_BR2 = 0xDA70D6;
+let const S_BR3 = 0x179FFF;
+
+// ---- keys (Win32 virtual keys) ------------------------------------------------------
+
+let const K_BACK = 8;
+let const K_TAB = 9;
+let const K_ENTER = 13;
+let const K_ESC = 27;
+let const K_SPACE = 32;
+let const K_PGUP = 33;
+let const K_PGDN = 34;
+let const K_END = 35;
+let const K_HOME = 36;
+let const K_LEFT = 37;
+let const K_UP = 38;
+let const K_RIGHT = 39;
+let const K_DOWN = 40;
+let const K_DELETE = 46;
+let const K_F1 = 112;
+let const K_F2 = 113;
+let const K_F3 = 114;
+let const K_F5 = 116;
+let const K_F12 = 123;
+let const K_PLUS = 187;
+let const K_COMMA = 188;
+let const K_MINUS = 189;
+let const K_SLASH = 191;
+let const K_BACKTICK = 192;
+let const K_LBRACKET = 219;
+let const K_BACKSLASH = 220;
+let const K_RBRACKET = 221;
+
+let const M_CTRL = 1;
+let const M_SHIFT = 2;
+let const M_ALT = 4;
+
+// ---- languages ----------------------------------------------------------------------
+
+let const L_PLAIN = 0;
+let const L_NEXA = 1;
+let const L_CPP = 2;
+let const L_JSON = 3;
+let const L_MD = 4;
+let const L_INI = 5;
+let const L_SHELL = 6;
+
+// ---- metrics (scaled by the monitor's DPI at startup) --------------------------------
+
+let SCALE: float = 1.0;
+let UI = 13;          // interface text size
+let UI_SMALL = 11;
+let FS = 14;          // code text size
+let CW = 8;           // code cell width
+let LH = 19;          // code line height
+let TOOLBAR_H = 35;
+let ACT_W = 48;
+let TABS_H = 35;
+let CRUMB_H = 22;
+let STATUS_H = 22;
+let ROW_H = 22;
+let HEADER_H = 35;
+let SCROLL_W = 14;
+
+// glyph cells for ASCII: the string to draw and its offset inside the cell
+let glyph_s: []string;
+let glyph_off: int[128];
+let glyph_w: int[128];
+
+// ---- window and frame ------------------------------------------------------------------
+
+let win_w = 1280;
+let win_h = 800;
+let now_ms = 0;
+let frame_dirty = true;
+let blink_ms = 0;
+let quit = false;
+
+// this frame's input, in the order it happened
+let ev_t: []int;
+let ev_a: []int;
+let ev_x: []int;
+let ev_y: []int;
+let ev_m: []int;
+let ev_c: []int;
+let mx = 0;
+let my = 0;
+let mouse_l = false;
+let hover_cursor = 0;
+
+// ---- layout (recomputed every frame) -----------------------------------------------------
+
+let show_sidebar = true;
+let show_panel = true;
+let sidebar_w = 260;
+let panel_h = 240;
+let view = 0;            // sidebar view: 0 explorer, 1 search
+let drag = 0;            // 0 none, 1 sidebar splitter, 2 panel splitter, 3 editor text, 4 scrollbar, 5 panel scrollbar, 6 minimap
+let drag_off = 0;
+
+let side_x = 0;
+let side_y = 0;
+let side_h = 0;
+let ed_x = 0;
+let ed_y = 0;
+let ed_w = 0;
+let ed_h = 0;
+let text_x = 0;          // left edge of the code, after the gutter
+let text_w = 0;
+let gutter_w = 0;
+let panel_y = 0;
+let main_x = 0;
+let main_w = 0;
+
+// ---- focus -------------------------------------------------------------------------------
+
+let const F_EDITOR = 0;
+let const F_FIND = 1;
+let const F_REPLACE = 2;
+let const F_QUICK = 3;
+let const F_TERM = 4;
+let const F_SEARCH = 5;
+let const F_RENAME = 6;
+let const F_TREE = 7;
+let const F_NONE = 8;
+let focus = 0;
+
+// one-line text fields, by id
+let const FLD_FIND = 0;
+let const FLD_REPLACE = 1;
+let const FLD_QUICK = 2;
+let const FLD_TERM = 3;
+let const FLD_SEARCH = 4;
+let const FLD_RENAME = 5;
+let fld_text: []string;
+let fld_caret: []int;
+let fld_anchor: []int;
+let fld_scroll: []int;
+
+// ---- documents ---------------------------------------------------------------------------
+
+struct Snap {
+    lines: []string;
+    cy: int;
+    cx: int;
+    ay: int;
+    ax: int;
+    ver: int;
+}
+
+struct Buf {
+    path: string;
+    name: string;
+    kind: int;          // 0 file, 1 settings, 2 welcome
+    lines: []string;
+    lang: int;
+    cy: int;
+    cx: int;
+    ay: int;
+    ax: int;
+    want: int;
+    sy: int;
+    sx: int;
+    ver: int;
+    saved: int;
+    crlf: bool;
+    undo: []Snap;
+    redo: []Snap;
+    hl_st: []int;
+    hl_dl: []string;
+    hl_valid: int;
+    mtime: long;
+    preview: bool;
+}
+
+let bufs: []Buf;
+let active = -1;
+let ver_seq = 1;
+
+// the active document, unpacked (doc_load / doc_store move it in and out of bufs)
+let L: []string;
+let cy = 0;
+let cx = 0;
+let ay = 0;
+let ax = 0;
+let want = -1;
+let sy = 0;
+let sx = 0;
+let doc_ver = 0;
+let doc_saved = 0;
+let doc_lang = 0;
+let doc_path = "";
+let doc_crlf = false;
+let U: []Snap;
+let R: []Snap;
+let hl_st: []int;
+let hl_dl: []string;
+let hl_valid = 0;
+
+// selection bounds from sel_bounds(), start before end
+let sel_y1 = 0;
+let sel_x1 = 0;
+let sel_y2 = 0;
+let sel_x2 = 0;
+
+// undo grouping
+let last_edit_kind = "";
+let last_edit_ms = 0;
+let last_edit_y = -1;
+
+// tab strip
+let tab_scroll = 0;
+let tab_drag = -1;
+
+// completion popup
+let comp_open = false;
+let comp_items: []string;
+let comp_kinds: []int;
+let comp_sel = 0;
+let comp_prefix = "";
+let comp_top = 0;
+
+// find
+let find_open = false;
+let find_replace = false;
+let find_case = false;
+let find_word = false;
+let find_hits_y: []int;
+let find_hits_x: []int;
+let find_hits_ver = -1;
+let find_hits_key = "";
+let find_cur = -1;
+
+// go to line / quick open
+let quick_open = false;
+let quick_sel = 0;
+let quick_top = 0;
+let quick_items: []string;
+let quick_detail: []string;
+let quick_kind: []int;
+let quick_key: []string;
+let quick_last = "~";
+
+// menus
+let menu_open = -1;
+let menu_x = 0;
+let menu_y = 0;
+let menu_ids: []string;
+let menu_hover = -1;
+let ctx_open = false;
+let ctx_path = "";
+let ctx_isdir = false;
+
+// ---- workspace -----------------------------------------------------------------------------
+
+let folder = "";
+let dir_cache: map[string][]string;
+let expanded: map[string]bool;
+let tree_rows: []string;
+let tree_depth: []int;
+let tree_dir: []bool;
+let tree_scroll = 0;
+let tree_sel = "";
+let tree_collapsed = false;
+let open_editors_collapsed = true;
+let rename_path = "";
+let rename_mode = 0;     // 1 new file, 2 new folder, 3 rename
+let rename_parent = "";
+let files_index: []string;
+let files_index_ms = 0;
+let git_branch = "";
+
+let search_files: []string;
+let search_lines: []int;
+let search_cols: []int;
+let search_text: []string;
+let search_scroll = 0;
+let search_summary = "";
+let search_case = false;
+
+let recent: []string;
+
+// ---- panel ----------------------------------------------------------------------------------
+
+let panel_tab = 1;       // 0 problems, 1 output, 2 terminal
+let out_lines: []string;
+let out_partial = "";
+let out_scroll = 0;
+let out_follow = true;
+let task_proc = -1;
+let task_label = "";
+let task_start_ms = 0;
+let task_exit = -2;
+let term_lines: []string;
+let term_partial = "";
+let term_proc = -1;
+let term_scroll = 0;
+let term_follow = true;
+let term_history: []string;
+let term_hist_i = 0;
+let prob_file: []string;
+let prob_line: []int;
+let prob_msg: []string;
+let prob_err: []bool;
+let prob_scroll = 0;
+let check_proc = -1;
+let check_file = "";
+let check_out = "";
+let check_due = 0;
+
+// ---- settings -----------------------------------------------------------------------------------
+
+let settings_path = "";
+let nexac = "";
+let run_args = "";
+let auto_save = false;
+let show_minimap = true;
+let show_ws = false;
+let font_size = 14;
+let win_max = false;
+let last_files: []string;
+let settings_extra = "";
+let nexac_version = "";
+
+// ---- word tables -----------------------------------------------------------------------------------
+
+let nx_words: map[string]int;
+let cpp_words: map[string]int;
+let sh_words: map[string]int;
+let nx_members: map[string][]string;
+let nx_methods: []string;
+let hl_out_state = 0;
+let hl_out_delim = "";
+
+// ---- the rest, by the file that uses them --------------------------------------------------------
+
+let cmd_ids: []string;
+let cmd_labels: []string;
+let cmd_keys: []string;
+let quit_requested = false;
+let tab_ctx = -1;
+let const HM_NORMAL = 0;
+let const HM_BLOCK = 1;
+let const HM_RAW = 2;
+let const HM_FENCE = 3;
+let const STD_MODULES = " io os file dll random math crypto network json gfx gfx3d time thread inline ui ";
+let hit_y = 0;
+let hit_x = 0;
+let word_a = 0;
+let word_b = 0;
+let blk_a = 0;
+let blk_b = 0;
+let br_y = -1;
+let br_x = -1;
+let br_my = -1;
+let br_mx = -1;
+let line_clip = "";
+let drag_line_mode = false;
+let drag_word = false;
+let drag_anchor_y = 0;
+let drag_anchor_a = 0;
+let drag_anchor_b = 0;
+let sym_names: []string;
+let sym_lines: []int;
+let sym_kinds: []int;
+let comp_box_x = 0;
+let comp_box_y = 0;
+let comp_box_w = 0;
+let comp_box_h = 0;
+let fw_x = 0;
+let fw_y = 0;
+let fw_w = 0;
+let fw_h = 0;
+let doc_diag_lines: []int;
+let doc_diag_err: []bool;
+let doc_diag_msg: []string;
+let search_top = 0;
+let qk_x = 0;
+let qk_y = 0;
+let qk_w = 0;
+let qk_h = 0;
+let qk_row = 0;
+let qk_list_y = 0;
+let const MENU_NAMES = "File Edit Selection View Go Run Terminal Help";
+let menu_x_draw = 0;
+let menu_y_draw = 0;
+let flash_msg = "";
+let flash_until = 0;
+let prob_src: []string;
+let panel_body_y = 0;
+let panel_body_h = 0;
+let tip_text = "";
+let cmd_center_x = 0;
+let cmd_center_w = 0;
+let tab_xs: []int;
+let tab_ws: []int;
+let tab_follow = true;
+let status_items_x: []int;
+let status_items_w: []int;
+let status_items_id: []string;
+let set_compiler = "";
+let set_args = "";
+let set_loaded = false;
+let down_x = -1000;
+let down_y = -1000;
+let up_this_frame = false;
+let up_x = 0;
+let up_y = 0;
+let last_title = "";
+let chord_k = false;
+let HC: []int;
+let test_mode = false;
+let page_scroll = 0;

@@ -1,4 +1,5 @@
 // Nexium Setup -- a graphical installer and uninstaller for Nexium, written in Nexa.
+// The interface is drawn with std/ui (NexaC 0.1.15 or newer).
 //
 // This file builds the setup *stub*. installer/pack.nxa appends the payload
 // (Nexium.exe, nexium.ico, README.md, LICENSE) and a manifest to the stub, so
@@ -19,17 +20,27 @@
 #include <std/io>
 #include <std/os>
 #include <std/file>
-#include <std/gfx>
-#include <std/time>
+#include <std/ui>
 
-let VERSION = "1.1.0";
+let VERSION = "2.0.0";
 let NEXA_URL = "https://github.com/Bobism-2009/Nexa-Lang/releases";
 
-let W = 840;
-let H = 540;
+let W = 860;
+let H = 560;
 let SIDEBAR = 240;
-let CX = 272;           // left edge of the page content
-let FOOT = 472;         // top of the button bar
+let CX = 280;           // left edge of the page content
+let CW = 540;           // width of the page content
+let FOOT = 492;         // top of the button bar
+
+// std/ui "dark" theme colours, for the parts drawn directly with gfx.
+let C_SIDEBAR = 0x16171A;
+let C_LINE = 0x2C2E33;
+let C_TEXT = 0xE8E9EC;
+let C_MUTED = 0x9CA1AA;
+let C_ACCENT = 0x0078D4;
+let C_OK = 0x3FB950;
+let C_WARN = 0xD29922;
+let C_ERROR = 0xF0524F;
 
 // Pages
 let P_WELCOME = 0;
@@ -78,16 +89,10 @@ let pk_offs: []int;
 let pk_sizes: []int;
 let logo = 0;
 
-// Input for the current frame.
-let mx = 0;
-let my = 0;
-let mouse_prev = false;
-let press_x = -1;
-let press_y = -1;
-let released = false;
+// Keyboard shortcuts for the current frame (widgets read their own input).
 let key_enter = false;
 let key_escape = false;
-let field_focus = false;
+let scope_i = 0;            // 0 = just me, 1 = all users (ui.radio works on ints)
 
 // ---------------------------------------------------------------------------
 // PowerShell helper: registry, shortcuts, PATH, elevation and the folder
@@ -390,26 +395,15 @@ fn load_logo() {
 }
 
 // ---------------------------------------------------------------------------
-// Drawing helpers
+// Drawing helpers. Text and widgets come from std/ui; the sidebar, step
+// markers and ticks are plain gfx shapes in the theme's colours.
 // ---------------------------------------------------------------------------
 fn fill(x: int, y: int, w: int, h: int, c: int) {
     gfx.fill(x, y, w, h, (c >> 16) & 255, (c >> 8) & 255, c & 255);
 }
 
-fn fill_round(x: int, y: int, w: int, h: int, r: int, c: int) {
-    gfx.fill_round_rect(x, y, w, h, r, (c >> 16) & 255, (c >> 8) & 255, c & 255);
-}
-
-fn outline_round(x: int, y: int, w: int, h: int, r: int, c: int) {
-    gfx.round_rect(x, y, w, h, r, (c >> 16) & 255, (c >> 8) & 255, c & 255);
-}
-
 fn line(x1: int, y1: int, x2: int, y2: int, c: int, t: int) {
     gfx.line(x1, y1, x2, y2, (c >> 16) & 255, (c >> 8) & 255, c & 255, t);
-}
-
-fn text(x: int, y: int, s: string, c: int, scale: int) {
-    gfx.text(x, y, s, (c >> 16) & 255, (c >> 8) & 255, c & 255, scale);
 }
 
 fn dot(cx: int, cy: int, r: int, c: int) {
@@ -425,147 +419,73 @@ fn check_mark(x: int, y: int, c: int) {
     line(x + 4, y + 9, x + 11, y, c, 2);
 }
 
-fn cross_mark(x: int, y: int, c: int) {
-    line(x, y, x + 9, y + 9, c, 2);
-    line(x, y + 9, x + 9, y, c, 2);
+fn warn_mark(x: int, y: int) {
+    dot(x + 6, y + 6, 6, C_WARN);
+    fill(x + 5, y + 2, 2, 6, C_SIDEBAR);
+    fill(x + 5, y + 9, 2, 2, C_SIDEBAR);
+}
+
+fn textc(x: int, y: int, s: string, size: int, c: int): int {
+    return ui.text(x, y, s, size, (c >> 16) & 255, (c >> 8) & 255, c & 255);
 }
 
 // Text that no longer fits keeps its end, which is the informative part of a path.
-fn fit(s: string, max_chars: int): string {
-    if (len(s) <= max_chars) return s;
-    return "..." + s.substring(len(s) - (max_chars - 3), max_chars - 3);
+fn fit(s: string, max_w: int, size: int): string {
+    if (ui.text_width(s, size) <= max_w) return s;
+    let t = s;
+    while (len(t) > 1 && ui.text_width("..." + t, size) > max_w) {
+        t = t.substring(1, len(t) - 1);
+    }
+    return "..." + t;
 }
 
-// Word-wrapped paragraph at scale 2; returns the height it took.
-fn para(x: int, y: int, s: string, max_chars: int, c: int): int {
+// Word-wrapped paragraph; returns the height it took.
+fn para(x: int, y: int, s: string, max_w: int, size: int, c: int): int {
+    let lh = ui.text_height(size) + 5;
     let lines = 0;
     let cur = "";
     for (w in s.split(" ")) {
         if (cur == "") {
             cur = w;
-        } else if (len(cur) + 1 + len(w) <= max_chars) {
+        } else if (ui.text_width(cur + " " + w, size) <= max_w) {
             cur += " " + w;
         } else {
-            text(x, y + lines * 22, cur, c, 2);
+            textc(x, y + lines * lh, cur, size, c);
             lines++;
             cur = w;
         }
     }
     if (cur != "") {
-        text(x, y + lines * 22, cur, c, 2);
+        textc(x, y + lines * lh, cur, size, c);
         lines++;
     }
-    return lines * 22;
+    return lines * lh;
 }
 
-// ---------------------------------------------------------------------------
-// Widgets (immediate mode)
-// ---------------------------------------------------------------------------
-fn inside(x: int, y: int, w: int, h: int): bool {
-    return mx >= x && mx < x + w && my >= y && my < y + h;
-}
-
-fn clicked(x: int, y: int, w: int, h: int): bool {
-    return released && inside(x, y, w, h) && press_x >= x && press_x < x + w && press_y >= y && press_y < y + h;
-}
-
-fn button(x: int, y: int, w: int, h: int, label: string, primary: bool, enabled: bool): bool {
-    let hov = enabled && inside(x, y, w, h);
-    let bg = 0x2D2D2D;
-    let fg = 0xE0E0E0;
-    if (primary) {
-        bg = 0x0E639C;
-        if (hov) bg = 0x1177BB;
-        fg = 0xFFFFFF;
-    } else if (hov) {
-        bg = 0x3C3C3C;
-    }
-    if (!enabled) {
-        bg = 0x252525;
-        fg = 0x6A6A6A;
-    }
-    fill_round(x, y, w, h, 5, bg);
-    if (!primary) outline_round(x, y, w, h, 5, 0x454545);
-    let tw = gfx.text_width(label, 2);
-    text(x + (w - tw) / 2, y + (h - 14) / 2, label, fg, 2);
-    return enabled && clicked(x, y, w, h);
-}
-
-fn checkbox(x: int, y: int, label: string, v: bool): bool {
-    let tw = gfx.text_width(label, 2);
-    let hov = inside(x, y - 2, 30 + tw, 24);
-    if (v) {
-        fill_round(x, y, 20, 20, 4, 0x0E639C);
-        check_mark(x + 4, y + 5, 0xFFFFFF);
-    } else {
-        fill_round(x, y, 20, 20, 4, 0x252526);
-        outline_round(x, y, 20, 20, 4, hov ? 0x0E8CE8 : 0x5A5A5A);
-    }
-    text(x + 32, y + 3, label, hov ? 0xFFFFFF : 0xD4D4D4, 2);
-    if (clicked(x, y - 2, 30 + tw, 24)) return !v;
-    return v;
-}
-
-fn radio(x: int, y: int, label: string, detail: string, selected: bool): bool {
-    let tw = gfx.text_width(label, 2);
-    let hov = inside(x, y - 2, 30 + tw + 12 + gfx.text_width(detail, 2), 24);
-    ring(x + 10, y + 10, 10, (selected || hov) ? 0x0E8CE8 : 0x5A5A5A);
-    if (selected) dot(x + 10, y + 10, 5, 0x0E8CE8);
-    text(x + 32, y + 3, label, hov ? 0xFFFFFF : 0xD4D4D4, 2);
-    text(x + 32 + tw + 12, y + 3, detail, 0x7A7A7A, 2);
-    return clicked(x, y - 2, 30 + tw + 12 + gfx.text_width(detail, 2), 24);
-}
-
-// Single-line editor for the install folder.
-fn dir_field(x: int, y: int, w: int, h: int) {
-    if (released) field_focus = clicked(x, y, w, h);
-    if (field_focus) {
-        let typed = gfx.typed();
-        if (typed != "") {
-            install_dir += typed;
-            dir_edited = true;
-        }
-        if (gfx.pressed("backspace") == 1 && len(install_dir) > 0) {
-            install_dir = install_dir.substring(0, len(install_dir) - 1);
-            dir_edited = true;
-        }
-    }
-    fill_round(x, y, w, h, 4, 0x252526);
-    outline_round(x, y, w, h, 4, field_focus ? 0x0E8CE8 : 0x454545);
-    let shown = fit(install_dir, (w - 24) / 12);
-    text(x + 10, y + (h - 14) / 2, shown, 0xE0E0E0, 2);
-    if (field_focus && ((int)(time.now_ms() / 500.0)) % 2 == 0) {
-        let cx = x + 10 + gfx.text_width(shown, 2) + 1;
-        fill(cx, y + 8, 2, h - 16, 0xE0E0E0);
-    }
-}
-
-fn progress_bar(x: int, y: int, w: int, done: int, total: int) {
-    fill_round(x, y, w, 12, 6, 0x2A2A2A);
-    if (total > 0 && done > 0) {
-        let fw = w * done / total;
-        if (fw < 12) fw = 12;
-        fill_round(x, y, fw, 12, 6, 0x0E8CE8);
-    }
+// Buttons sit right-aligned in the footer; index 0 is the rightmost.
+fn footer_button(index: int, label: string, style: string): bool {
+    let bw = 116;
+    let x = W - 28 - bw - index * (bw + 10);
+    return ui.button(x, FOOT + 18, bw, 36, label, style);
 }
 
 // ---------------------------------------------------------------------------
 // Chrome
 // ---------------------------------------------------------------------------
 fn draw_sidebar() {
-    fill(0, 0, SIDEBAR, H, 0x181818);
-    fill(SIDEBAR - 1, 0, 1, H, 0x2B2B2B);
-    let lx = SIDEBAR / 2 - 48;
+    fill(0, 0, SIDEBAR, H, C_SIDEBAR);
+    fill(SIDEBAR - 1, 0, 1, H, C_LINE);
+    let lx = SIDEBAR / 2 - 44;
     if (logo != 0) {
-        gfx.blit(lx, 34, logo, 96, 96);
+        gfx.blit(lx, 40, logo, 88, 88);
     } else {
-        fill_round(lx, 34, 96, 96, 18, 0x0E639C);
-        text(lx + 30, 58, "N", 0xFFFFFF, 7);
+        fill(lx, 40, 88, 88, C_ACCENT);
+        ui.heading(lx + 30, 62, "N", 40);
     }
     let title = "Nexium";
-    text((SIDEBAR - gfx.text_width(title, 3)) / 2, 146, title, 0xF0F0F0, 3);
+    ui.heading((SIDEBAR - ui.text_width(title, 26)) / 2, 142, title, 26);
     let sub = (uninstall_mode ? "Uninstall " : "Setup ") + VERSION;
-    text((SIDEBAR - gfx.text_width(sub, 2)) / 2, 178, sub, 0x8A8A8A, 2);
+    ui.caption((SIDEBAR - ui.text_width(sub, 13)) / 2, 178, sub);
 
     let labels = ["Welcome", "Options", "Install", "Finish"];
     let current = page;
@@ -577,45 +497,55 @@ fn draw_sidebar() {
         else current = 2;
     }
     for (i, len(labels)) {
-        let y = 244 + i * 44;
-        let cx = 44;
-        let cy = y + 8;
+        let cx = 48;
+        let cy = 250 + i * 48;
+        if (i + 1 < len(labels)) {
+            let rail = C_LINE;
+            if (i < current) rail = C_ACCENT;
+            fill(cx, cy + 13, 2, 22, rail);
+        }
+        let label_c = C_MUTED;
         if (i < current) {
-            dot(cx, cy, 11, 0x0E639C);
+            dot(cx, cy, 12, C_ACCENT);
             check_mark(cx - 6, cy - 5, 0xFFFFFF);
         } else if (i == current) {
-            dot(cx, cy, 11, page == P_ERROR ? 0xB33A3A : 0x0E8CE8);
-            text(cx - 5, cy - 7, (string)(i + 1), 0xFFFFFF, 2);
+            let fillc = C_ACCENT;
+            if (page == P_ERROR) fillc = C_ERROR;
+            dot(cx, cy, 12, fillc);
+            let n = (string)(i + 1);
+            textc(cx - ui.text_width(n, 13) / 2, cy - 8, n, 13, 0xFFFFFF);
+            label_c = C_TEXT;
         } else {
-            ring(cx, cy, 11, 0x4A4A4A);
-            text(cx - 5, cy - 7, (string)(i + 1), 0x6A6A6A, 2);
+            ring(cx, cy, 12, 0x4A4E57);
+            let n = (string)(i + 1);
+            textc(cx - ui.text_width(n, 13) / 2, cy - 8, n, 13, C_MUTED);
         }
-        if (i + 1 < len(labels)) fill(cx, cy + 14, 1, 18, i < current ? 0x0E639C : 0x333333);
-        text(cx + 24, cy - 7, labels[i], i == current ? 0xF0F0F0 : 0x8A8A8A, 2);
+        textc(cx + 26, cy - 10, labels[i], 15, label_c);
     }
+    ui.caption(24, H - 34, "github.com/Bobism-2009/Nexium");
 }
 
 fn draw_footer() {
-    fill(SIDEBAR, FOOT, W - SIDEBAR, H - FOOT, 0x181818);
-    fill(SIDEBAR, FOOT, W - SIDEBAR, 1, 0x2B2B2B);
+    fill(SIDEBAR, FOOT, W - SIDEBAR, H - FOOT, C_SIDEBAR);
+    fill(SIDEBAR, FOOT, W - SIDEBAR, 1, C_LINE);
 }
 
-fn page_title(s: string) {
-    text(CX, 40, s, 0xF0F0F0, 3);
+fn page_title(s: string, sub: string) {
+    ui.heading(CX, 34, s, 26);
+    if (sub != "") ui.caption(CX, 72, sub);
 }
 
 // Status of the Nexa compiler Nexium drives for Run / Build.
 fn draw_nexa_status(y: int) {
-    fill_round(CX, y, W - CX - 32, 64, 6, 0x1B1B1C);
-    outline_round(CX, y, W - CX - 32, 64, 6, 0x2E2E2E);
+    ui.panel(CX, y, CW, 76);
     if (nexa_path != "") {
-        dot(CX + 20, y + 20, 6, 0x4EC96B);
-        text(CX + 36, y + 13, "Nexa compiler found", 0xE0E0E0, 2);
-        text(CX + 36, y + 37, fit(nexa_path, 40), 0x8A8A8A, 2);
+        dot(CX + 24, y + 26, 5, C_OK);
+        textc(CX + 40, y + 16, "Nexa compiler found", 15, C_TEXT);
+        ui.caption(CX + 40, y + 42, fit(nexa_path, CW - 60, 13));
     } else {
-        dot(CX + 20, y + 20, 6, 0xE0A040);
-        text(CX + 36, y + 13, "Nexa is not installed", 0xE0E0E0, 2);
-        opt_nexa = checkbox(CX + 36, y + 36, "Install the Nexa compiler too", opt_nexa);
+        dot(CX + 24, y + 26, 5, C_WARN);
+        textc(CX + 40, y + 16, "The Nexa compiler is not installed", 15, C_TEXT);
+        opt_nexa = ui.checkbox(CX + 40, y + 44, "Install it too (downloads NexaC from GitHub)", opt_nexa);
     }
 }
 
@@ -691,12 +621,17 @@ fn run_step(s: string) {
                 fail("Could not write Nexium.exe to " + install_dir + ". If Nexium is running, close it and try again.");
                 break;
             }
-            // The runtime DLLs Nexium.exe links against go next to it.
+            // Any runtime DLLs in the payload go next to it.
             for (name in pk_names) {
                 if (name.lower().ends_with(".dll") && !write_file(name, payload(name))) {
                     fail("Could not write " + name + " to " + install_dir + ". If Nexium is running, close it and try again.");
                     break;
                 }
+            }
+            // Nexium 1.x shipped the MinGW runtime as DLLs; 2.x needs none, so
+            // an update clears out the ones it left behind.
+            for (old in ["libstdc++-6.dll", "libgcc_s_seh-1.dll", "libmcfgthread-2.dll", "libwinpthread-1.dll", "imgui.ini"]) {
+                if (!pk_names.contains(old) && file.exists(join(install_dir, old)) == 1) { file.remove(join(install_dir, old)); }
             }
             break;
         case "docs":
@@ -841,36 +776,45 @@ fn preflight(): bool {
 // Pages
 // ---------------------------------------------------------------------------
 fn page_welcome() {
-    page_title("Welcome to Nexium");
-    let y = 96;
-    y += para(CX, y, "This will install Nexium " + VERSION + ", a fast native IDE for the Nexa programming language.", 44, 0xC8C8C8);
-    y += 18;
-    let bullets = ["Nexa highlighting and live errors", "Terminal with one-key Run and Build", "Quick open, outline and search", "A built-in AI coding agent"];
+    page_title("Welcome to Nexium", "Setup will guide you through installing Nexium " + VERSION + ".");
+    let y = 108;
+    y += para(CX, y, "Nexium is a fast, native IDE for the Nexa programming language.", CW, 15, C_TEXT);
+    y += 14;
+    ui.panel(CX, y, CW, 150, "What you get");
+    let bullets = ["Nexa highlighting, completion and live errors",
+                   "A built-in terminal with one-key Run and Build",
+                   "Quick open, symbol outline and workspace search",
+                   "An AI coding agent that can edit and run your project"];
+    let by = y + 54;
     for (bl in bullets) {
-        dot(CX + 6, y + 7, 3, 0x0E8CE8);
-        text(CX + 20, y, bl, 0xD4D4D4, 2);
-        y += 28;
+        check_mark(CX + 20, by + 5, C_ACCENT);
+        textc(CX + 42, by, bl, 15, C_TEXT);
+        by += 22;
     }
-    draw_nexa_status(360);
+    draw_nexa_status(y + 166);
 
-    let next = button(W - 32 - 120 - 12 - 120, FOOT + 18, 120, 36, "Next", true, true);
-    let cancel = button(W - 32 - 120, FOOT + 18, 120, 36, "Cancel", false, true);
-    if (next || key_enter) page = P_OPTIONS;
-    if (cancel || key_escape) quit = true;
+    if (footer_button(0, "Cancel", "secondary") || key_escape) quit = true;
+    if (footer_button(1, "Next", "primary") || key_enter) page = P_OPTIONS;
 }
 
 fn page_options() {
-    page_title("Install options");
-    text(CX, 92, "Install for", 0x8A8A8A, 2);
-    let prev_scope = scope;
-    if (radio(CX, 118, "Just me", "no admin needed", scope == "User")) scope = "User";
-    if (radio(CX, 150, "All users", "needs admin", scope == "Machine")) scope = "Machine";
-    if (scope != prev_scope && !dir_edited) install_dir = default_dir();
+    page_title("Install options", "Choose who Nexium is for and where it goes.");
 
-    text(CX, 196, "Location", 0x8A8A8A, 2);
-    let fw = W - CX - 32 - 120 - 12;
-    dir_field(CX, 220, fw, 38);
-    if (button(W - 32 - 120, 221, 120, 36, "Browse", false, true)) {
+    ui.panel(CX, 100, CW, 142, "Install for");
+    let prev = scope_i;
+    scope_i = ui.radio(CX + 20, 152, "Just me", scope_i, 0);
+    ui.caption(CX + 140, 154, "No administrator rights needed");
+    scope_i = ui.radio(CX + 20, 182, "All users", scope_i, 1);
+    ui.caption(CX + 140, 184, "Asks for administrator permission");
+    if (scope_i != prev) {
+        scope = "User";
+        if (scope_i == 1) scope = "Machine";
+        if (!dir_edited) install_dir = default_dir();
+    }
+    let before = install_dir;
+    install_dir = ui.textbox(CX + 20, 206 - 2, CW - 40 - 110, install_dir, "Install folder");
+    if (install_dir != before) dir_edited = true;
+    if (ui.button(CX + CW - 20 - 100, 204, 100, ui.text_height() + 16, "Browse", "secondary")) {
         if (helper("browse") == 0) {
             let picked = clean_dir(file.read(helper_out));
             if (picked != "") {
@@ -880,29 +824,29 @@ fn page_options() {
             }
         }
     }
-    let y = 270;
+
+    ui.panel(CX, 258, CW, 170, "Additional tasks");
+    opt_startmenu = ui.checkbox(CX + 20, 310, "Add to the Start menu", opt_startmenu);
+    opt_desktop = ui.checkbox(CX + 20, 338, "Create a desktop shortcut", opt_desktop);
+    opt_assoc = ui.checkbox(CX + 20, 366, "Open .nxa files with Nexium", opt_assoc);
+    opt_path = ui.checkbox(CX + 20, 394, "Add Nexium to PATH", opt_path);
+
     if (notice != "") {
-        text(CX, y, fit(notice, 44), 0xF48771, 2);
+        textc(CX, 444, fit(notice, CW, 14), 14, C_ERROR);
     } else if (file.exists(join(install_dir, "Nexium.exe")) == 1) {
-        text(CX, y, "Nexium is installed here; it will be updated.", 0x6CB6FF, 2);
+        textc(CX, 444, "Nexium is already installed here and will be updated.", 14, 0x6CB6FF);
     }
 
-    opt_startmenu = checkbox(CX, 306, "Add to the Start menu", opt_startmenu);
-    opt_desktop = checkbox(CX, 338, "Create a desktop shortcut", opt_desktop);
-    opt_assoc = checkbox(CX, 370, "Open .nxa files with Nexium", opt_assoc);
-    opt_path = checkbox(CX, 402, "Add Nexium to PATH", opt_path);
-
-    let bx = W - 32 - 120;
-    let back = button(bx - 2 * 132, FOOT + 18, 120, 36, "Back", false, true);
-    let install = button(bx - 132, FOOT + 18, 120, 36, "Install", true, install_dir.trim() != "");
-    let cancel = button(bx, FOOT + 18, 120, 36, "Cancel", false, true);
-    if (back) {
+    if (footer_button(0, "Cancel", "secondary")) quit = true;
+    let install = footer_button(1, "Install", "primary");
+    if (footer_button(2, "Back", "ghost")) {
         notice = "";
         page = P_WELCOME;
     }
-    if (cancel || key_escape) quit = true;
-    if ((install || (key_enter && !field_focus)) && install_dir.trim() != "") {
-        if (preflight()) {
+    if (install) {
+        if (install_dir.trim() == "") {
+            notice = "Choose a folder to install into.";
+        } else if (preflight()) {
             plan_install();
             page = P_PROGRESS;
         }
@@ -910,51 +854,52 @@ fn page_options() {
 }
 
 fn page_progress() {
-    page_title(uninstall_mode ? "Removing Nexium" : "Installing Nexium");
+    let title = "Installing Nexium";
+    if (uninstall_mode) title = "Removing Nexium";
+    page_title(title, "This takes a few seconds.");
     let total = len(steps);
-    let label = step_i < total ? step_label(steps[step_i]) + "..." : "Done";
-    text(CX, 100, label, 0xD4D4D4, 2);
-    progress_bar(CX, 132, W - CX - 32, step_i, total);
+    let label = "Done";
+    if (step_i < total) label = step_label(steps[step_i]) + "...";
+    textc(CX, 108, label, 15, C_TEXT);
+    let frac = 0.0;
+    if (total > 0) frac = (float)step_i / (float)total;
+    ui.progress(CX, 138, CW, frac);
     for (i, step_i) {
-        let y = 172 + i * 26;
-        check_mark(CX + 2, y + 2, 0x4EC96B);
-        text(CX + 24, y, step_label(steps[i]), 0x8A8A8A, 2);
+        let y = 170 + i * 26;
+        check_mark(CX + 2, y + 4, C_OK);
+        textc(CX + 24, y, step_label(steps[i]), 14, C_MUTED);
     }
-    button(W - 32 - 120, FOOT + 18, 120, 36, "Cancel", false, false);
+    ui.caption(W - 28 - ui.text_width("Please wait", 13), FOOT + 28, "Please wait");
 }
 
 fn draw_warnings(y: int): int {
     for (w in warnings) {
-        cross_mark(CX + 2, y + 3, 0xE0A040);
-        y += para(CX + 22, y, w, 42, 0xE0A040);
+        warn_mark(CX, y + 3);
+        y += para(CX + 22, y, w, CW - 22, 14, C_WARN) + 4;
     }
     return y;
 }
 
 fn page_finish() {
-    let bx = W - 32 - 120;
     if (uninstall_mode) {
-        page_title("Nexium was removed");
+        page_title("Nexium was removed", "");
         let y = 96;
-        y += para(CX, y, "Nexium has been uninstalled from this computer.", 44, 0xC8C8C8);
-        y += 12;
-        draw_warnings(y);
-        if (button(bx, FOOT + 18, 120, 36, "Close", true, true) || key_enter || key_escape) quit = true;
+        y += para(CX, y, "Nexium has been uninstalled from this computer. Your Nexa projects were not touched.", CW, 15, C_TEXT);
+        draw_warnings(y + 14);
+        if (footer_button(0, "Close", "primary") || key_enter || key_escape) quit = true;
         return;
     }
-    page_title("Nexium is ready");
-    let y = 96;
-    y += para(CX, y, "Nexium " + VERSION + " was installed to:", 44, 0xC8C8C8);
-    text(CX, y + 4, fit(install_dir, 44), 0x6CB6FF, 2);
-    y += 40;
-    y = draw_warnings(y);
+    page_title("Nexium is ready", "Setup finished installing Nexium " + VERSION + ".");
+    ui.panel(CX, 100, CW, 86, "Installed to");
+    textc(CX + 20, 150, fit(install_dir, CW - 40, 15), 15, 0x6CB6FF);
+    let y = draw_warnings(204);
     if (nexa_path == "") {
-        y += 8;
-        y += para(CX, y, "Install the Nexa compiler to run and build programs from Nexium.", 44, 0xC8C8C8);
-        if (button(CX, y + 8, 140, 36, "Get Nexa", false, true)) os.open(NEXA_URL);
+        y += 6;
+        y += para(CX, y, "Install the Nexa compiler to run and build programs from Nexium.", CW - 130, 14, C_MUTED);
+        if (ui.button(CX + CW - 116, y - 30, 116, 32, "Get Nexa", "secondary")) os.open(NEXA_URL);
     }
-    opt_launch = checkbox(CX, FOOT - 44, "Launch Nexium now", opt_launch);
-    if (button(bx, FOOT + 18, 120, 36, "Finish", true, true) || key_enter) {
+    opt_launch = ui.checkbox(CX, FOOT - 42, "Launch Nexium now", opt_launch);
+    if (footer_button(0, "Finish", "primary") || key_enter) {
         // Through Explorer so Nexium does not inherit this process's elevation.
         if (opt_launch) os.spawn("explorer.exe", join(install_dir, "Nexium.exe"));
         quit = true;
@@ -962,36 +907,43 @@ fn page_finish() {
 }
 
 fn page_error() {
-    page_title(uninstall_mode ? "Uninstall stopped" : "Setup could not finish");
-    let y = 96;
-    y += para(CX, y, error_msg, 44, 0xE0E0E0);
-    draw_warnings(y + 12);
-    let bx = W - 32 - 120;
-    let back = button(bx - 132, FOOT + 18, 120, 36, uninstall_mode ? "Retry" : "Back", false, true);
-    let close = button(bx, FOOT + 18, 120, 36, "Close", true, true);
-    if (back) {
+    let title = "Setup could not finish";
+    if (uninstall_mode) title = "Uninstall stopped";
+    page_title(title, "");
+    ui.panel(CX, 90, CW, 120);
+    dot(CX + 26, 118, 7, C_ERROR);
+    fill(CX + 25, 113, 2, 6, 0xFFFFFF);
+    fill(CX + 25, 121, 2, 2, 0xFFFFFF);
+    para(CX + 46, 108, error_msg, CW - 66, 15, C_TEXT);
+    draw_warnings(226);
+    if (footer_button(0, "Close", "primary") || key_escape) quit = true;
+    let again = "Back";
+    if (uninstall_mode) again = "Retry";
+    if (footer_button(1, again, "secondary")) {
         exit_code = 0;
         if (uninstall_mode) page = P_WELCOME;
         else page = P_OPTIONS;
     }
-    if (close || key_escape) quit = true;
 }
 
 fn page_confirm_uninstall() {
-    page_title("Uninstall Nexium");
-    let y = 96;
-    y += para(CX, y, "This removes Nexium, its shortcuts, its .nxa file association and its PATH entry from:", 44, 0xC8C8C8);
-    text(CX, y + 4, fit(install_dir, 44), 0x6CB6FF, 2);
-    y += 44;
-    y += para(CX, y, "Your Nexa projects are not touched.", 44, 0x8A8A8A);
-    opt_remove_settings = checkbox(CX, y + 20, "Also remove my Nexium settings", opt_remove_settings);
-    if (notice != "") text(CX, y + 64, fit(notice, 44), 0xF48771, 2);
+    page_title("Uninstall Nexium", "Remove Nexium " + VERSION + " from this computer.");
+    ui.panel(CX, 100, CW, 150, "This removes");
+    let items = ["Nexium and its runtime files", "Start menu and desktop shortcuts",
+                 "The .nxa file association and PATH entry"];
+    let y = 152;
+    for (it in items) {
+        check_mark(CX + 20, y + 5, C_ACCENT);
+        textc(CX + 42, y, it, 15, C_TEXT);
+        y += 24;
+    }
+    ui.caption(CX, 262, "From: " + fit(install_dir, CW - 60, 13));
+    ui.caption(CX, 282, "Your Nexa projects are not touched.");
+    opt_remove_settings = ui.checkbox(CX, 316, "Also remove my Nexium settings", opt_remove_settings);
+    if (notice != "") textc(CX, 356, fit(notice, CW, 14), 14, C_ERROR);
 
-    let bx = W - 32 - 120;
-    let go = button(bx - 132, FOOT + 18, 120, 36, "Uninstall", true, true);
-    let cancel = button(bx, FOOT + 18, 120, 36, "Cancel", false, true);
-    if (cancel || key_escape) quit = true;
-    if (go || key_enter) {
+    if (footer_button(0, "Cancel", "secondary") || key_escape) quit = true;
+    if (footer_button(1, "Uninstall", "danger") || key_enter) {
         if (preflight()) {
             plan_uninstall();
             page = P_PROGRESS;
@@ -1012,7 +964,11 @@ fn parse_args(args: []string) {
         else if (a == "--elevated") elevated = true;
         else if (a == "--scope") {
             scope = "User";
-            if (v == "Machine") scope = "Machine";
+            scope_i = 0;
+            if (v == "Machine") {
+                scope = "Machine";
+                scope_i = 1;
+            }
             i++;
         }
         else if (a == "--dir") { install_dir = v.replace("|", " "); dir_edited = true; i++; }
@@ -1088,7 +1044,7 @@ fn main(args: []string) {
     }
 
     let window_title: string = uninstall_mode ? "Uninstall Nexium" : "Nexium Setup";
-    gfx.open(window_title, W, H, 1);
+    ui.open(window_title, W, H);
     gfx.maxfps(60);
     load_logo();
     if (logo != 0) gfx.icon(logo);
@@ -1101,19 +1057,14 @@ fn main(args: []string) {
             if (page == P_PROGRESS) run_all_steps();
             break;
         }
-        mx = gfx.mouse_x();
-        my = gfx.mouse_y();
-        let down = gfx.mouse("left") == 1;
-        if (down && !mouse_prev) {
-            press_x = mx;
-            press_y = my;
-        }
-        released = (!down && mouse_prev);
-        mouse_prev = down;
         key_enter = (gfx.pressed("enter") == 1);
         key_escape = (gfx.pressed("escape") == 1);
 
-        fill(0, 0, W, H, 0x1E1E1E);
+        ui.theme("dark");
+        ui.accent(0, 120, 212);
+        ui.rounding(6);
+        ui.font_size(15);
+        ui.background();
         draw_sidebar();
         draw_footer();
         if (page == P_WELCOME) {

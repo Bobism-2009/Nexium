@@ -1,0 +1,400 @@
+// UTF-8 helpers, visual columns, and the one-line text fields (find, quick
+// open, terminal input, ...), which all edit the same way.
+
+fn ubyte(s: string, i: int): int {
+    return (int)(unsigned char)s[i];
+}
+
+fn utf8(cp: int): string {
+    if (cp < 0x80) {
+        let s = " ";
+        s[0] = (char)cp;
+        return s;
+    }
+    if (cp < 0x800) {
+        let s = "  ";
+        s[0] = (char)(0xC0 | (cp >> 6));
+        s[1] = (char)(0x80 | (cp & 0x3F));
+        return s;
+    }
+    if (cp < 0x10000) {
+        let s = "   ";
+        s[0] = (char)(0xE0 | (cp >> 12));
+        s[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        s[2] = (char)(0x80 | (cp & 0x3F));
+        return s;
+    }
+    let s = "    ";
+    s[0] = (char)(0xF0 | (cp >> 18));
+    s[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    s[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    s[3] = (char)(0x80 | (cp & 0x3F));
+    return s;
+}
+
+// Bytes in the code point that starts at s[i].
+fn cp_len(s: string, i: int): int {
+    let b = ubyte(s, i);
+    if (b < 0x80) { return 1; }
+    if (b >= 0xF0) { return 4; }
+    if (b >= 0xE0) { return 3; }
+    if (b >= 0xC0) { return 2; }
+    return 1;
+}
+
+fn next_i(s: string, i: int): int {
+    if (i >= len(s)) { return len(s); }
+    let n = i + cp_len(s, i);
+    if (n > len(s)) { return len(s); }
+    return n;
+}
+
+fn prev_i(s: string, i: int): int {
+    if (i <= 0) { return 0; }
+    let j = i - 1;
+    while (j > 0 && (ubyte(s, j) & 0xC0) == 0x80) { j--; }
+    return j;
+}
+
+fn is_word_b(b: int): bool {
+    return (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b >= 0x80;
+}
+
+fn is_word_at(s: string, i: int): bool {
+    if (i < 0 || i >= len(s)) { return false; }
+    return is_word_b(ubyte(s, i));
+}
+
+fn is_space_b(b: int): bool {
+    return b == 32 || b == 9;
+}
+
+// Start of the word to the left of i (Ctrl+Left).
+fn word_left(s: string, i: int): int {
+    let j = i;
+    while (j > 0 && is_space_b(ubyte(s, j - 1))) { j--; }
+    if (j > 0 && is_word_b(ubyte(s, j - 1))) {
+        while (j > 0 && is_word_b(ubyte(s, j - 1))) { j--; }
+    } else {
+        while (j > 0 && !is_word_b(ubyte(s, j - 1)) && !is_space_b(ubyte(s, j - 1))) { j--; }
+    }
+    return j;
+}
+
+// End of the word to the right of i (Ctrl+Right).
+fn word_right(s: string, i: int): int {
+    let n = len(s);
+    let j = i;
+    while (j < n && is_space_b(ubyte(s, j))) { j++; }
+    if (j < n && is_word_b(ubyte(s, j))) {
+        while (j < n && is_word_b(ubyte(s, j))) { j++; }
+    } else {
+        while (j < n && !is_word_b(ubyte(s, j)) && !is_space_b(ubyte(s, j))) { j++; }
+    }
+    return j;
+}
+
+// Visual column of byte i: tabs stop every 4 columns, a code point is one column.
+fn vcol(s: string, i: int): int {
+    let v = 0;
+    let j = 0;
+    let n = imin(i, len(s));
+    while (j < n) {
+        if (s[j] == '\t') {
+            v = (v / 4 + 1) * 4;
+            j++;
+        } else {
+            v++;
+            j = next_i(s, j);
+        }
+    }
+    return v;
+}
+
+// Byte index nearest visual column v.
+fn at_vcol(s: string, v: int): int {
+    let c = 0;
+    let j = 0;
+    let n = len(s);
+    while (j < n) {
+        let nc = c + 1;
+        if (s[j] == '\t') { nc = (c / 4 + 1) * 4; }
+        if (nc > v) {
+            if (v - c > nc - v) { return next_i(s, j); }
+            return j;
+        }
+        c = nc;
+        j = next_i(s, j);
+    }
+    return n;
+}
+
+fn vlen(s: string): int {
+    return vcol(s, len(s));
+}
+
+fn leading_ws(s: string): string {
+    let j = 0;
+    while (j < len(s) && is_space_b(ubyte(s, j))) { j++; }
+    return s.substring(0, j);
+}
+
+fn is_blank(s: string): bool {
+    return len(s.trim()) == 0;
+}
+
+// Lines of text, with CRLF (and a lone CR) folded to LF.
+fn split_lines(t: string): []string {
+    let s = t.replace("\r\n", "\n").replace("\r", "\n");
+    return s.split("\n");
+}
+
+fn strip_ansi(s: string): string {
+    if (!s.contains("\x1b")) { return s; }
+    let out = "";
+    let i = 0;
+    let n = len(s);
+    while (i < n) {
+        if (s[i] == '\x1b') {
+            i++;
+            if (i < n && s[i] == '[') {
+                i++;
+                while (i < n && !((s[i] >= '@' && s[i] <= '~'))) { i++; }
+                i++;
+            } else if (i < n && s[i] == ']') {
+                while (i < n && s[i] != '\x07') { i++; }
+                i++;
+            } else {
+                i++;
+            }
+        } else {
+            out += s.substring(i, 1);
+            i++;
+        }
+    }
+    return out;
+}
+
+fn lower_eq(a: string, b: string): bool {
+    return a.lower() == b.lower();
+}
+
+// Fuzzy subsequence score of pattern in s; -1 when it does not match. Higher
+// is better: consecutive letters, word starts and an early first hit count.
+fn fuzzy(s: string, pat: string): int {
+    if (len(pat) == 0) { return 1; }
+    let ls = s.lower();
+    let lp = pat.lower();
+    let score = 0;
+    let j = 0;
+    let prev = -2;
+    for (i, len(ls)) {
+        if (j < len(lp) && ls[i] == lp[j]) {
+            score += 10;
+            if (prev == i - 1) { score += 15; }
+            if (i == 0 || !is_word_b(ubyte(s, i - 1)) || (s[i] >= 'A' && s[i] <= 'Z')) { score += 12; }
+            if (j == 0) { score -= imin(i, 20); }
+            prev = i;
+            j++;
+        }
+    }
+    if (j < len(lp)) { return -1; }
+    return score - len(s) / 4;
+}
+
+// ---- one-line fields ------------------------------------------------------------------------
+
+fn fld_init() {
+    for (i, 8) {
+        fld_text.push("");
+        fld_caret.push(0);
+        fld_anchor.push(0);
+        fld_scroll.push(0);
+    }
+}
+
+fn fld_set(id: int, s: string) {
+    fld_text[id] = s;
+    fld_caret[id] = len(s);
+    fld_anchor[id] = len(s);
+    fld_scroll[id] = 0;
+}
+
+fn fld_select_all(id: int) {
+    fld_anchor[id] = 0;
+    fld_caret[id] = len(fld_text[id]);
+}
+
+fn fld_has_sel(id: int): bool {
+    return fld_anchor[id] != fld_caret[id];
+}
+
+fn fld_del_sel(id: int) {
+    let a = imin(fld_anchor[id], fld_caret[id]);
+    let b = imax(fld_anchor[id], fld_caret[id]);
+    let t: string = fld_text[id];
+    fld_text[id] = t.substring(0, a) + t.substring(b, -1);
+    fld_caret[id] = a;
+    fld_anchor[id] = a;
+}
+
+fn fld_insert(id: int, s: string) {
+    let clean = s.replace("\r", "").replace("\n", " ").replace("\t", " ");
+    if (fld_has_sel(id)) { fld_del_sel(id); }
+    let t: string = fld_text[id];
+    let c: int = fld_caret[id];
+    fld_text[id] = t.substring(0, c) + clean + t.substring(c, -1);
+    fld_caret[id] = c + len(clean);
+    fld_anchor[id] = fld_caret[id];
+}
+
+// Handles an editing key; returns 0 if it was not one, 1 if handled, 2 if
+// the text changed.
+fn fld_key(id: int, vk: int, mods: int): int {
+    let t: string = fld_text[id];
+    let c: int = fld_caret[id];
+    let shift = (mods & M_SHIFT) != 0;
+    let ctrl = (mods & M_CTRL) != 0;
+    let nc = c;
+    if (vk == K_LEFT) {
+        if (!shift && fld_has_sel(id)) {
+            nc = imin(c, fld_anchor[id]);
+        } else if (ctrl) {
+            nc = word_left(t, c);
+        } else {
+            nc = prev_i(t, c);
+        }
+    } else if (vk == K_RIGHT) {
+        if (!shift && fld_has_sel(id)) {
+            nc = imax(c, fld_anchor[id]);
+        } else if (ctrl) {
+            nc = word_right(t, c);
+        } else {
+            nc = next_i(t, c);
+        }
+    } else if (vk == K_HOME) {
+        nc = 0;
+    } else if (vk == K_END) {
+        nc = len(t);
+    } else if (vk == K_BACK) {
+        if (fld_has_sel(id)) {
+            fld_del_sel(id);
+        } else if (c > 0) {
+            let p = prev_i(t, c);
+            if (ctrl) { p = word_left(t, c); }
+            fld_text[id] = t.substring(0, p) + t.substring(c, -1);
+            fld_caret[id] = p;
+            fld_anchor[id] = p;
+        } else {
+            return 1;
+        }
+        return 2;
+    } else if (vk == K_DELETE) {
+        if (fld_has_sel(id)) {
+            fld_del_sel(id);
+        } else if (c < len(t)) {
+            let q = next_i(t, c);
+            if (ctrl) { q = word_right(t, c); }
+            fld_text[id] = t.substring(0, c) + t.substring(q, -1);
+        } else {
+            return 1;
+        }
+        return 2;
+    } else if (ctrl && vk == 65) {
+        fld_select_all(id);
+        return 1;
+    } else if (ctrl && (vk == 67 || vk == 88)) {
+        if (fld_has_sel(id)) {
+            let a = imin(fld_anchor[id], c);
+            let b = imax(fld_anchor[id], c);
+            nx_clip_set(t.substring(a, b - a));
+            if (vk == 88) {
+                fld_del_sel(id);
+                return 2;
+            }
+        }
+        return 1;
+    } else if (ctrl && vk == 86) {
+        let clip: string = nx_clip_get();
+        fld_insert(id, clip);
+        return 2;
+    } else {
+        return 0;
+    }
+    fld_caret[id] = nc;
+    if (!shift) { fld_anchor[id] = nc; }
+    return 1;
+}
+
+fn fld_char(id: int, cp: int) {
+    fld_insert(id, utf8(cp));
+}
+
+// Byte index in the field under pixel x (relative to the text start).
+fn fld_hit(id: int, rx: int): int {
+    let t: string = fld_text[id];
+    let i = 0;
+    let best = 0;
+    while (i <= len(t)) {
+        let w = tw(t.substring(0, i), UI);
+        if (w - fld_scroll[id] > rx) {
+            let pw = tw(t.substring(0, best), UI) - fld_scroll[id];
+            if (rx - pw < w - fld_scroll[id] - rx) { return best; }
+            return i;
+        }
+        best = i;
+        if (i == len(t)) { break; }
+        i = next_i(t, i);
+    }
+    return len(t);
+}
+
+fn fld_click(id: int, rx: int, shift: bool) {
+    fld_caret[id] = fld_hit(id, rx);
+    if (!shift) { fld_anchor[id] = fld_caret[id]; }
+}
+
+// Draws the field; the caret shows when focused.
+fn fld_draw(id: int, x: int, y: int, w: int, h: int, focused: bool, placeholder: string) {
+    fill(x, y, w, h, C_INPUT);
+    outline(x, y, w, h, focused ? C_ACCENT : C_INPUT_BORDER);
+    let t: string = fld_text[id];
+    let pad = px(6);
+    let inner = w - pad * 2;
+    let cxp = tw(t.substring(0, fld_caret[id]), UI);
+    let sc: int = fld_scroll[id];
+    if (cxp - sc > inner - 2) { sc = cxp - inner + 2; }
+    if (cxp - sc < 0) { sc = cxp; }
+    if (sc < 0) { sc = 0; }
+    fld_scroll[id] = sc;
+    let ty = y + (h - ui.text_height(UI)) / 2;
+    if (len(t) == 0) {
+        txt(x + pad, ty, placeholder, C_DIM, UI);
+    } else {
+        if (focused && fld_has_sel(id)) {
+            let a = imin(fld_anchor[id], fld_caret[id]);
+            let b = imax(fld_anchor[id], fld_caret[id]);
+            let xa = clamp(tw(t.substring(0, a), UI) - sc, 0, inner);
+            let xb = clamp(tw(t.substring(0, b), UI) - sc, 0, inner);
+            fill(x + pad + xa, y + px(3), xb - xa, h - px(6), C_SELECTION);
+        }
+        // Text scrolled left is cut at the field's edge by drawing only the
+        // characters that fit.
+        let start = 0;
+        while (start < len(t) && tw(t.substring(0, next_i(t, start)), UI) <= sc) { start = next_i(t, start); }
+        let vis = t.substring(start, -1);
+        let off = tw(t.substring(0, start), UI) - sc;
+        txt(x + pad + off, ty, fit(vis, inner - off, UI).replace("…", ""), C_TEXT, UI);
+    }
+    if (focused && caret_on()) {
+        fill(x + pad + cxp - sc, y + px(4), 1, h - px(8), C_TEXT);
+    }
+}
+
+fn caret_on(): bool {
+    return ((now_ms - blink_ms) / 530) % 2 == 0;
+}
+
+fn upper_s(s: string): string {
+    return s.upper();
+}

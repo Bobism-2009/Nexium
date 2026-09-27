@@ -1,0 +1,1869 @@
+// The code editor: keyboard and mouse editing, find and replace, completion,
+// and drawing the text one character cell at a time.
+
+// ---- geometry --------------------------------------------------------------------------------
+
+fn code_h(): int {
+    return imax(ed_h, LH);
+}
+
+fn visible_lines(): int {
+    return imax(1, code_h() / LH);
+}
+
+fn max_sy(): int {
+    return imax(0, (len(L) - 1) * LH);
+}
+
+fn clamp_scroll() {
+    sy = clamp(sy, 0, max_sy());
+    if (sx < 0) { sx = 0; }
+}
+
+// Keeps the cursor on screen; center puts it in the middle when it has to move.
+fn reveal(center: bool) {
+    if (ed_h <= 0) { return; }
+    let y = cy * LH;
+    let h = code_h();
+    if (y < sy || y + LH > sy + h) {
+        if (center) {
+            sy = y - h / 2 + LH;
+        } else if (y < sy) {
+            sy = y;
+        } else {
+            sy = y + LH - h;
+        }
+    }
+    let x = vcol(L[cy], cx) * CW;
+    let w = imax(text_w - SCROLL_W, CW * 4);
+    if (x < sx) { sx = imax(0, x - CW * 4); }
+    if (x > sx + w - CW * 2) { sx = x - w + CW * 6; }
+    clamp_scroll();
+    frame_dirty = true;
+}
+
+// Document position under a pixel in the editor.
+
+fn hit_test(px_: int, py_: int) {
+    let y = (py_ - ed_y + sy) / LH;
+    if (py_ < ed_y) { y = (sy - (ed_y - py_) - LH + 1) / LH; }
+    hit_y = clamp(y, 0, len(L) - 1);
+    let v = (px_ - text_x + sx + CW / 2) / CW;
+    if (v < 0) { v = 0; }
+    hit_x = at_vcol(L[hit_y], v);
+}
+
+// ---- highlighting states ---------------------------------------------------------------------
+
+fn hl_ensure(upto: int) {
+    let want_n = len(L) + 1;
+    if (len(hl_st) != want_n) {
+        while (len(hl_st) > want_n) {
+            hl_st.pop();
+            hl_dl.pop();
+        }
+        while (len(hl_st) < want_n) {
+            hl_st.push(0);
+            hl_dl.push("");
+        }
+    }
+    if (hl_valid > len(L)) { hl_valid = len(L); }
+    hl_st[0] = 0;
+    hl_dl[0] = "";
+    let stop = imin(upto, len(L));
+    while (hl_valid < stop) {
+        let k = hl_valid;
+        let cols = hl_line(doc_lang, L[k], hl_st[k], hl_dl[k]);
+        hl_st[k + 1] = hl_out_state;
+        hl_dl[k + 1] = hl_out_delim;
+        hl_valid++;
+    }
+}
+
+fn line_colors(k: int): []int {
+    hl_ensure(k + 1);
+    return hl_line(doc_lang, L[k], hl_st[k], hl_dl[k]);
+}
+
+// ---- words ------------------------------------------------------------------------------------------
+
+// The word around byte x of line y, in word_a..word_b; "" if none.
+fn word_at(y: int, x: int): string {
+    let s: string = L[y];
+    let a = x;
+    let b = x;
+    if (!is_word_at(s, a) && is_word_at(s, a - 1)) {
+        a--;
+        b--;
+    }
+    if (!is_word_at(s, a)) {
+        word_a = x;
+        word_b = x;
+        return "";
+    }
+    while (a > 0 && is_word_at(s, a - 1)) { a--; }
+    while (b < len(s) && is_word_at(s, b)) { b++; }
+    word_a = a;
+    word_b = b;
+    return s.substring(a, b - a);
+}
+
+fn select_word() {
+    let w = word_at(cy, cx);
+    if (len(w) == 0) { return; }
+    ay = cy;
+    ax = word_a;
+    cx = word_b;
+}
+
+// ---- line operations ----------------------------------------------------------------------------------
+
+// The lines the selection touches (a selection ending at column 0 stops the line before).
+
+fn block_lines() {
+    sel_bounds();
+    blk_a = sel_y1;
+    blk_b = sel_y2;
+    if (has_sel() && sel_x2 == 0 && sel_y2 > sel_y1) { blk_b = sel_y2 - 1; }
+}
+
+fn indent_lines(out: bool) {
+    block_lines();
+    begin_edit("indent");
+    let y = blk_a;
+    while (y <= blk_b) {
+        let s: string = L[y];
+        if (out) {
+            let n = 0;
+            if (s.starts_with("\t")) {
+                n = 1;
+            } else {
+                while (n < 4 && n < len(s) && s[n] == ' ') { n++; }
+            }
+            L[y] = s.substring(n, -1);
+            if (cy == y) { cx = imax(0, cx - n); }
+            if (ay == y) { ax = imax(0, ax - n); }
+        } else if (len(s) > 0 || blk_a == blk_b) {
+            L[y] = "    " + s;
+            if (cy == y) { cx += 4; }
+            if (ay == y && (has_sel() || ay != cy)) { ax += 4; }
+        }
+        y++;
+    }
+    if (!has_sel()) {
+        ax = cx;
+        ay = cy;
+    }
+    end_edit(blk_a);
+}
+
+fn toggle_comment() {
+    let tok = lang_comment(doc_lang);
+    if (len(tok) == 0) { return; }
+    block_lines();
+    let all = true;
+    let min_ind = 100000;
+    let y = blk_a;
+    while (y <= blk_b) {
+        let s: string = L[y];
+        if (!is_blank(s)) {
+            let ws = leading_ws(s);
+            min_ind = imin(min_ind, len(ws));
+            if (!s.substring(len(ws), -1).starts_with(tok)) { all = false; }
+        }
+        y++;
+    }
+    if (min_ind == 100000) { min_ind = 0; }
+    begin_edit("comment");
+    y = blk_a;
+    while (y <= blk_b) {
+        let s: string = L[y];
+        let delta = 0;
+        let at = 0;
+        if (all) {
+            let ws = leading_ws(s);
+            at = len(ws);
+            if (s.substring(at, -1).starts_with(tok)) {
+                let n = len(tok);
+                if (s.substring(at + n, 1) == " ") { n++; }
+                L[y] = s.substring(0, at) + s.substring(at + n, -1);
+                delta = -n;
+            }
+        } else if (!is_blank(s) || blk_a == blk_b) {
+            at = imin(min_ind, len(s));
+            L[y] = s.substring(0, at) + tok + " " + s.substring(at, -1);
+            delta = len(tok) + 1;
+        }
+        if (cy == y && cx >= at) { cx = imax(at, cx + delta); }
+        if (ay == y && ax >= at) { ax = imax(at, ax + delta); }
+        y++;
+    }
+    end_edit(blk_a);
+}
+
+fn move_lines(dir: int) {
+    block_lines();
+    if (dir < 0 && blk_a == 0) { return; }
+    if (dir > 0 && blk_b >= len(L) - 1) { return; }
+    begin_edit("move");
+    if (dir < 0) {
+        let above: string = L[blk_a - 1];
+        L.remove(blk_a - 1);
+        L.insert(blk_b, above);
+    } else {
+        let below: string = L[blk_b + 1];
+        L.remove(blk_b + 1);
+        L.insert(blk_a, below);
+    }
+    cy += dir;
+    ay += dir;
+    end_edit(imin(blk_a, blk_a + dir));
+    reveal(false);
+}
+
+fn copy_lines(dir: int) {
+    block_lines();
+    begin_edit("copy");
+    let chunk = L[blk_a:blk_b + 1];
+    let n = len(chunk);
+    let k = n - 1;
+    while (k >= 0) {
+        L.insert(blk_b + 1, chunk[k]);
+        k--;
+    }
+    if (dir > 0) {
+        cy += n;
+        ay += n;
+    }
+    end_edit(blk_a);
+    reveal(false);
+}
+
+fn delete_lines() {
+    block_lines();
+    begin_edit("delete-line");
+    let k = blk_b;
+    while (k >= blk_a) {
+        L.remove(k);
+        k--;
+    }
+    if (len(L) == 0) { L.push(""); }
+    cy = imin(blk_a, len(L) - 1);
+    cx = imin(cx, len(L[cy]));
+    ay = cy;
+    ax = cx;
+    end_edit(blk_a);
+    reveal(false);
+}
+
+fn insert_line(below: bool) {
+    begin_edit("line");
+    let ind = leading_ws(L[cy]);
+    if (below) {
+        L.insert(cy + 1, ind);
+        cy++;
+    } else {
+        L.insert(cy, ind);
+    }
+    cx = len(ind);
+    ay = cy;
+    ax = cx;
+    end_edit(cy - 1);
+    reveal(false);
+}
+
+fn select_line() {
+    if (!has_sel()) {
+        ay = cy;
+        ax = 0;
+    }
+    if (cy < len(L) - 1) {
+        cy++;
+        cx = 0;
+    } else {
+        cx = len(L[cy]);
+    }
+    reveal(false);
+}
+
+fn trim_trailing() {
+    begin_edit("trim");
+    for (y, len(L)) {
+        let s: string = L[y];
+        let e = len(s);
+        while (e > 0 && is_space_b(ubyte(s, e - 1))) { e--; }
+        if (e < len(s)) { L[y] = s.substring(0, e); }
+    }
+    clamp_cursor();
+    end_edit(0);
+}
+
+fn change_case(upper: bool) {
+    if (!has_sel()) { select_word(); }
+    if (!has_sel()) { return; }
+    let t = sel_text();
+    sel_bounds();
+    let y1 = sel_y1;
+    let x1 = sel_x1;
+    let rev = ay > cy || (ay == cy && ax > cx);
+    begin_edit("case");
+    insert_text(upper ? t.upper() : t.lower());
+    if (rev) {
+        ay = cy;
+        ax = cx;
+        cy = y1;
+        cx = x1;
+    } else {
+        ay = y1;
+        ax = x1;
+    }
+    end_edit(y1);
+}
+
+// ---- brackets --------------------------------------------------------------------------------------
+
+fn bracket_pair(c: char): char {
+    if (c == '(') { return ')'; }
+    if (c == '[') { return ']'; }
+    if (c == '{') { return '}'; }
+    if (c == ')') { return '('; }
+    if (c == ']') { return '['; }
+    if (c == '}') { return '{'; }
+    return ' ';
+}
+
+fn is_open_br(c: char): bool {
+    return c == '(' || c == '[' || c == '{';
+}
+
+fn is_close_br(c: char): bool {
+    return c == ')' || c == ']' || c == '}';
+}
+
+// Finds the bracket at or before the cursor and its partner (br_* / br_m*).
+fn match_brackets() {
+    br_y = -1;
+    br_my = -1;
+    let s: string = L[cy];
+    let x = -1;
+    if (cx < len(s) && (is_open_br(s[cx]) || is_close_br(s[cx]))) {
+        x = cx;
+    } else if (cx > 0 && (is_open_br(s[cx - 1]) || is_close_br(s[cx - 1]))) {
+        x = cx - 1;
+    }
+    if (x < 0) { return; }
+    br_y = cy;
+    br_x = x;
+    let c = s[x];
+    let other = bracket_pair(c);
+    let dir = is_open_br(c) ? 1 : -1;
+    let depth = 0;
+    let y = cy;
+    let i = x;
+    let steps = 0;
+    while (y >= 0 && y < len(L) && steps < 200000) {
+        let t: string = L[y];
+        while (i >= 0 && i < len(t)) {
+            let ch = t[i];
+            if (ch == c) { depth++; }
+            if (ch == other) {
+                depth--;
+                if (depth == 0) {
+                    br_my = y;
+                    br_mx = i;
+                    return;
+                }
+            }
+            i += dir;
+            steps++;
+        }
+        y += dir;
+        if (y >= 0 && y < len(L)) {
+            if (dir > 0) { i = 0; } else { i = len(L[y]) - 1; }
+        }
+    }
+}
+
+fn jump_bracket() {
+    match_brackets();
+    if (br_my < 0) { return; }
+    if (cy == br_my && (cx == br_mx || cx == br_mx + 1)) {
+        set_cursor(br_y, br_x, false);
+    } else {
+        set_cursor(br_my, br_mx, false);
+    }
+    reveal(false);
+}
+
+// ---- typing -------------------------------------------------------------------------------------------
+
+fn next_char(): string {
+    let s: string = L[cy];
+    if (cx < len(s)) { return s.substring(cx, 1); }
+    return "";
+}
+
+fn prev_char(): string {
+    let s: string = L[cy];
+    if (cx > 0) { return s.substring(cx - 1, 1); }
+    return "";
+}
+
+fn closer_for(ch: string): string {
+    if (ch == "(") { return ")"; }
+    if (ch == "[") { return "]"; }
+    if (ch == "{") { return "}"; }
+    if (ch == "\"") { return "\""; }
+    if (ch == "'") { return "'"; }
+    if (ch == "`") { return "`"; }
+    return "";
+}
+
+fn code_lang(): bool {
+    return doc_lang == L_NEXA || doc_lang == L_CPP || doc_lang == L_JSON || doc_lang == L_SHELL;
+}
+
+fn type_char(cp: int) {
+    let ch = utf8(cp);
+    let close = closer_for(ch);
+    let quote = ch == "\"" || ch == "'" || ch == "`";
+    if (ch == "`" && doc_lang != L_MD) { close = ""; }
+    if (ch == "'" && !code_lang()) { close = ""; }
+    // wrap a selection in brackets or quotes
+    if (has_sel() && len(close) > 0 && !(sel_y1 != sel_y2 && quote)) {
+        sel_bounds();
+        let t = sel_text();
+        let y1 = sel_y1;
+        let x1 = sel_x1;
+        begin_edit("wrap");
+        insert_text(ch + t + close);
+        ay = y1;
+        ax = x1 + len(ch);
+        cx -= len(close);
+        end_edit(y1);
+        return;
+    }
+    let nxt = next_char();
+    // step over a closer that is already there
+    if (!has_sel() && (ch == ")" || ch == "]" || ch == "}" || quote) && nxt == ch) {
+        set_cursor(cy, cx + 1, false);
+        last_edit_kind = "";
+        return;
+    }
+    if (len(close) > 0 && !has_sel()) {
+        let pairs = nxt == "" || nxt == " " || nxt == "\t" || nxt == ")" || nxt == "]" || nxt == "}" || nxt == ";" || nxt == ",";
+        if (quote) {
+            let pv = prev_char();
+            pairs = pairs && !(len(pv) > 0 && is_word_b(ubyte(pv, 0))) && pv != ch;
+            // no pairing inside an open string on this line
+            let before = L[cy].substring(0, cx);
+            if (before.count(ch) % 2 == 1) { pairs = false; }
+        }
+        if (pairs) {
+            begin_edit("type");
+            insert_text(ch + close);
+            cx -= len(close);
+            ax = cx;
+            end_edit(cy);
+            update_completion(false);
+            return;
+        }
+    }
+    // a closing brace on an otherwise blank line lines up with its opener
+    if (ch == "}" && !has_sel() && is_blank(L[cy].substring(0, cx)) && cx >= 4) {
+        begin_edit("type");
+        let ind = leading_ws(L[cy]);
+        let cut = imin(4, len(ind));
+        L[cy] = L[cy].substring(cut, -1);
+        cx -= cut;
+        ax = cx;
+        insert_text("}");
+        end_edit(cy);
+        return;
+    }
+    begin_edit("type");
+    insert_text(ch);
+    end_edit(cy);
+    reveal(false);
+    update_completion(false);
+}
+
+fn press_enter() {
+    let s: string = L[cy];
+    let ind = leading_ws(s);
+    if (len(ind) > cx) { ind = ind.substring(0, cx); }
+    let before = s.substring(0, cx).trim();
+    let after = s.substring(cx, -1).trim();
+    let last = "";
+    if (len(before) > 0) { last = before.substring(len(before) - 1, 1); }
+    begin_edit("enter");
+    delete_sel();
+    if (last == "{" || last == "[" || last == "(") {
+        let inner = ind + "    ";
+        let first = "";
+        if (len(after) > 0) { first = after.substring(0, 1); }
+        if (first == closer_for(last)) {
+            insert_text("\n" + inner + "\n" + ind);
+            cy--;
+            cx = len(inner);
+        } else {
+            insert_text("\n" + inner);
+        }
+    } else {
+        // drop the spaces the cursor leaves behind at the end of the line
+        let head: string = L[cy].substring(0, cx);
+        let trimmed = head;
+        while (len(trimmed) > 0 && is_space_b(ubyte(trimmed, len(trimmed) - 1)) && len(trimmed) > len(ind)) {
+            trimmed = trimmed.substring(0, len(trimmed) - 1);
+        }
+        if (is_blank(head)) { trimmed = ""; }
+        L[cy] = trimmed + L[cy].substring(cx, -1);
+        cx = len(trimmed);
+        let rest: string = L[cy].substring(cx, -1);
+        let skip = 0;
+        while (skip < len(rest) && is_space_b(ubyte(rest, skip))) { skip++; }
+        L[cy] = trimmed + rest.substring(skip, -1);
+        insert_text("\n" + ind);
+    }
+    ay = cy;
+    ax = cx;
+    end_edit(cy - 1);
+    reveal(false);
+}
+
+fn backspace(ctrl: bool) {
+    if (has_sel()) {
+        sel_bounds();
+        let from = sel_y1;
+        begin_edit("delete");
+        delete_sel();
+        end_edit(from);
+        return;
+    }
+    if (cx == 0) {
+        if (cy == 0) { return; }
+        begin_edit("join");
+        let prev_len = len(L[cy - 1]);
+        L[cy - 1] = L[cy - 1] + L[cy];
+        L.remove(cy);
+        cy--;
+        cx = prev_len;
+        ay = cy;
+        ax = cx;
+        end_edit(cy);
+        reveal(false);
+        return;
+    }
+    let s: string = L[cy];
+    let from = prev_i(s, cx);
+    let to = cx;
+    if (ctrl) {
+        from = word_left(s, cx);
+    } else if (is_blank(s.substring(0, cx)) && !s.contains("\t")) {
+        // in the indentation: back to the previous tab stop
+        let v = cx;
+        from = imax(0, ((v - 1) / 4) * 4);
+    } else {
+        let pv = s.substring(from, to - from);
+        let cl = closer_for(pv);
+        if (len(cl) > 0 && cx < len(s) && s.substring(cx, len(cl)) == cl) { to = cx + len(cl); }
+    }
+    begin_edit("delete");
+    L[cy] = s.substring(0, from) + s.substring(to, -1);
+    cx = from;
+    ax = cx;
+    ay = cy;
+    end_edit(cy);
+    update_completion(true);
+    reveal(false);
+}
+
+fn delete_forward(ctrl: bool) {
+    if (has_sel()) {
+        sel_bounds();
+        let from = sel_y1;
+        begin_edit("delete");
+        delete_sel();
+        end_edit(from);
+        return;
+    }
+    let s: string = L[cy];
+    if (cx >= len(s)) {
+        if (cy >= len(L) - 1) { return; }
+        begin_edit("join");
+        L[cy] = s + L[cy + 1];
+        L.remove(cy + 1);
+        end_edit(cy);
+        return;
+    }
+    let to = next_i(s, cx);
+    if (ctrl) { to = word_right(s, cx); }
+    begin_edit("delete");
+    L[cy] = s.substring(0, cx) + s.substring(to, -1);
+    end_edit(cy);
+}
+
+fn copy_sel(cut: bool) {
+    if (has_sel()) {
+        let t = sel_text();
+        nx_clip_set(t);
+        line_clip = "";
+        if (cut) {
+            sel_bounds();
+            let from = sel_y1;
+            begin_edit("cut");
+            delete_sel();
+            end_edit(from);
+        }
+        return;
+    }
+    // no selection: the whole line
+    let t: string = L[cy] + "\n";
+    nx_clip_set(t);
+    line_clip = t;
+    if (cut) {
+        begin_edit("cut");
+        L.remove(cy);
+        if (len(L) == 0) { L.push(""); }
+        cy = imin(cy, len(L) - 1);
+        cx = imin(cx, len(L[cy]));
+        ay = cy;
+        ax = cx;
+        end_edit(cy);
+    }
+}
+
+fn paste() {
+    let t: string = nx_clip_get();
+    if (len(t) == 0) { return; }
+    if (!has_sel() && t == line_clip) {
+        // a copied line goes in above the cursor's line
+        begin_edit("paste");
+        let keep = cx;
+        cx = 0;
+        ax = 0;
+        insert_text(t);
+        cx = keep;
+        ax = cx;
+        end_edit(cy - 1);
+        reveal(false);
+        return;
+    }
+    sel_bounds();
+    let from = has_sel() ? sel_y1 : cy;
+    begin_edit("paste");
+    insert_text(t.replace("\t", "    "));
+    end_edit(from);
+    reveal(false);
+}
+
+// ---- cursor movement ------------------------------------------------------------------------------------
+
+fn move_v(dy: int, extend: bool) {
+    if (want < 0) { want = vcol(L[cy], cx); }
+    let ny = clamp(cy + dy, 0, len(L) - 1);
+    if (ny == cy) {
+        if (dy < 0) { set_cursor(cy, 0, extend); }
+        if (dy > 0) { set_cursor(cy, len(L[cy]), extend); }
+        return;
+    }
+    let w = want;
+    set_cursor(ny, at_vcol(L[ny], w), extend);
+    want = w;
+}
+
+fn home(extend: bool, ctrl: bool) {
+    if (ctrl) {
+        set_cursor(0, 0, extend);
+        return;
+    }
+    let ind = len(leading_ws(L[cy]));
+    set_cursor(cy, cx == ind ? 0 : ind, extend);
+}
+
+// ---- keys ----------------------------------------------------------------------------------------------------
+
+// Editor keys; returns true if the key was used.
+fn ed_key(vk: int, mods: int): bool {
+    let ctrl = (mods & M_CTRL) != 0;
+    let shift = (mods & M_SHIFT) != 0;
+    let alt = (mods & M_ALT) != 0;
+    if (comp_open && comp_key(vk, mods)) { return true; }
+    let keep_want = false;
+    if (vk == K_LEFT) {
+        if (has_sel() && !shift) {
+            sel_bounds();
+            set_cursor(sel_y1, sel_x1, false);
+        } else if (cx == 0 && cy > 0) {
+            set_cursor(cy - 1, len(L[cy - 1]), shift);
+        } else {
+            set_cursor(cy, ctrl ? word_left(L[cy], cx) : prev_i(L[cy], cx), shift);
+        }
+    } else if (vk == K_RIGHT) {
+        if (has_sel() && !shift) {
+            sel_bounds();
+            set_cursor(sel_y2, sel_x2, false);
+        } else if (cx >= len(L[cy]) && cy < len(L) - 1) {
+            set_cursor(cy + 1, 0, shift);
+        } else {
+            set_cursor(cy, ctrl ? word_right(L[cy], cx) : next_i(L[cy], cx), shift);
+        }
+    } else if (vk == K_UP && alt) {
+        if (shift) { copy_lines(-1); } else { move_lines(-1); }
+    } else if (vk == K_DOWN && alt) {
+        if (shift) { copy_lines(1); } else { move_lines(1); }
+    } else if (vk == K_UP && ctrl) {
+        sy = imax(0, sy - LH);
+        keep_want = true;
+    } else if (vk == K_DOWN && ctrl) {
+        sy = imin(max_sy(), sy + LH);
+        keep_want = true;
+    } else if (vk == K_UP) {
+        move_v(-1, shift);
+        keep_want = true;
+    } else if (vk == K_DOWN) {
+        move_v(1, shift);
+        keep_want = true;
+    } else if (vk == K_PGUP) {
+        let n = visible_lines() - 1;
+        move_v(-n, shift);
+        sy = imax(0, sy - n * LH);
+        keep_want = true;
+    } else if (vk == K_PGDN) {
+        let n = visible_lines() - 1;
+        move_v(n, shift);
+        sy = imin(max_sy(), sy + n * LH);
+        keep_want = true;
+    } else if (vk == K_HOME) {
+        home(shift, ctrl);
+    } else if (vk == K_END) {
+        if (ctrl) {
+            set_cursor(len(L) - 1, len(L[len(L) - 1]), shift);
+        } else {
+            set_cursor(cy, len(L[cy]), shift);
+        }
+    } else if (vk == K_BACK) {
+        backspace(ctrl);
+    } else if (vk == K_DELETE) {
+        if (shift && !ctrl) {
+            copy_sel(true);
+        } else {
+            delete_forward(ctrl);
+        }
+    } else if (vk == K_ENTER && ctrl) {
+        insert_line(!shift);
+    } else if (vk == K_ENTER) {
+        press_enter();
+    } else if (vk == K_TAB) {
+        sel_bounds();
+        if (shift) {
+            indent_lines(true);
+        } else if (has_sel() && sel_y1 != sel_y2) {
+            indent_lines(false);
+        } else {
+            let v = vcol(L[cy], cx);
+            edit_insert(" ".repeat(4 - v % 4), "type");
+        }
+    } else if (vk == K_ESC) {
+        if (comp_open) {
+            comp_open = false;
+        } else if (find_open) {
+            find_open = false;
+        } else if (has_sel()) {
+            set_cursor(cy, cx, false);
+        } else {
+            return false;
+        }
+    } else if (ctrl && !alt) {
+        if (vk == 90 && !shift) {
+            undo();
+        } else if (vk == 89 || (vk == 90 && shift)) {
+            redo();
+        } else if (vk == 65) {
+            ay = 0;
+            ax = 0;
+            cy = len(L) - 1;
+            cx = len(L[cy]);
+        } else if (vk == 67) {
+            copy_sel(false);
+        } else if (vk == 88) {
+            copy_sel(true);
+        } else if (vk == 86) {
+            paste();
+        } else if (vk == 76) {
+            select_line();
+        } else if (vk == 68) {
+            copy_lines(1);
+        } else if (vk == 75 && shift) {
+            delete_lines();
+        } else if (vk == K_SLASH) {
+            toggle_comment();
+        } else if (vk == K_RBRACKET) {
+            indent_lines(false);
+        } else if (vk == K_LBRACKET) {
+            indent_lines(true);
+        } else if (vk == K_BACKSLASH && shift) {
+            jump_bracket();
+        } else if (vk == K_SPACE) {
+            update_completion(true);
+            if (!comp_open) { update_completion_any(); }
+        } else {
+            return false;
+        }
+    } else if (vk == K_F12) {
+        goto_definition(word_at(cy, cx));
+    } else {
+        return false;
+    }
+    if (!keep_want) { want = -1; }
+    if (vk != K_BACK && vk != K_SPACE && !(ctrl && vk == K_SPACE)) {
+        if (vk == K_LEFT || vk == K_RIGHT || vk == K_UP || vk == K_DOWN || vk == K_HOME || vk == K_END || vk == K_PGUP || vk == K_PGDN || vk == K_ENTER) {
+            comp_open = false;
+            last_edit_kind = "";
+        }
+    }
+    if (vk != K_UP && vk != K_DOWN || !ctrl) { reveal(false); }
+    blink_ms = now_ms;
+    frame_dirty = true;
+    return true;
+}
+
+fn ed_char(cp: int) {
+    if (!is_file_tab()) { return; }
+    type_char(cp);
+    want = -1;
+    blink_ms = now_ms;
+}
+
+// ---- mouse --------------------------------------------------------------------------------------------------
+
+fn ed_mouse_down(x: int, y: int, clicks: int, mods: int) {
+    focus = F_EDITOR;
+    comp_open = false;
+    let shift = (mods & M_SHIFT) != 0;
+    let ctrl = (mods & M_CTRL) != 0;
+    // scrollbar
+    let sbx = ed_x + ed_w - SCROLL_W;
+    if (x >= sbx) {
+        let total = len(L) * LH + code_h();
+        let th = imax(px(20), code_h() * code_h() / imax(total, 1));
+        let ty = ed_y + (code_h() - th) * sy / imax(max_sy(), 1);
+        if (y >= ty && y < ty + th) {
+            drag = 4;
+            drag_off = y - ty;
+        } else {
+            let frac = (y - ed_y - th / 2) * 1000 / imax(code_h() - th, 1);
+            sy = clamp(frac * max_sy() / 1000, 0, max_sy());
+            drag = 4;
+            drag_off = th / 2;
+        }
+        return;
+    }
+    last_edit_kind = "";
+    hit_test(x, y);
+    if (x < text_x) {
+        // gutter: select whole lines
+        if (shift) {
+            set_cursor(hit_y + 1 < len(L) ? hit_y + 1 : hit_y, hit_y + 1 < len(L) ? 0 : len(L[hit_y]), true);
+        } else {
+            set_cursor(hit_y, 0, false);
+            if (hit_y + 1 < len(L)) {
+                cy = hit_y + 1;
+                cx = 0;
+            } else {
+                cx = len(L[hit_y]);
+            }
+        }
+        drag = 3;
+        drag_line_mode = true;
+        drag_anchor_y = hit_y;
+        return;
+    }
+    drag_line_mode = false;
+    if (ctrl && clicks == 1) {
+        let w = word_at(hit_y, hit_x);
+        if (len(w) > 0) {
+            set_cursor(hit_y, hit_x, false);
+            goto_definition(w);
+            return;
+        }
+    }
+    if (clicks == 2) {
+        set_cursor(hit_y, hit_x, false);
+        select_word();
+        drag_word = true;
+        drag_anchor_y = ay;
+        drag_anchor_a = ax;
+        drag_anchor_b = cx;
+    } else if (clicks >= 3) {
+        set_cursor(hit_y, 0, false);
+        select_line();
+        drag_line_mode = true;
+        drag_anchor_y = hit_y;
+    } else {
+        set_cursor(hit_y, hit_x, shift);
+        drag_word = false;
+    }
+    want = -1;
+    drag = 3;
+}
+
+// Called every frame while the left button is held after a press in the text.
+fn ed_drag() {
+    if (drag == 4) {
+        let total = len(L) * LH + code_h();
+        let th = imax(px(20), code_h() * code_h() / imax(total, 1));
+        let frac = (my - drag_off - ed_y) * 1000 / imax(code_h() - th, 1);
+        sy = clamp(frac * max_sy() / 1000, 0, max_sy());
+        frame_dirty = true;
+        return;
+    }
+    // scroll while dragging past the edges
+    if (my < ed_y) { sy = imax(0, sy - LH); }
+    if (my > ed_y + ed_h) { sy = imin(max_sy(), sy + LH); }
+    hit_test(mx, clamp(my, ed_y, ed_y + ed_h - 1));
+    if (drag_line_mode) {
+        if (hit_y >= drag_anchor_y) {
+            ay = drag_anchor_y;
+            ax = 0;
+            if (hit_y + 1 < len(L)) {
+                cy = hit_y + 1;
+                cx = 0;
+            } else {
+                cy = hit_y;
+                cx = len(L[hit_y]);
+            }
+        } else {
+            ay = imin(drag_anchor_y + 1, len(L) - 1);
+            ax = drag_anchor_y + 1 < len(L) ? 0 : len(L[drag_anchor_y]);
+            cy = hit_y;
+            cx = 0;
+        }
+    } else if (drag_word) {
+        let w = word_at(hit_y, hit_x);
+        let a = hit_x;
+        let b = hit_x;
+        if (len(w) > 0) {
+            a = word_a;
+            b = word_b;
+        }
+        if (hit_y < drag_anchor_y || (hit_y == drag_anchor_y && a < drag_anchor_a)) {
+            ay = drag_anchor_y;
+            ax = drag_anchor_b;
+            cy = hit_y;
+            cx = a;
+        } else {
+            ay = drag_anchor_y;
+            ax = drag_anchor_a;
+            cy = hit_y;
+            cx = b;
+        }
+    } else {
+        cy = hit_y;
+        cx = hit_x;
+    }
+    frame_dirty = true;
+    reveal(false);
+}
+
+fn ed_wheel(delta: int, horizontal: bool) {
+    if (horizontal || (nx_mods() & M_SHIFT) != 0) {
+        sx = imax(0, sx - delta * CW * 6 / 120);
+    } else {
+        sy = clamp(sy - delta * LH * 3 / 120, 0, max_sy());
+    }
+    frame_dirty = true;
+}
+
+// ---- go to definition --------------------------------------------------------------------------------
+
+// Line in lines that defines name (fn, struct, enum, let at the start), or -1.
+fn find_def(lines: []string, name: string): int {
+    let pats = ["fn " + name + "(", "fn " + name + " (", "struct " + name, "enum " + name, "let " + name + " ", "let " + name + ":", "let " + name + "=", "let const " + name, "#define " + name, "class " + name];
+    for (k, len(lines)) {
+        let t: string = lines[k].trim();
+        for (p in pats) {
+            if (t.starts_with(p) || t.starts_with("extern " + p)) {
+                let after = t.substring(len(p), 1);
+                if (p.ends_with("(") || len(after) == 0 || !is_word_b(ubyte(after, 0))) { return k; }
+            }
+        }
+    }
+    return -1;
+}
+
+fn goto_definition(name: string) {
+    if (len(name) == 0) { return; }
+    let k = find_def(L, name);
+    if (k >= 0) {
+        let col = L[k].index_of(name);
+        set_cursor(k, imax(col, 0), false);
+        cx = imax(col, 0) + len(name);
+        ax = imax(col, 0);
+        reveal(true);
+        return;
+    }
+    // other Nexa files in the workspace
+    ensure_files_index();
+    for (p in files_index) {
+        if (!p.lower().ends_with(".nxa") || same_path(p, doc_path)) { continue; }
+        let lines = split_lines(file.read(p));
+        let d = find_def(lines, name);
+        if (d >= 0) {
+            open_file(p, false);
+            let col = L[d].index_of(name);
+            set_cursor(d, imax(col, 0), false);
+            ax = imax(col, 0);
+            cx = ax + len(name);
+            reveal(true);
+            return;
+        }
+    }
+    flash("No definition found for '" + name + "'");
+}
+
+// Symbols (fn, struct, enum) in the document, for the outline and quick open.
+
+fn collect_symbols() {
+    sym_names.clear();
+    sym_lines.clear();
+    sym_kinds.clear();
+    for (k, len(L)) {
+        let t: string = L[k];
+        if (len(t) == 0 || t[0] == ' ' && !t.contains("fn ")) { continue; }
+        let s = t.trim();
+        let kind = 0;
+        let rest = "";
+        if (s.starts_with("fn ")) {
+            kind = 1;
+            rest = s.substring(3, -1);
+        } else if (s.starts_with("extern fn ")) {
+            kind = 1;
+            rest = s.substring(10, -1);
+        } else if (s.starts_with("struct ")) {
+            kind = 2;
+            rest = s.substring(7, -1);
+        } else if (s.starts_with("enum ")) {
+            kind = 3;
+            rest = s.substring(5, -1);
+        } else if (s.starts_with("let ") && len(leading_ws(t)) == 0) {
+            kind = 4;
+            rest = s.substring(4, -1);
+            if (rest.starts_with("const ")) { rest = rest.substring(6, -1); }
+        } else {
+            continue;
+        }
+        let e = word_end(rest, 0);
+        if (e == 0) { continue; }
+        sym_names.push(rest.substring(0, e));
+        sym_lines.push(k);
+        sym_kinds.push(kind);
+    }
+}
+
+// Name of the function the cursor is in, for the breadcrumbs.
+fn enclosing_symbol(): string {
+    let k = cy;
+    while (k >= 0) {
+        let s: string = L[k].trim();
+        if (s.starts_with("fn ") || s.starts_with("struct ") || s.starts_with("enum ")) {
+            let sp = s.index_of(" ");
+            let rest = s.substring(sp + 1, -1);
+            return rest.substring(0, word_end(rest, 0));
+        }
+        if (k < cy && len(L[k]) > 0 && L[k][0] == '}') { return ""; }
+        k--;
+    }
+    return "";
+}
+
+// ---- completion ------------------------------------------------------------------------------------------
+
+fn comp_add(w: string, kind: int) {
+    if (comp_items.contains(w)) { return; }
+    comp_items.push(w);
+    comp_kinds.push(kind);
+}
+
+// kind: 1 keyword, 2 type, 3 module, 4 function, 5 variable/word, 6 method
+fn update_completion(force: bool) {
+    if (doc_lang != L_NEXA && doc_lang != L_CPP && !force) {
+        comp_open = false;
+        return;
+    }
+    let s: string = L[cy];
+    let a = cx;
+    while (a > 0 && is_word_b(ubyte(s, a - 1))) { a--; }
+    let prefix = s.substring(a, cx - a);
+    let member_of = "";
+    if (a > 0 && s[a - 1] == '.') {
+        let o = a - 1;
+        while (o > 0 && is_word_b(ubyte(s, o - 1))) { o--; }
+        member_of = s.substring(o, a - 1 - o);
+    }
+    if (len(prefix) == 0 && len(member_of) == 0 && !force) {
+        comp_open = false;
+        return;
+    }
+    if (len(prefix) > 0 && is_digit_b(ubyte(prefix, 0))) {
+        comp_open = false;
+        return;
+    }
+    // inside a string or comment there is nothing to complete
+    let cols = line_colors(cy);
+    if (cx > 0 && cx - 1 < len(cols)) {
+        let c = cols[cx - 1];
+        if (c == S_STRING || c == S_COMMENT || c == S_ESCAPE) {
+            comp_open = false;
+            return;
+        }
+    }
+    comp_items.clear();
+    comp_kinds.clear();
+    comp_prefix = prefix;
+    let lp = prefix.lower();
+    if (len(member_of) > 0) {
+        if (nx_members.has(member_of)) {
+            for (m in nx_members[member_of]) {
+                if (m.lower().starts_with(lp)) { comp_add(m, 4); }
+            }
+        } else {
+            for (m in nx_methods) {
+                if (m.lower().starts_with(lp)) { comp_add(m, 6); }
+            }
+        }
+    } else {
+        for (w, k in nx_words) {
+            if (doc_lang == L_NEXA && w.lower().starts_with(lp) && w != prefix) {
+                comp_add(w, k == 3 ? 2 : (k == 5 ? 3 : 1));
+            }
+        }
+        if (doc_lang == L_CPP) {
+            for (w, k in cpp_words) {
+                if (w.lower().starts_with(lp) && w != prefix) { comp_add(w, k == 3 ? 2 : 1); }
+            }
+        }
+        // words in the document near the cursor
+        let y0 = imax(0, cy - 400);
+        let y1 = imin(len(L), cy + 400);
+        let y = y0;
+        // the prefix's first letter, both cases, to skip most words without copying them
+        let f0 = 0;
+        let f1 = 0;
+        if (len(lp) > 0) {
+            f0 = ubyte(lp, 0);
+            f1 = f0;
+            if (f0 >= 97 && f0 <= 122) { f1 = f0 - 32; }
+        }
+        while (y < y1 && len(comp_items) < 400) {
+            let t: string = L[y];
+            let i = 0;
+            while (i < len(t)) {
+                let b0 = ubyte(t, i);
+                if (is_word_b(b0) && (i == 0 || !is_word_b(ubyte(t, i - 1)))) {
+                    let e = word_end(t, i);
+                    if (len(lp) > 0 && b0 != f0 && b0 != f1) {
+                        i = e;
+                        continue;
+                    }
+                    let w = t.substring(i, e - i);
+                    if (e - i > 2 && w != prefix && !(y == cy && i == a) && w.lower().starts_with(lp) && !is_digit_b(ubyte(w, 0))) {
+                        let kind = 5;
+                        if (e < len(t) && t[e] == '(') { kind = 4; }
+                        comp_add(w, kind);
+                    }
+                    i = e;
+                } else {
+                    i++;
+                }
+            }
+            y++;
+        }
+    }
+    if (len(comp_items) == 0) {
+        comp_open = false;
+        return;
+    }
+    // shortest first, then alphabetical, with exact-case prefix matches ahead
+    let order: []string;
+    for (i, len(comp_items)) {
+        let w: string = comp_items[i];
+        let rank = w.starts_with(prefix) ? 0 : 1;
+        order.push(f"{rank}{len(w):03}{w}\x01{comp_kinds[i]}");
+    }
+    order.sort();
+    comp_items.clear();
+    comp_kinds.clear();
+    for (o in order) {
+        let sep = o.index_of("\x01");
+        comp_items.push(o.substring(4, sep - 4));
+        comp_kinds.push((int)o.substring(sep + 1, -1));
+    }
+    comp_open = true;
+    comp_sel = 0;
+    comp_top = 0;
+}
+
+fn update_completion_any() {
+    update_completion(true);
+}
+
+fn comp_accept() {
+    if (!comp_open || comp_sel >= len(comp_items)) { return; }
+    let w: string = comp_items[comp_sel];
+    let s: string = L[cy];
+    let a = cx;
+    while (a > 0 && is_word_b(ubyte(s, a - 1))) { a--; }
+    let b = cx;
+    while (b < len(s) && is_word_b(ubyte(s, b))) { b++; }
+    begin_edit("complete");
+    L[cy] = s.substring(0, a) + w + s.substring(b, -1);
+    cx = a + len(w);
+    ax = cx;
+    ay = cy;
+    end_edit(cy);
+    comp_open = false;
+    last_edit_kind = "";
+}
+
+fn comp_key(vk: int, mods: int): bool {
+    let n = len(comp_items);
+    if (vk == K_DOWN) {
+        comp_sel = (comp_sel + 1) % n;
+    } else if (vk == K_UP) {
+        comp_sel = (comp_sel + n - 1) % n;
+    } else if (vk == K_PGDN) {
+        comp_sel = imin(n - 1, comp_sel + 8);
+    } else if (vk == K_PGUP) {
+        comp_sel = imax(0, comp_sel - 8);
+    } else if (vk == K_ENTER || vk == K_TAB) {
+        comp_accept();
+    } else if (vk == K_ESC) {
+        comp_open = false;
+    } else {
+        return false;
+    }
+    frame_dirty = true;
+    return true;
+}
+
+fn comp_color(kind: int): int {
+    if (kind == 1) { return S_KEYWORD; }
+    if (kind == 2) { return S_TYPE; }
+    if (kind == 3) { return S_TYPE; }
+    if (kind == 4 || kind == 6) { return 0xB180D7; }
+    return S_VAR;
+}
+
+fn comp_icon(kind: int): string {
+    if (kind == 1) { return "k"; }
+    if (kind == 2) { return "T"; }
+    if (kind == 3) { return "{}"; }
+    if (kind == 4 || kind == 6) { return ""; }
+    return "ab";
+}
+
+fn draw_completion() {
+    if (!comp_open || !is_file_tab()) { return; }
+    let n = len(comp_items);
+    let rows = imin(n, 12);
+    let rh = px(22);
+    let w = px(360);
+    let h = rows * rh + 2;
+    let x = text_x + vcol(L[cy], cx - len(comp_prefix)) * CW - sx - px(24);
+    let y = ed_y + (cy + 1) * LH - sy + px(2);
+    if (y + h > ed_y + ed_h && y - LH - h - px(4) > ed_y) { y = y - LH - h - px(4); }
+    x = clamp(x, ed_x, win_w - w - px(4));
+    if (comp_sel < comp_top) { comp_top = comp_sel; }
+    if (comp_sel >= comp_top + rows) { comp_top = comp_sel - rows + 1; }
+    fill(x, y, w, h, 0x202020);
+    outline(x, y, w, h, 0x454545);
+    for (r, rows) {
+        let i = comp_top + r;
+        let ry = y + 1 + r * rh;
+        if (i == comp_sel) {
+            fill(x + 1, ry, w - 2, rh, 0x04395E);
+            outline(x + 1, ry, w - 2, rh, C_ACCENT);
+        }
+        let kind: int = comp_kinds[i];
+        let icon = comp_icon(kind);
+        if (len(icon) == 0) {
+            draw_glyph("symbol", x + px(5), ry + (rh - px(16)) / 2, px(16), comp_color(kind));
+        } else {
+            txt_v(x + px(8), ry, rh, icon, comp_color(kind), UI_SMALL);
+        }
+        let word: string = comp_items[i];
+        let pl = len(comp_prefix);
+        let tx = x + px(30);
+        if (pl > 0 && pl <= len(word) && word.substring(0, pl).lower() == comp_prefix.lower()) {
+            let wa = txt_v(tx, ry, rh, word.substring(0, pl), 0x2AAAFF, UI);
+            txt_v(tx + wa, ry, rh, word.substring(pl, -1), C_TEXT, UI);
+        } else {
+            txt_v(tx, ry, rh, word, C_TEXT, UI);
+        }
+        if (i == comp_sel) {
+            let d = "";
+            if (kind == 1) { d = "keyword"; }
+            if (kind == 2) { d = "type"; }
+            if (kind == 3) { d = "module"; }
+            if (kind == 4) { d = "function"; }
+            if (kind == 6) { d = "method"; }
+            let dw = tw(d, UI_SMALL);
+            txt_v(x + w - dw - px(10), ry, rh, d, C_MUTED, UI_SMALL);
+        }
+    }
+    comp_box_x = x;
+    comp_box_y = y;
+    comp_box_w = w;
+    comp_box_h = h;
+}
+
+fn comp_click(x: int, y: int): bool {
+    if (!comp_open || !inside(x, y, comp_box_x, comp_box_y, comp_box_w, comp_box_h)) { return false; }
+    let r = (y - comp_box_y - 1) / px(22);
+    comp_sel = clamp(comp_top + r, 0, len(comp_items) - 1);
+    comp_accept();
+    return true;
+}
+
+// ---- find and replace ---------------------------------------------------------------------------------
+
+fn find_key(): string {
+    return f"{doc_ver}|{find_case}|{find_word}|{fld_text[FLD_FIND]}|{active}";
+}
+
+fn find_update() {
+    let key = find_key();
+    if (key == find_hits_key) { return; }
+    find_hits_key = key;
+    find_hits_y.clear();
+    find_hits_x.clear();
+    let pat: string = fld_text[FLD_FIND];
+    if (len(pat) == 0 || !is_file_tab()) { return; }
+    let p = find_case ? pat : pat.lower();
+    for (y, len(L)) {
+        let s: string = L[y];
+        if (!find_case) { s = s.lower(); }
+        let at = s.index_of(p);
+        while (at >= 0 && len(find_hits_y) < 20000) {
+            let ok = true;
+            if (find_word) { ok = !is_word_at(s, at - 1) && !is_word_at(s, at + len(p)); }
+            if (ok) {
+                find_hits_y.push(y);
+                find_hits_x.push(at);
+            }
+            at = s.index_of(p, at + imax(1, len(p)));
+        }
+    }
+}
+
+// Index of the hit at or after (y, x) (dir 1) or before it (dir -1).
+fn find_pick(y: int, x: int, dir: int): int {
+    let n = len(find_hits_y);
+    if (n == 0) { return -1; }
+    if (dir > 0) {
+        for (i, n) {
+            if (find_hits_y[i] > y || (find_hits_y[i] == y && find_hits_x[i] >= x)) { return i; }
+        }
+        return 0;
+    }
+    let i = n - 1;
+    while (i >= 0) {
+        if (find_hits_y[i] < y || (find_hits_y[i] == y && find_hits_x[i] < x)) { return i; }
+        i--;
+    }
+    return n - 1;
+}
+
+fn find_next(dir: int) {
+    find_update();
+    let n = len(find_hits_y);
+    if (n == 0) { return; }
+    sel_bounds();
+    let i = 0;
+    if (dir > 0) {
+        i = find_pick(sel_y2, has_sel() ? sel_x2 : cx, 1);
+    } else {
+        i = find_pick(sel_y1, sel_x1, -1);
+    }
+    select_hit(i);
+}
+
+fn select_hit(i: int) {
+    let plen = len(fld_text[FLD_FIND]);
+    let hy: int = find_hits_y[i];
+    let hx: int = find_hits_x[i];
+    ay = hy;
+    ax = hx;
+    cy = hy;
+    cx = hx + plen;
+    find_cur = i;
+    reveal(true);
+    frame_dirty = true;
+}
+
+// The hit the selection is on, or -1.
+fn current_hit(): int {
+    if (!has_sel()) { return -1; }
+    sel_bounds();
+    if (sel_y1 != sel_y2) { return -1; }
+    for (i, len(find_hits_y)) {
+        if (find_hits_y[i] == sel_y1 && find_hits_x[i] == sel_x1 && sel_x2 - sel_x1 == len(fld_text[FLD_FIND])) { return i; }
+    }
+    return -1;
+}
+
+fn replace_one() {
+    find_update();
+    let i = current_hit();
+    if (i < 0) {
+        find_next(1);
+        return;
+    }
+    let rep: string = fld_text[FLD_REPLACE];
+    edit_insert(rep, "replace");
+    find_update();
+    find_next(1);
+}
+
+fn replace_all() {
+    find_update();
+    let n = len(find_hits_y);
+    if (n == 0) { return; }
+    let plen = len(fld_text[FLD_FIND]);
+    let rep: string = fld_text[FLD_REPLACE];
+    begin_edit("replace-all");
+    // right to left so earlier offsets stay valid
+    let i = n - 1;
+    while (i >= 0) {
+        let y: int = find_hits_y[i];
+        let x: int = find_hits_x[i];
+        let s: string = L[y];
+        L[y] = s.substring(0, x) + rep + s.substring(x + plen, -1);
+        i--;
+    }
+    clamp_cursor();
+    ay = cy;
+    ax = cx;
+    end_edit(0);
+    flash(f"Replaced {n} occurrence{n == 1 ? "" : "s"}");
+}
+
+fn open_find(replace: bool) {
+    if (!is_file_tab()) { return; }
+    find_open = true;
+    find_replace = replace || find_replace && find_open;
+    if (!replace) { find_replace = false; }
+    let t = sel_text();
+    if (len(t) > 0 && !t.contains("\n")) {
+        fld_set(FLD_FIND, t);
+    } else if (!has_sel()) {
+        let w = word_at(cy, cx);
+        if (len(w) > 0 && len(fld_text[FLD_FIND]) == 0) { fld_set(FLD_FIND, w); }
+    }
+    fld_select_all(FLD_FIND);
+    focus = F_FIND;
+    if (replace) {
+        find_replace = true;
+    }
+    frame_dirty = true;
+}
+
+// Geometry of the find widget, shared by drawing and clicks.
+
+fn find_layout() {
+    fw_w = imin(px(440), ed_w - px(40));
+    fw_h = find_replace ? px(66) : px(36);
+    fw_x = ed_x + ed_w - fw_w - SCROLL_W - px(6);
+    fw_y = ed_y;
+}
+
+fn draw_find() {
+    if (!find_open || !is_file_tab()) { return; }
+    find_update();
+    find_layout();
+    let x = fw_x;
+    let y = fw_y;
+    fill(x, y, fw_w, fw_h, C_WIDGET);
+    outline(x, y, fw_w, fw_h, 0x454545);
+    fill(x, y, px(3), fw_h, find_replace ? C_ACCENT : 0x454545);
+    // toggle for the replace row
+    let tgx = x + px(6);
+    if (icon_button(tgx, y + px(8), find_replace ? "chevdown" : "chevright", "Toggle Replace")) {
+        find_replace = !find_replace;
+        frame_dirty = true;
+    }
+    let fx = x + px(28);
+    let fwid = fw_w - px(28) - px(170);
+    fld_draw(FLD_FIND, fx, y + px(6), fwid, px(24), focus == F_FIND, "Find");
+    // match case / whole word toggles inside the field
+    let tx = fx + fwid - px(48);
+    if (toggle_box(tx, y + px(8), "Aa", find_case)) {
+        find_case = !find_case;
+    }
+    if (toggle_box(tx + px(24), y + px(8), "ab", find_word)) {
+        find_word = !find_word;
+    }
+    // count
+    let n = len(find_hits_y);
+    let cur = current_hit();
+    let label = "No results";
+    if (n > 0) {
+        label = cur >= 0 ? f"{cur + 1} of {n}" : f"{n} found";
+    }
+    if (len(fld_text[FLD_FIND]) == 0) { label = ""; }
+    let lx = fx + fwid + px(8);
+    txt_v(lx, y + px(6), px(24), label, n == 0 && len(label) > 0 ? C_ERROR : C_TEXT, UI_SMALL);
+    let bx = x + fw_w - px(80);
+    if (icon_button(bx, y + px(8), "up", "Previous Match (Shift+Enter)")) { find_next(-1); }
+    if (icon_button(bx + px(24), y + px(8), "down", "Next Match (Enter)")) { find_next(1); }
+    if (icon_button(bx + px(50), y + px(8), "close", "Close (Escape)")) {
+        find_open = false;
+        focus = F_EDITOR;
+    }
+    if (find_replace) {
+        fld_draw(FLD_REPLACE, fx, y + px(36), fwid, px(24), focus == F_REPLACE, "Replace");
+        if (ui.button(fx + fwid + px(6), y + px(37), px(70), px(22), "Replace", "secondary")) { replace_one(); }
+        if (ui.button(fx + fwid + px(80), y + px(37), px(46), px(22), "All", "secondary")) { replace_all(); }
+    }
+}
+
+// A small square toggle (the find widget's Aa / ab); true when clicked.
+fn toggle_box(x: int, y: int, label: string, on: bool): bool {
+    let s = px(20);
+    let hov = hovered(x, y, s, s);
+    if (on) {
+        fill(x, y, s, s, 0x264F78);
+        outline(x, y, s, s, C_ACCENT);
+    } else if (hov) {
+        fill(x, y, s, s, 0x3A3D41);
+    }
+    let w = tw(label, UI_SMALL);
+    txt_v(x + (s - w) / 2, y, s, label, on ? C_BRIGHT : C_TEXT, UI_SMALL);
+    return clicked_in(x, y, s, s);
+}
+
+// Mouse down in the find widget; true if it was inside it.
+fn find_mouse(x: int, y: int, mods: int): bool {
+    if (!find_open || !is_file_tab()) { return false; }
+    find_layout();
+    if (!inside(x, y, fw_x, fw_y, fw_w, fw_h)) { return false; }
+    let fx = fw_x + px(28);
+    let fwid = fw_w - px(28) - px(170);
+    if (inside(x, y, fx, fw_y + px(6), fwid - px(50), px(24))) {
+        focus = F_FIND;
+        fld_click(FLD_FIND, x - fx - px(6), (mods & M_SHIFT) != 0);
+    } else if (find_replace && inside(x, y, fx, fw_y + px(36), fwid, px(24))) {
+        focus = F_REPLACE;
+        fld_click(FLD_REPLACE, x - fx - px(6), (mods & M_SHIFT) != 0);
+    }
+    return true;
+}
+
+fn find_field_key(vk: int, mods: int) {
+    let id = focus == F_REPLACE ? FLD_REPLACE : FLD_FIND;
+    if (vk == K_ENTER) {
+        if (id == FLD_REPLACE) {
+            if ((mods & M_CTRL) != 0) { replace_all(); } else { replace_one(); }
+        } else {
+            find_next((mods & M_SHIFT) != 0 ? -1 : 1);
+        }
+        return;
+    }
+    if (vk == K_ESC) {
+        find_open = false;
+        focus = F_EDITOR;
+        return;
+    }
+    if (vk == K_TAB) {
+        if (find_replace) { focus = focus == F_FIND ? F_REPLACE : F_FIND; }
+        return;
+    }
+    if (vk == K_F3) {
+        find_next((mods & M_SHIFT) != 0 ? -1 : 1);
+        return;
+    }
+    let r = fld_key(id, vk, mods);
+    if (r == 2 && id == FLD_FIND) { find_as_you_type(); }
+}
+
+fn find_as_you_type() {
+    find_update();
+    if (len(find_hits_y) == 0) { return; }
+    sel_bounds();
+    let i = find_pick(sel_y1, sel_x1, 1);
+    select_hit(i);
+}
+
+// ---- drawing -----------------------------------------------------------------------------------------------
+
+fn digits(n: int): int {
+    let d = 1;
+    let v = n;
+    while (v >= 10) {
+        v /= 10;
+        d++;
+    }
+    return d;
+}
+
+// Problems for the open file: line number -> is error.
+
+fn collect_doc_diags() {
+    doc_diag_lines.clear();
+    doc_diag_err.clear();
+    doc_diag_msg.clear();
+    if (len(doc_path) == 0) { return; }
+    for (i, len(prob_file)) {
+        if (same_path(prob_file[i], doc_path)) {
+            doc_diag_lines.push(prob_line[i] - 1);
+            doc_diag_err.push(prob_err[i]);
+            doc_diag_msg.push(prob_msg[i]);
+        }
+    }
+}
+
+fn draw_squiggle(x1: int, x2: int, y: int, c: int) {
+    let x = x1;
+    let up = true;
+    while (x < x2) {
+        let nx = imin(x + px(3), x2);
+        if (up) {
+            line(x, y + px(2), nx, y, c, 1);
+        } else {
+            line(x, y, nx, y + px(2), c, 1);
+        }
+        up = !up;
+        x = nx;
+    }
+}
+
+fn draw_editor() {
+    fill(ed_x, ed_y, ed_w, ed_h, C_EDITOR);
+    clamp_scroll();
+    let first = sy / LH;
+    let off = sy % LH;
+    let rows = ed_h / LH + 2;
+    let last = imin(len(L), first + rows);
+    hl_ensure(last);
+    sel_bounds();
+    let sel = has_sel();
+    let ty = (LH - ui.text_height(FS)) / 2;
+    let vmin = sx / CW - 1;
+    let vmax = (sx + text_w) / CW + 1;
+    let focused = focus == F_EDITOR || focus == F_FIND || focus == F_REPLACE;
+    collect_doc_diags();
+
+    // the word under the cursor, for its other occurrences
+    let occ = "";
+    if (!sel && doc_lang != L_PLAIN && doc_lang != L_MD) {
+        occ = word_at(cy, cx);
+        if (len(occ) > 0 && is_digit_b(ubyte(occ, 0))) { occ = ""; }
+    } else if (sel && sel_y1 == sel_y2 && sel_x2 - sel_x1 >= 2) {
+        occ = L[sel_y1].substring(sel_x1, sel_x2 - sel_x1);
+        if (occ.trim() != occ) { occ = ""; }
+    }
+    if (find_open) { find_update(); }
+    let hit_i = 0;
+    if (find_open && len(find_hits_y) > 0) {
+        hit_i = find_pick(first, 0, 1);
+        if (find_hits_y[hit_i] < first) { hit_i = len(find_hits_y); }
+    }
+    let cur_hit = find_open ? current_hit() : -1;
+    match_brackets();
+
+    let k = first;
+    while (k < last) {
+        let y = ed_y + (k - first) * LH - off;
+        let s: string = L[k];
+        // current line
+        if (k == cy && !sel) {
+            outline(text_x - gutter_w + px(1), y, ed_w - px(2), LH, C_LINE);
+            fill(text_x - gutter_w + px(1), y + 1, ed_w - px(2), 1, C_LINE);
+            fill(text_x - gutter_w + px(1), y + LH - 2, ed_w - px(2), 1, C_LINE);
+        }
+        // selection
+        if (sel && k >= sel_y1 && k <= sel_y2) {
+            let a = k == sel_y1 ? vcol(s, sel_x1) : 0;
+            let b = k == sel_y2 ? vcol(s, sel_x2) : vlen(s) + 1;
+            fill(text_x + a * CW - sx, y, (b - a) * CW, LH, focused ? C_SELECTION : C_SEL_INACTIVE);
+        }
+        // find hits
+        if (find_open) {
+            let plen = len(fld_text[FLD_FIND]);
+            while (hit_i < len(find_hits_y) && find_hits_y[hit_i] == k) {
+                let hx: int = find_hits_x[hit_i];
+                let a = vcol(s, hx);
+                let b = vcol(s, hx + plen);
+                if (hit_i == cur_hit) {
+                    fill(text_x + a * CW - sx, y, (b - a) * CW, LH, C_FIND_CUR);
+                } else {
+                    fill_a(text_x + a * CW - sx, y, (b - a) * CW, LH, 0xEA5C00, 85);
+                }
+                hit_i++;
+            }
+        } else if (len(occ) > 0) {
+            let at = s.index_of(occ);
+            while (at >= 0) {
+                if (!is_word_at(s, at - 1) && !is_word_at(s, at + len(occ)) && !(sel && k == sel_y1 && at == sel_x1)) {
+                    let a = vcol(s, at);
+                    let b = vcol(s, at + len(occ));
+                    fill_a(text_x + a * CW - sx, y, (b - a) * CW, LH, 0x575757, 150);
+                }
+                at = s.index_of(occ, at + len(occ));
+            }
+        }
+        // indent guides
+        let ind = vcol(s, len(leading_ws(s)));
+        if (is_blank(s)) {
+            // a blank line takes the indent of the next non-blank one
+            let j = k + 1;
+            while (j < len(L) && j < k + 50 && is_blank(L[j])) { j++; }
+            let pk = imax(k - 1, 0);
+            if (j < len(L)) { ind = imin(vcol(L[j], len(leading_ws(L[j]))), vcol(L[pk], len(leading_ws(L[pk]))) + 4); }
+        }
+        let g = 4;
+        while (g < ind + 1 && g <= ind) {
+            let gx = text_x + (g - 4) * CW - sx;
+            if (gx >= text_x) { fill(gx, y, 1, LH, 0x404040); }
+            g += 4;
+        }
+        // bracket pair boxes
+        if (br_my >= 0) {
+            if (k == br_y) { outline(text_x + vcol(s, br_x) * CW - sx, y + 1, CW, LH - 2, 0x888888); }
+            if (k == br_my) { outline(text_x + vcol(s, br_mx) * CW - sx, y + 1, CW, LH - 2, 0x888888); }
+        }
+        // text
+        let cols = hl_line(doc_lang, s, hl_st[k], hl_dl[k]);
+        let v = 0;
+        let j = 0;
+        let n = len(s);
+        let gy = y + ty;
+        while (j < n) {
+            let b = ubyte(s, j);
+            if (b == 9) {
+                let nv = (v / 4 + 1) * 4;
+                if (show_ws && v >= vmin) { txt(text_x + v * CW - sx + CW / 2, gy, "→", 0x3B3B3B, FS); }
+                v = nv;
+                j++;
+                continue;
+            }
+            if (v > vmax) { break; }
+            if (b < 128) {
+                if (v >= vmin) {
+                    if (b > 32) {
+                        let c: int = cols[j];
+                        ui.text(text_x + v * CW - sx + glyph_off[b], gy, glyph_s[b], FS, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+                    } else if (b == 32 && show_ws) {
+                        fill(text_x + v * CW - sx + CW / 2, y + LH / 2, px(2), px(2), 0x3B3B3B);
+                    }
+                }
+                j++;
+            } else {
+                let cl = cp_len(s, j);
+                if (v >= vmin) {
+                    let ch = s.substring(j, cl);
+                    let c: int = cols[j];
+                    let w = tw(ch, FS);
+                    ui.text(text_x + v * CW - sx + (CW - w) / 2, gy, ch, FS, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+                }
+                j += cl;
+            }
+            v++;
+        }
+        // squiggles
+        for (d, len(doc_diag_lines)) {
+            if (doc_diag_lines[d] == k) {
+                let a = vcol(s, len(leading_ws(s)));
+                let b = imax(a + 2, vlen(s));
+                draw_squiggle(text_x + a * CW - sx, text_x + b * CW - sx, y + LH - px(4), doc_diag_err[d] ? C_ERROR : C_WARNING);
+            }
+        }
+        k++;
+    }
+    // caret
+    if (focused && is_file_tab() && caret_on()) {
+        let cyp = ed_y + cy * LH - sy;
+        let cxp = text_x + vcol(L[cy], cx) * CW - sx;
+        if (cyp + LH > ed_y && cyp < ed_y + ed_h && cxp >= text_x) {
+            fill(cxp, cyp, px(2), LH, 0xAEAFAD);
+        }
+    }
+    draw_gutter(first, last, off);
+    draw_scrollbar();
+    draw_find();
+    draw_hover_diag();
+}
+
+fn draw_gutter(first: int, last: int, off: int) {
+    let gx = text_x - gutter_w;
+    fill(gx, ed_y, gutter_w, ed_h, C_EDITOR);
+    let nw = digits(len(L)) * CW;
+    let ty = (LH - ui.text_height(FS)) / 2;
+    let k = first;
+    while (k < last) {
+        let y = ed_y + (k - first) * LH - off;
+        let label = (string)(k + 1);
+        let w = len(label) * CW;
+        let active_line = k == cy;
+        let c = active_line ? 0xCCCCCC : C_DIM;
+        let x = gx + px(18) + nw - w;
+        for (i, len(label)) {
+            let b = ubyte(label, i);
+            ui.text(x + i * CW + glyph_off[b], y + ty, glyph_s[b], FS, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+        }
+        for (d, len(doc_diag_lines)) {
+            if (doc_diag_lines[d] == k) {
+                disc(gx + px(8), y + LH / 2, px(4), doc_diag_err[d] ? C_ERROR : C_WARNING);
+            }
+        }
+        k++;
+    }
+}
+
+fn draw_scrollbar() {
+    let x = ed_x + ed_w - SCROLL_W;
+    let h = code_h();
+    fill(x, ed_y, 1, h, 0x2B2B2B);
+    let total = len(L) * LH + h;
+    // overview ruler: errors, find hits, cursor
+    let scale_h = imax(h, 1);
+    for (d, len(doc_diag_lines)) {
+        let my_ = ed_y + doc_diag_lines[d] * scale_h / imax(len(L), 1);
+        fill(x + SCROLL_W / 2, my_, SCROLL_W / 2, px(3), doc_diag_err[d] ? C_ERROR : C_WARNING);
+    }
+    if (find_open) {
+        let step = imax(1, len(find_hits_y) / 400);
+        let i = 0;
+        while (i < len(find_hits_y)) {
+            let hy = ed_y + find_hits_y[i] * scale_h / imax(len(L), 1);
+            fill(x + px(3), hy, SCROLL_W / 2, px(2), 0xD18616);
+            i += step;
+        }
+    }
+    let cyy = ed_y + cy * scale_h / imax(len(L), 1);
+    fill(x + 1, cyy, SCROLL_W - 1, px(2), 0xA0A0A0);
+    if (total <= h + LH) { return; }
+    let th = imax(px(20), h * h / total);
+    let tyy = ed_y + (h - th) * sy / imax(max_sy(), 1);
+    let hov = hovered(x, ed_y, SCROLL_W, h) || drag == 4;
+    fill_a(x + 1, tyy, SCROLL_W - 1, th, 0x797979, hov ? 130 : 80);
+}
+
+// Shows the problem message when the mouse rests on a squiggled line.
+fn draw_hover_diag() {
+    if (drag != 0 || !hovered(ed_x, ed_y, ed_w - SCROLL_W, ed_h) || len(doc_diag_lines) == 0) { return; }
+    let k = (my - ed_y + sy) / LH;
+    for (d, len(doc_diag_lines)) {
+        if (doc_diag_lines[d] == k) {
+            let msg: string = doc_diag_msg[d];
+            let w = imin(tw(msg, UI) + px(20), px(640));
+            let x = clamp(mx, ed_x, win_w - w - px(8));
+            let y = ed_y + (k + 1) * LH - sy + px(2);
+            fill(x, y, w, px(28), 0x252526);
+            outline(x, y, w, px(28), 0x454545);
+            txt_v(x + px(10), y, px(28), fit(msg, w - px(20), UI), doc_diag_err[d] ? 0xF48771 : 0xCCA700, UI);
+            return;
+        }
+    }
+}

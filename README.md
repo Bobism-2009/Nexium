@@ -1,59 +1,69 @@
 # Nexium
 
-A lightweight native Windows IDE for the [Nexa](https://github.com/Bobism-2009/Nexa-Lang) programming language, built with Dear ImGui and Direct3D 11. It includes a code editor, file explorer, integrated terminal, live diagnostics and an AI coding agent.
+A lightweight native Windows IDE for the [Nexa](https://github.com/Bobism-2009/Nexa-Lang) programming language, written in Nexa itself. Its interface is drawn with Nexa's `std/ui` module, and the C++ that NexaC generates from it is kept in [`transpiled/`](transpiled/) so you can read exactly what gets compiled.
 
 ## Features
 
 **Editor**
-- Syntax highlighting for Nexa, plus C/C++, JSON, Markdown, shell/batch/PowerShell/Makefile and INI/TOML/YAML
-- Nexa-aware highlighting: f-string interpolation, enum members, struct fields, `inline_cpp!` bodies as C++, and invalid escapes or literals shown in red
-- Rainbow brackets, matching-bracket highlight, highlighting of other uses of the word under the caret, and indent guides
-- Live diagnostics from the Nexa parser, with error squiggles, hover messages and markers in the scrollbar
-- Completion for keywords, types, `std/` modules and their functions, and symbols in the file
-- Go to definition (F12 or Ctrl+click), a symbol outline and a breadcrumb bar
+- Syntax highlighting for Nexa, plus C/C++, JSON, Markdown (with highlighted code fences), shell/batch/PowerShell/Makefile and INI/TOML/YAML
+- Nexa-aware highlighting: f-string interpolation, escapes, enum variants, module calls, `#include <std/...>` names checked against the real module list, and invalid escapes or literals shown in red
+- Rainbow brackets, matching-bracket boxes, highlighting of other uses of the word under the caret, and indent guides
+- Problems from the Nexa compiler as you save: squiggles, gutter markers, hover messages and marks in the scrollbar
+- Completion for keywords, types, `std/` module functions and words in the file
+- Go to definition (F12 or Ctrl+click), across the open folder's `.nxa` files
 - Find and replace with match-case and whole-word options
 - Line editing: move, copy, duplicate, delete, comment, and indent or outdent
-- Undo that treats multi-line edits as one step, and keeps each file's original line endings (CRLF or LF)
+- Auto-closing brackets and quotes, smart indentation, and undo that groups typing
+- Keeps each file's line endings (CRLF or LF)
 
 **Workspace**
-- File explorer, workspace search and a Problems panel
+- File explorer with new file/folder, rename and delete, workspace search and a Problems panel
 - Quick open (Ctrl+P): fuzzy file search; type `>` for commands, `@` for symbols, `:` for a line number
-- Integrated terminal (ConPTY), and Run/Build through the Nexa compiler
-
-**AI agent**
-- Chat and Agent modes, with support for OpenAI, Anthropic, OpenRouter, Groq, Ollama or any OpenAI-compatible endpoint
-- The agent can read, edit and search files, and run commands and Nexa builds in the open folder. Its edits to open files can be undone.
+- Menus and a command palette covering every command
+- Integrated terminal (cmd.exe), and Build/Run through NexaC with the output in the panel
+- Reopens your folder and files, and reloads files changed on disk
 
 ## Requirements
 
 - Windows 10 or 11
-- A MinGW-w64 toolchain (g++ with C++17, `mingw32-make`, `windres`)
-- The [Nexa-Lang](https://github.com/Bobism-2009/Nexa-Lang) sources. Nexium uses Nexa's lexer and parser headers for diagnostics.
-- The Nexa compiler (`Nexa`, `NexaC` or `nexac`) on `PATH`, to run and build programs
+- [NexaC](https://github.com/Bobism-2009/Nexa-Lang) 0.1.15 or newer (for `std/ui`) with the C++ compiler it uses
+- `windres` (from MinGW-w64 or llvm-mingw) for the icon, and `mingw32-make`
+
+To run and build programs from inside Nexium, the Nexa compiler (`NexaC`, `Nexa` or `nexac`) must be on `PATH`, or set in Settings.
 
 ## Building
 
 ```sh
-mingw32-make NEXA_LANG=D:/Projects/Nexa-Lang
+mingw32-make
+# or, if the NexaC on PATH is older than 0.1.15:
+mingw32-make NEXAC=path/to/NexaC.exe
 ```
 
-`NEXA_LANG` points at your Nexa-Lang checkout; the build uses its `include/` folder. The result is `Nexium.exe` in the repository root.
+This builds `Nexium.exe` from `nexium/main.nxa` and writes the generated C++ to `transpiled/nexium.cpp`. Nexium.exe links the C++ runtime statically, so it runs on its own with no DLLs. `mingw32-make transpiled` regenerates only the C++.
+
+The transpiled file also builds without NexaC, with an llvm-mingw or MinGW-w64 compiler:
+
+```sh
+windres -I res -O coff -o res/nexium_res.o res/nexium.rc
+clang++ -std=c++17 -O2 transpiled/nexium.cpp res/nexium_res.o -o Nexium.exe -static -mwindows -luser32 -lole32 -lshell32 -lgdi32 -lwindowscodecs -lcomdlg32 -lwinmm
+```
 
 ### Installer
 
-`NexiumSetup.exe` is a single-file graphical installer written in Nexa (`installer/setup.nxa`). Build it with:
+`NexiumSetup.exe` is a single-file graphical installer, also written in Nexa (`installer/setup.nxa`) and drawn with `std/ui`. Build it with:
 
 ```sh
-mingw32-make installer
+mingw32-make installer NEXAC=path/to/NexaC.exe
 ```
 
-This compiles the setup with NexaC and uses `installer/pack.nxa` to append `Nexium.exe`, the MinGW runtime DLLs it needs (`libstdc++-6.dll`, `libgcc_s_seh-1.dll` and the thread runtime), its icon, the README and the license to the setup executable. Only `Nexium.exe` and `NexiumSetup.exe` are left afterwards. Set `MINGW_BIN` if the runtime DLLs are not in your compiler's `bin` folder.
+This compiles the setup with NexaC and uses `installer/pack.nxa` to append `Nexium.exe`, its icon, the README and the license to the setup executable. Only `Nexium.exe` and `NexiumSetup.exe` are left afterwards.
 
 The installer can:
 - install for the current user (no admin rights needed) or for all users (asks for administrator permission)
 - create Start menu and desktop shortcuts, open `.nxa` files with Nexium, and add Nexium to PATH
 - if the Nexa compiler is not installed, offer to download the latest NexaC release and run its installer
 - register Nexium in Apps & features, with an uninstaller that reverses all of this and restores the previous `.nxa` handler
+- update an existing install in place
 
 For unattended installs:
 
@@ -62,17 +72,16 @@ NexiumSetup.exe --silent [--scope User|Machine] [--dir <path>] [--desktop 0|1] [
 "<install dir>\Uninstall.exe" --uninstall --silent
 ```
 
-You can open files or a folder from the command line:
+You can open a file or a folder from the command line:
 
 ```sh
 Nexium.exe path\to\main.nxa
+Nexium.exe path\to\project
 ```
 
 ## Configuration
 
-Settings are stored in `%APPDATA%\Nexium\settings.json`, including the open folder, panel layout, compiler name and agent provider.
-
-The agent reads API keys from the Settings panel. If none is set there, it falls back to these environment variables: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY` or `GROQ_API_KEY`.
+Settings are stored in `%APPDATA%\Nexium\settings.json`: the open folder and files, recent folders, panel layout, font size, the compiler and run arguments. Open them from the gear in the activity bar (Ctrl+,).
 
 ## Keyboard shortcuts
 
@@ -82,6 +91,7 @@ The agent reads API keys from the Settings panel. If none is set there, it falls
 | Go to symbol / line | Ctrl+Shift+O / Ctrl+G |
 | Go to definition | F12, Ctrl+click |
 | Find / replace | Ctrl+F / Ctrl+H, F3 / Shift+F3 |
+| Find in files | Ctrl+Shift+F |
 | Toggle line comment | Ctrl+/ |
 | Move / copy line | Alt+Up/Down, Shift+Alt+Up/Down |
 | Duplicate / delete line | Ctrl+D / Ctrl+Shift+K |
@@ -89,28 +99,34 @@ The agent reads API keys from the Settings panel. If none is set there, it falls
 | Trigger suggestions | Ctrl+Space |
 | Jump to matching bracket | Ctrl+Shift+\ |
 | Save / save all | Ctrl+S / Ctrl+K S |
+| Open folder | Ctrl+K Ctrl+O |
 | Switch tabs | Ctrl+Tab, Ctrl+PageUp/PageDown |
-| Run / build / stop | F5 / Ctrl+Alt+B / Shift+F5 |
-| Toggle sidebar / panel / agent | Ctrl+B / Ctrl+J / Ctrl+Shift+L |
-| Problems / terminal | Ctrl+Shift+M / Ctrl+` |
+| Build and run / build / stop | F5 / Ctrl+Shift+B / Shift+F5 |
+| Toggle sidebar / panel | Ctrl+B / Ctrl+J |
+| Problems / output / terminal | Ctrl+Shift+M / Ctrl+Shift+U / Ctrl+` |
+| Font size | Ctrl+= / Ctrl+- / Ctrl+0 |
 
 ## Project layout
 
 ```
-src/
-  main.cpp        Window, Direct3D 11 setup, fonts, main loop
-  ide.cpp         Layout, title bar and menus, tabs, status bar, quick open, shortcuts
-  editor.cpp      Text buffer, undo, editing commands, editor rendering, find
-  highlight.cpp   Syntax highlighters, Nexa outline, diagnostics, completion
-  workspace.cpp   Explorer, search, outline and problems views
-  terminal.cpp    ConPTY terminal, VT screen buffer, run/build
-  agent.cpp       AI agent: providers, streaming, tools
-  util.cpp        Paths, file IO, JSON, settings, HTTP
+nexium/
+  main.nxa        Entry point: main loop, input routing, shortcuts, settings
+  state.nxa       Every global, in one place (NexaC emits globals in file order)
+  draw.nxa        Drawing helpers over std/gfx and std/ui, and line icons
+  text.nxa        UTF-8 helpers, visual columns, one-line text fields
+  highlight.nxa   Syntax highlighters and the word tables behind completion
+  buffer.nxa      Documents: open, save, tabs, undo, editing primitives
+  editor.nxa      The code editor: keys, mouse, find, completion, drawing
+  workspace.nxa   Explorer, workspace search, quick open
+  commands.nxa    The command table, menus, build and run
+  panel.nxa       PROBLEMS, OUTPUT and TERMINAL
+  chrome.nxa      Layout, title bar, activity bar, tabs, status bar, welcome and settings pages
+  native.hpp      The Win32 pieces Nexa's library does not cover yet (key repeat, cursors, dialogs, child processes)
+transpiled/       The C++ NexaC generates from nexium/ (regenerated by make)
 installer/        Nexa setup wizard (setup.nxa) and payload packer (pack.nxa)
 res/              Icon and resource script
-third_party/      Dear ImGui
 ```
 
 ## License
 
-Nexium is released under the MIT License; see [LICENSE](LICENSE). Dear ImGui is also MIT-licensed (see `third_party/imgui/LICENSE.txt`).
+Nexium is released under the MIT License; see [LICENSE](LICENSE). Programs built with `std/ui`, Nexium included, contain the Inter typeface (SIL Open Font License 1.1) and stb_truetype (public domain); their notices travel in the generated source.
