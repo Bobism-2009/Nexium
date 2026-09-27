@@ -359,6 +359,17 @@ fn fld_draw(id: int, x: int, y: int, w: int, h: int, focused: bool, placeholder:
     fill(x, y, w, h, C_INPUT);
     outline(x, y, w, h, focused ? C_ACCENT : C_INPUT_BORDER);
     let t: string = fld_text[id];
+    if (id == FLD_KEY) {
+        // a secret: dots, with the caret at the end
+        let dots = "•".repeat(imin(len(t), 60));
+        if (len(t) == 0) {
+            txt(x + px(6), y + (h - ui.text_height(UI)) / 2, placeholder, C_DIM, UI);
+        } else {
+            txt(x + px(6), y + (h - ui.text_height(UI)) / 2, dots, C_TEXT, UI);
+        }
+        if (focused && caret_on()) { fill(x + px(6) + tw(dots, UI), y + px(4), 1, h - px(8), C_TEXT); }
+        return;
+    }
     let pad = px(6);
     let inner = w - pad * 2;
     let cxp = tw(t.substring(0, fld_caret[id]), UI);

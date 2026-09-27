@@ -22,7 +22,7 @@
 #include <std/file>
 #include <std/ui>
 
-let VERSION = "2.0.0";
+let VERSION = "2.1.0";
 let NEXA_URL = "https://github.com/Bobism-2009/Nexa-Lang/releases";
 
 let W = 860;

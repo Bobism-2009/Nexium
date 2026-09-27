@@ -623,3 +623,6 @@ static int nx_confirm(const std::string& msg) {
     nx__events.clear();
     return r == IDOK ? 1 : 0;
 }
+
+#include "native_text.hpp"
+#include "native_http.hpp"

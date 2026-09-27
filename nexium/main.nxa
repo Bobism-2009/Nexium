@@ -17,6 +17,7 @@
 #include "workspace.nxa"
 #include "commands.nxa"
 #include "panel.nxa"
+#include "agent.nxa"
 #include "chrome.nxa"
 
 // ---- settings --------------------------------------------------------------------------------------
@@ -53,6 +54,26 @@ fn load_settings() {
         let r: Json = j.get("recent");
         for (i, r.len()) { recent.push(r.get(i).as_string()); }
     }
+    if (j.has("font_family") && len(j.get("font_family").as_string()) > 0) { font_family = j.get("font_family").as_string(); }
+    if (j.has("minimap")) { show_minimap = j.get("minimap").as_bool(); }
+    if (j.has("show_agent")) { show_agent = j.get("show_agent").as_bool(); }
+    if (j.has("agent_w")) { agent_w = j.get("agent_w").as_int(); }
+    if (j.has("nexa_lang")) { nexa_lang = j.get("nexa_lang").as_string(); }
+    if (j.has("provider")) { ag_provider = j.get("provider").as_string(); }
+    if (!provider_ids().contains(ag_provider)) { ag_provider = "openai"; }
+    if (j.has("mode")) { ag_mode = j.get("mode").as_string() == "chat" ? "chat" : "agent"; }
+    if (j.has("temperature")) { ag_temp = j.get("temperature").as_float(); }
+    if (j.has("providers") && j.get("providers").is_object()) {
+        let ps: Json = j.get("providers");
+        for (id in provider_ids()) {
+            if (!ps.has(id)) { continue; }
+            let slot: Json = ps.get(id);
+            if (slot.has("api_key")) { ag_keys[id] = slot.get("api_key").as_string(); }
+            if (slot.has("base_url")) { ag_urls[id] = slot.get("base_url").as_string(); }
+            if (slot.has("model")) { ag_models[id] = slot.get("model").as_string(); }
+            if (slot.has("custom_model")) { ag_custom[id] = slot.get("custom_model").as_string(); }
+        }
+    }
     if (j.has("open_files")) {
         let r: Json = j.get("open_files");
         for (i, r.len()) { last_files.push(r.get(i).as_string()); }
@@ -79,6 +100,24 @@ fn save_settings() {
     j.set("render_whitespace", json.bool(show_ws));
     j.set("auto_save", json.bool(auto_save));
     j.set("maximized", json.bool(nx_maximized() == 1));
+    j.set("font_family", json.string(font_family));
+    j.set("minimap", json.bool(show_minimap));
+    j.set("show_agent", json.bool(show_agent));
+    j.set("agent_w", json.int((int)(agent_w / SCALE)));
+    j.set("nexa_lang", json.string(nexa_lang));
+    j.set("provider", json.string(ag_provider));
+    j.set("mode", json.string(ag_mode));
+    j.set("temperature", json.float(ag_temp));
+    let ps: Json = json.object();
+    for (id in provider_ids()) {
+        let slot: Json = json.object();
+        slot.set("api_key", json.string(ag_keys.has(id) ? ag_keys[id] : ""));
+        slot.set("base_url", json.string(ag_urls.has(id) ? ag_urls[id] : ""));
+        slot.set("model", json.string(ag_models.has(id) ? ag_models[id] : ""));
+        slot.set("custom_model", json.string(ag_custom.has(id) ? ag_custom[id] : ""));
+        ps.set(id, slot);
+    }
+    j.set("providers", ps);
     if (nx_maximized() == 0 && nx_minimized() == 0) {
         j.set("window_w", json.int((int)(win_w / SCALE)));
         j.set("window_h", json.int((int)(win_h / SCALE)));
@@ -166,6 +205,7 @@ fn global_key(vk: int, m: int): bool {
     if (ctrl && !shift && (vk == 87 || vk == 115)) { run_cmd("file.close"); return true; }
     if (ctrl && vk == K_COMMA) { run_cmd("app.settings"); return true; }
     if (ctrl && !shift && vk == 66) { run_cmd("view.sidebar"); return true; }
+    if (ctrl && shift && vk == 76) { run_cmd("view.agent"); return true; }
     if (ctrl && !shift && vk == 74) { run_cmd("view.panel"); return true; }
     if (ctrl && shift && vk == 77) { run_cmd("view.problems"); return true; }
     if (ctrl && shift && vk == 85) { run_cmd("view.output"); return true; }
@@ -226,6 +266,18 @@ fn on_key(vk: int, m: int) {
         term_key(vk, m);
         return;
     }
+    if (focus == F_AGENT && show_agent) {
+        agent_key(vk, m);
+        return;
+    }
+    if (focus == F_KEY) {
+        if (vk == K_ESC || vk == K_ENTER || vk == K_TAB) {
+            focus = F_NONE;
+            return;
+        }
+        if (fld_key(FLD_KEY, vk, m) == 2) { key_field_changed(); }
+        return;
+    }
     if (focus == F_SEARCH) {
         search_key(vk, m);
         return;
@@ -262,6 +314,15 @@ fn on_char(cp: int) {
     if (focus == F_TERM) {
         fld_char(FLD_TERM, cp);
         term_follow = true;
+        return;
+    }
+    if (focus == F_AGENT && show_agent) {
+        fld_char(FLD_AGENT, cp);
+        return;
+    }
+    if (focus == F_KEY) {
+        fld_char(FLD_KEY, cp);
+        key_field_changed();
         return;
     }
     if (focus == F_SEARCH) {
@@ -302,6 +363,15 @@ fn on_mouse_down(btn: int, x: int, y: int, clicks: int, m: int) {
         if (btn == 0) { activity_mouse(x, y); }
         return;
     }
+    if (show_agent && x >= agent_x() - px(2)) {
+        if (x < agent_x() + px(3)) {
+            drag = 7;
+            drag_off = x - agent_x();
+        } else if (btn == 0) {
+            agent_mouse(x, y, btn);
+        }
+        return;
+    }
     if (show_sidebar && x >= side_x + sidebar_w - px(2) && x < side_x + sidebar_w + px(3)) {
         drag = 1;
         drag_off = x - (side_x + sidebar_w);
@@ -314,7 +384,13 @@ fn on_mouse_down(btn: int, x: int, y: int, clicks: int, m: int) {
             if (rename_mode == 3) { ri = tree_rows.index_of(rename_path); }
             if (ri < 0 || y < tree_row_y(ri) || y >= tree_row_y(ri) + ROW_H) { finish_rename(true); }
         }
-        if (view == 0) { explorer_mouse(x, y, btn, clicks); } else { search_mouse(x, y, m); }
+        if (view == 0) {
+            explorer_mouse(x, y, btn, clicks);
+        } else if (view == 1) {
+            search_mouse(x, y, m);
+        } else {
+            outline_mouse(x, y);
+        }
         return;
     }
     if (show_panel && y >= panel_y - px(2) && y < panel_y + px(3)) {
@@ -331,7 +407,13 @@ fn on_mouse_down(btn: int, x: int, y: int, clicks: int, m: int) {
         return;
     }
     if (!is_file_tab()) {
-        focus = F_NONE;
+        if (active_kind() == 1 && inside(x, y, key_x, key_y, key_w, key_h)) {
+            focus = F_KEY;
+            fld_caret[FLD_KEY] = len(fld_text[FLD_KEY]);
+            fld_anchor[FLD_KEY] = fld_caret[FLD_KEY];
+        } else {
+            focus = F_NONE;
+        }
         return;
     }
     if (y < ed_y) { return; }
@@ -355,7 +437,7 @@ fn on_mouse_up(btn: int, x: int, y: int) {
         up_this_frame = true;
         up_x = x;
         up_y = y;
-        if (drag == 1 || drag == 2) { save_settings(); }
+        if (drag == 1 || drag == 2 || drag == 7) { save_settings(); }
         drag = 0;
     }
     frame_dirty = true;
@@ -369,9 +451,15 @@ fn on_wheel(delta: int, x: int, y: int, horizontal: bool) {
         if (n > 0) { quick_sel = clamp(quick_sel - delta / 120, 0, n - 1); }
         return;
     }
+    if (show_agent && x >= agent_x() && y > TOOLBAR_H) {
+        agent_wheel(delta);
+        return;
+    }
     if (show_sidebar && x >= side_x && x < side_x + sidebar_w && y > TOOLBAR_H) {
         if (view == 0) {
             tree_scroll = imax(0, tree_scroll - delta * ROW_H * 3 / 120);
+        } else if (view == 2) {
+            outline_scroll = imax(0, outline_scroll - delta * ROW_H * 3 / 120);
         } else {
             search_scroll = imax(0, search_scroll - delta * ROW_H * 3 / 120);
         }
@@ -427,12 +515,17 @@ fn handle_input() {
         frame_dirty = true;
     } else if (drag == 3 || drag == 4) {
         if (is_file_tab()) { ed_drag(); }
+    } else if (drag == 6) {
+        if (is_file_tab()) { minimap_drag(); }
+    } else if (drag == 7) {
+        agent_w = clamp(win_w - mx + drag_off, px(280), win_w / 2);
+        frame_dirty = true;
     }
 }
 
 fn update_cursor_shape() {
     let c = 0;
-    if (drag == 1) {
+    if (drag == 1 || drag == 7) {
         c = 2;
     } else if (drag == 2) {
         c = 3;
@@ -441,9 +534,13 @@ fn update_cursor_shape() {
     } else if (menu_open < 0 && !quick_open) {
         if (show_sidebar && mx >= side_x + sidebar_w - px(2) && mx < side_x + sidebar_w + px(3) && my > TOOLBAR_H && my < win_h - STATUS_H) {
             c = 2;
+        } else if (show_agent && mx >= agent_x() - px(2) && mx < agent_x() + px(3) && my > TOOLBAR_H && my < win_h - STATUS_H) {
+            c = 2;
+        } else if (show_agent && mx >= agent_x() && inside(mx, my, ag_in_x, ag_in_y, ag_in_w - px(64), ag_in_h)) {
+            c = 1;
         } else if (show_panel && my >= panel_y - px(2) && my < panel_y + px(3) && mx >= main_x) {
             c = 3;
-        } else if (is_file_tab() && mx >= text_x && mx < ed_x + ed_w - SCROLL_W && my >= ed_y && my < ed_y + ed_h) {
+        } else if (is_file_tab() && mx >= text_x && mx < ed_x + ed_w - SCROLL_W - mm_w() && my >= ed_y && my < ed_y + ed_h) {
             c = 1;
             if (find_open) {
                 find_layout();
@@ -474,6 +571,7 @@ fn draw_frame() {
     draw_panel();
     if (len(bufs) > 0) { draw_tabs(); }
     draw_sidebar();
+    draw_agent();
     draw_activity();
     draw_status();
     draw_toolbar();
@@ -516,6 +614,7 @@ fn main(args: []string) {
     load_settings();
     sidebar_w = px(sidebar_w);
     panel_h = px(panel_h);
+    agent_w = px(agent_w);
     let w0 = px(win_w);
     let h0 = px(win_h);
     ui.open("Nexium", w0, h0);
@@ -592,6 +691,7 @@ fn main(args: []string) {
         layout();
         handle_input();
         poll_processes();
+        agent_poll();
         maybe_check();
         let dropped = gfx.drop();
         while (len(dropped) > 0) {
@@ -611,7 +711,7 @@ fn main(args: []string) {
         }
         // idle: wait for input instead of spinning, but wake for the caret
         // blink and for running processes
-        let busy = drag != 0 || task_proc >= 0 || check_proc >= 0 || len(ev_t) > 0;
+        let busy = drag != 0 || task_proc >= 0 || check_proc >= 0 || len(ev_t) > 0 || agent_busy();
         if (!busy) {
             nx_wait(term_proc >= 0 ? 50 : 250);
         } else {
@@ -620,6 +720,7 @@ fn main(args: []string) {
         }
     }
     save_settings();
+    agent_stop();
     if (term_proc >= 0) { nx_proc_free(term_proc); }
     if (task_proc >= 0) { nx_proc_free(task_proc); }
 }

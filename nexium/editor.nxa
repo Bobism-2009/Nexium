@@ -842,8 +842,13 @@ fn ed_mouse_down(x: int, y: int, clicks: int, mods: int) {
     comp_open = false;
     let shift = (mods & M_SHIFT) != 0;
     let ctrl = (mods & M_CTRL) != 0;
-    // scrollbar
+    // minimap and scrollbar
     let sbx = ed_x + ed_w - SCROLL_W;
+    if (mm_w() > 0 && x >= sbx - mm_w() && x < sbx) {
+        drag = 6;
+        minimap_drag();
+        return;
+    }
     if (x >= sbx) {
         let total = len(L) * LH + code_h();
         let th = imax(px(20), code_h() * code_h() / imax(total, 1));
@@ -1474,7 +1479,7 @@ fn open_find(replace: bool) {
 fn find_layout() {
     fw_w = imin(px(440), ed_w - px(40));
     fw_h = find_replace ? px(66) : px(36);
-    fw_x = ed_x + ed_w - fw_w - SCROLL_W - px(6);
+    fw_x = ed_x + ed_w - fw_w - SCROLL_W - mm_w() - px(6);
     fw_y = ed_y;
 }
 
@@ -1638,6 +1643,76 @@ fn draw_squiggle(x1: int, x2: int, y: int, c: int) {
     }
 }
 
+// Width of the minimap beside the scrollbar (0 when it is off).
+fn mm_w(): int {
+    if (show_minimap && is_file_tab() && ed_w > px(500)) { return px(70); }
+    return 0;
+}
+
+// First document line the minimap shows, so the viewport moves through it
+// in step with the scroll position.
+fn mm_first(): int {
+    let rows = ed_h / 2;
+    let max_first = imax(0, len(L) - rows);
+    return max_first * sy / imax(1, max_sy());
+}
+
+fn draw_minimap() {
+    let w = mm_w();
+    if (w == 0) { return; }
+    let x = ed_x + ed_w - SCROLL_W - w;
+    fill(x, ed_y, w, ed_h, C_EDITOR);
+    let first = mm_first();
+    let rows = ed_h / 2;
+    let k = first;
+    while (k < len(L) && k < first + rows) {
+        let s: string = L[k];
+        let y = ed_y + (k - first) * 2;
+        let t = s.trim();
+        let c = 0x5A5A5A;
+        if (t.starts_with("//") || t.starts_with("#") || t.starts_with("/*") || t.starts_with("*")) { c = 0x3F5F37; }
+        if (t.starts_with("fn ") || t.starts_with("struct ") || t.starts_with("enum ")) { c = 0x6F6A8C; }
+        let v = 0;
+        let j = 0;
+        let run = -1;
+        while (j < len(s) && v < w - px(6)) {
+            let b = ubyte(s, j);
+            if (b == 32 || b == 9) {
+                if (run >= 0) {
+                    fill(x + px(4) + run, y, v - run, 1, c);
+                    run = -1;
+                }
+                if (b == 9) { v = (v / 4 + 1) * 4; } else { v++; }
+                j++;
+                continue;
+            }
+            if (run < 0) { run = v; }
+            v++;
+            j = next_i(s, j);
+        }
+        if (run >= 0) { fill(x + px(4) + run, y, v - run, 1, c); }
+        k++;
+    }
+    for (d, len(doc_diag_lines)) {
+        let dl: int = doc_diag_lines[d];
+        if (dl >= first && dl < first + rows) { fill(x, ed_y + (dl - first) * 2, w, 2, doc_diag_err[d] ? 0x7A2A2A : 0x6A5A10); }
+    }
+    // the visible part
+    let vy = ed_y + (sy / LH - first) * 2;
+    let vh = visible_lines() * 2;
+    let hov = hovered(x, ed_y, w, ed_h) || drag == 6;
+    fill_a(x, vy, w, vh, 0xFFFFFF, hov ? 30 : 16);
+    let cyy = ed_y + (cy - first) * 2;
+    if (cy >= first && cy < first + rows) { fill(x, cyy, w, 2, 0x3A5A80); }
+}
+
+// Scrolls so the line under the minimap pointer sits mid-screen.
+fn minimap_drag() {
+    let line_ = mm_first() + (my - ed_y) / 2;
+    sy = clamp((line_ - visible_lines() / 2) * LH, 0, max_sy());
+    frame_dirty = true;
+}
+
 fn draw_editor() {
     fill(ed_x, ed_y, ed_w, ed_h, C_EDITOR);
     clamp_scroll();
@@ -1648,7 +1723,7 @@ fn draw_editor() {
     hl_ensure(last);
     sel_bounds();
     let sel = has_sel();
-    let ty = (LH - ui.text_height(FS)) / 2;
+    let ty = (LH - nx_font_h(CODE_FONT)) / 2;
     let vmin = sx / CW - 1;
     let vmax = (sx + text_w) / CW + 1;
     let focused = focus == F_EDITOR || focus == F_FIND || focus == F_REPLACE;
@@ -1672,6 +1747,7 @@ fn draw_editor() {
     let cur_hit = find_open ? current_hit() : -1;
     match_brackets();
 
+    nx_clip(text_x, ed_y, ed_x + ed_w - SCROLL_W - mm_w(), ed_y + ed_h);
     let k = first;
     while (k < last) {
         let y = ed_y + (k - first) * LH - off;
@@ -1743,7 +1819,7 @@ fn draw_editor() {
             let b = ubyte(s, j);
             if (b == 9) {
                 let nv = (v / 4 + 1) * 4;
-                if (show_ws && v >= vmin) { txt(text_x + v * CW - sx + CW / 2, gy, "→", 0x3B3B3B, FS); }
+                if (show_ws && v >= vmin) { nx_text_cell(CODE_FONT, text_x + v * CW - sx, gy, CW, "→", 0x3B3B3B); }
                 v = nv;
                 j++;
                 continue;
@@ -1753,7 +1829,7 @@ fn draw_editor() {
                 if (v >= vmin) {
                     if (b > 32) {
                         let c: int = cols[j];
-                        ui.text(text_x + v * CW - sx + glyph_off[b], gy, glyph_s[b], FS, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+                        nx_text_cell(CODE_FONT, text_x + v * CW - sx, gy, CW, glyph_s[b], c);
                     } else if (b == 32 && show_ws) {
                         fill(text_x + v * CW - sx + CW / 2, y + LH / 2, px(2), px(2), 0x3B3B3B);
                     }
@@ -1762,10 +1838,8 @@ fn draw_editor() {
             } else {
                 let cl = cp_len(s, j);
                 if (v >= vmin) {
-                    let ch = s.substring(j, cl);
                     let c: int = cols[j];
-                    let w = tw(ch, FS);
-                    ui.text(text_x + v * CW - sx + (CW - w) / 2, gy, ch, FS, (c >> 16) & 255, (c >> 8) & 255, c & 255);
+                    nx_text_cell(CODE_FONT, text_x + v * CW - sx, gy, CW, s.substring(j, cl), c);
                 }
                 j += cl;
             }
@@ -1781,6 +1855,7 @@ fn draw_editor() {
         }
         k++;
     }
+    nx_clip_off();
     // caret
     if (focused && is_file_tab() && caret_on()) {
         let cyp = ed_y + cy * LH - sy;
@@ -1790,6 +1865,7 @@ fn draw_editor() {
         }
     }
     draw_gutter(first, last, off);
+    draw_minimap();
     draw_scrollbar();
     draw_find();
     draw_hover_diag();
@@ -1799,7 +1875,7 @@ fn draw_gutter(first: int, last: int, off: int) {
     let gx = text_x - gutter_w;
     fill(gx, ed_y, gutter_w, ed_h, C_EDITOR);
     let nw = digits(len(L)) * CW;
-    let ty = (LH - ui.text_height(FS)) / 2;
+    let ty = (LH - nx_font_h(CODE_FONT)) / 2;
     let k = first;
     while (k < last) {
         let y = ed_y + (k - first) * LH - off;
@@ -1808,10 +1884,7 @@ fn draw_gutter(first: int, last: int, off: int) {
         let active_line = k == cy;
         let c = active_line ? 0xCCCCCC : C_DIM;
         let x = gx + px(18) + nw - w;
-        for (i, len(label)) {
-            let b = ubyte(label, i);
-            ui.text(x + i * CW + glyph_off[b], y + ty, glyph_s[b], FS, (c >> 16) & 255, (c >> 8) & 255, c & 255);
-        }
+        nx_text(CODE_FONT, x, y + ty, label, c);
         for (d, len(doc_diag_lines)) {
             if (doc_diag_lines[d] == k) {
                 disc(gx + px(8), y + LH / 2, px(4), doc_diag_err[d] ? C_ERROR : C_WARNING);

@@ -4,7 +4,7 @@
 # by hand. Needs NexaC 0.1.15 or newer (std/ui); point NEXAC at it if the one
 # on PATH is older.
 NEXAC ?= NexaC
-SRC    = $(wildcard nexium/*.nxa) nexium/native.hpp
+SRC    = $(wildcard nexium/*.nxa) $(wildcard nexium/*.hpp)
 RES_O  = res/nexium_res.o
 
 all: Nexium.exe transpiled/nexium.cpp

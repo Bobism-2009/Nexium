@@ -144,11 +144,15 @@ fn metrics_init() {
     ROW_H = px(22);
     HEADER_H = px(35);
     SCROLL_W = px(14);
-    LH = ui.text_height(FS) + px(5);
-    // Code is drawn one character per cell so columns line up: the cell is as
-    // wide as a digit, and each glyph is centred in it.
-    CW = (ui.text_width("0000000000", FS) + 5) / 10;
+    // Code uses a real monospaced font, rendered by GDI with ClearType
+    // (native_text.hpp) so it stays sharp at small sizes.
+    nx_font_free_all();
+    CODE_FONT = nx_font(font_family, FS, 0);
+    PANEL_FONT = nx_font(font_family, px(13), 0);
+    CW = nx_font_cw(CODE_FONT);
     if (CW < 4) { CW = 4; }
+    LH = imax(nx_font_h(CODE_FONT) + px(3), FS * 140 / 100);
+    LH_MONO = nx_font_h(PANEL_FONT) + px(4);
     glyph_s.clear();
     for (i, 128) {
         if (i < 33 || i == 127) {
@@ -163,6 +167,24 @@ fn metrics_init() {
             glyph_w[i] = w;
             glyph_off[i] = (CW - w) / 2;
         }
+    }
+}
+
+// A soft shadow along a horizontal edge: below it (down) or above it.
+fn shadow_h(x: int, y: int, w: int, down: bool) {
+    let alphas = [60, 38, 22, 11, 4];
+    for (k, 5) {
+        let yy = down ? y + k : y - 1 - k;
+        fill_a(x, yy, w, 1, 0x000000, alphas[k]);
+    }
+}
+
+// The same along a vertical edge: to its right, or to its left.
+fn shadow_v(x: int, y: int, h: int, right: bool) {
+    let alphas = [4, 11, 22, 38, 60];
+    for (k, 5) {
+        let xx = right ? x + 5 - k : x + k + 1;
+        fill_a(xx, y, 1, h, 0x000000, alphas[k]);
     }
 }
 
@@ -199,7 +221,7 @@ fn draw_glyph(kind: string, x: int, y: int, s: int, c: int) {
         fill(m + px(4), n, 1, px(7), c);
     } else if (kind == "refresh") {
         circle(m, n, px(5), c);
-        fill(m + px(2), n - px(6), px(4), px(4), C_CHROME);
+        fill(m + px(2), n - px(6), px(4), px(4), C_SIDEBAR);
         gfx.fill_tri(m + px(1), n - px(7), m + px(6), n - px(5), m + px(2), n - px(1), (c >> 16) & 255, (c >> 8) & 255, c & 255);
     } else if (kind == "collapse") {
         outline(m - px(6), n - px(6), px(10), px(10), c);
@@ -226,6 +248,18 @@ fn draw_glyph(kind: string, x: int, y: int, s: int, c: int) {
         gfx.fill_tri(m - px(5), n - px(2), m + px(5), n - px(2), m, n + px(1), (c >> 16) & 255, (c >> 8) & 255, c & 255);
         outline(m - px(5), n - px(2), px(11), px(8), c);
         fill(m, n + px(1), 1, px(5), c);
+    } else if (kind == "gear") {
+        gear(m, n, px(7), c);
+    } else if (kind == "outline") {
+        for (k, 3) {
+            fill(m - px(6), n - px(5) + k * px(5), px(2), px(2), c);
+            fill(m - px(2), n - px(5) + k * px(5), px(8), 1, c);
+        }
+    } else if (kind == "agent") {
+        rrect_line(m - px(7), n - px(6), px(14), px(10), px(3), c);
+        gfx.fill_tri(m - px(3), n + px(4), m + px(1), n + px(4), m - px(4), n + px(8), (c >> 16) & 255, (c >> 8) & 255, c & 255);
+        fill(m - px(3), n - px(2), px(2), px(2), c);
+        fill(m + px(2), n - px(2), px(2), px(2), c);
     } else if (kind == "file") {
         outline(m - px(4), n - px(6), px(9), px(12), c);
         fill(m - px(2), n - px(2), px(5), 1, c);

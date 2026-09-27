@@ -1,0 +1,1381 @@
+// The AI agent: chat, or an agent that reads and edits files and runs
+// commands in the open folder. Talks to OpenAI-compatible APIs (OpenAI,
+// OpenRouter, Groq, Ollama, anything custom) and Anthropic's. Requests run on
+// a background thread (nx_http_*); the loop here is a small state machine the
+// frame loop advances.
+
+let const AG_IDLE = 0;
+let const AG_WAIT = 1;       // waiting for the model
+let const AG_TOOLS = 2;      // running the tools it asked for
+let const AG_PROC = 3;       // a run_command is in progress
+
+fn provider_ids(): []string {
+    return ["openai", "anthropic", "openrouter", "groq", "ollama", "custom"];
+}
+
+fn provider_label(id: string): string {
+    switch (id) {
+        case "openai": return "OpenAI";
+        case "anthropic": return "Anthropic";
+        case "openrouter": return "OpenRouter";
+        case "groq": return "Groq";
+        case "ollama": return "Ollama";
+        case "custom": return "Custom";
+        default: break;
+    }
+    return id;
+}
+
+fn provider_url(id: string): string {
+    switch (id) {
+        case "anthropic": return "https://api.anthropic.com";
+        case "openrouter": return "https://openrouter.ai/api/v1";
+        case "groq": return "https://api.groq.com/openai/v1";
+        case "ollama": return "http://127.0.0.1:11434/v1";
+        default: break;
+    }
+    return "https://api.openai.com/v1";
+}
+
+fn provider_env(id: string): string {
+    switch (id) {
+        case "openai": return "OPENAI_API_KEY";
+        case "anthropic": return "ANTHROPIC_API_KEY";
+        case "openrouter": return "OPENROUTER_API_KEY";
+        case "groq": return "GROQ_API_KEY";
+        default: break;
+    }
+    return "";
+}
+
+// The preset models for a provider, "id|label" each.
+fn provider_models(id: string): []string {
+    switch (id) {
+        case "openai": return ["gpt-4.1|GPT-4.1", "gpt-4o|GPT-4o", "gpt-4o-mini|GPT-4o mini", "o3|o3", "o4-mini|o4-mini", "gpt-4.1-mini|GPT-4.1 mini"];
+        case "anthropic": return ["claude-sonnet-5|Claude Sonnet 5", "claude-opus-5-5|Claude Opus 5.5", "claude-fable-5-1|Claude Fable 5.1", "claude-haiku-4-5-20251001|Claude Haiku 4.5", "claude-sonnet-4-20250514|Claude Sonnet 4"];
+        case "openrouter": return ["anthropic/claude-sonnet-4|Claude Sonnet 4", "openai/gpt-4o|GPT-4o", "google/gemini-2.5-pro|Gemini 2.5 Pro", "qwen/qwen3-coder|Qwen3 Coder", "deepseek/deepseek-chat|DeepSeek V3"];
+        case "groq": return ["openai/gpt-oss-20b|GPT OSS 20B", "openai/gpt-oss-120b|GPT OSS 120B", "qwen/qwen3.6-27b|Qwen3.6 27B", "groq/compound|Groq Compound", "groq/compound-mini|Compound Mini"];
+        case "ollama": return ["llama3.2|Llama 3.2", "qwen2.5-coder|Qwen2.5 Coder", "deepseek-coder-v2|DeepSeek Coder V2", "codellama|Code Llama"];
+        default: break;
+    }
+    return ["custom|Custom model"];
+}
+
+fn ag_key(): string {
+    if (ag_keys.has(ag_provider) && len(ag_keys[ag_provider]) > 0) { return ag_keys[ag_provider]; }
+    let env = provider_env(ag_provider);
+    if (len(env) > 0) {
+        let v: string = nx_env(env);
+        return v;
+    }
+    return "";
+}
+
+fn ag_url(): string {
+    if (ag_urls.has(ag_provider) && len(ag_urls[ag_provider]) > 0) { return ag_urls[ag_provider]; }
+    return provider_url(ag_provider);
+}
+
+fn ag_model(): string {
+    if (ag_custom.has(ag_provider) && len(ag_custom[ag_provider]) > 0) { return ag_custom[ag_provider]; }
+    if (ag_models.has(ag_provider) && len(ag_models[ag_provider]) > 0) { return ag_models[ag_provider]; }
+    let m = provider_models(ag_provider);
+    return m[0].substring(0, m[0].index_of("|"));
+}
+
+fn ag_model_label(): string {
+    let id = ag_model();
+    for (m in provider_models(ag_provider)) {
+        let bar = m.index_of("|");
+        if (m.substring(0, bar) == id) { return m.substring(bar + 1, -1); }
+    }
+    return id;
+}
+
+fn join_url(base: string, path: string): string {
+    let b = base;
+    while (b.ends_with("/")) { b = b.substring(0, len(b) - 1); }
+    return b + path;
+}
+
+// ---- conversation ---------------------------------------------------------------------------------------
+
+fn ag_push(role: string, content: string, tid: string, tname: string, targs: string) {
+    ag_role.push(role);
+    ag_content.push(content);
+    ag_tool_id.push(tid);
+    ag_tool_name.push(tname);
+    ag_tool_args.push(targs);
+    ag_open.push(false);
+    ag_follow = true;
+    frame_dirty = true;
+}
+
+fn agent_new_chat() {
+    agent_stop();
+    ag_role.clear();
+    ag_content.clear();
+    ag_tool_id.clear();
+    ag_tool_name.clear();
+    ag_tool_args.clear();
+    ag_open.clear();
+    ag_error = "";
+    ag_status = "";
+    ag_scroll = 0;
+    ag_layout_key.clear();
+    ag_layout_h.clear();
+}
+
+fn agent_busy(): bool {
+    return ag_state != AG_IDLE;
+}
+
+fn agent_stop() {
+    if (ag_http >= 0) {
+        nx_http_free(ag_http);
+        ag_http = -1;
+    }
+    if (ag_proc >= 0) {
+        nx_proc_free(ag_proc);
+        ag_proc = -1;
+    }
+    if (ag_state != AG_IDLE) { ag_status = "Stopped"; }
+    ag_state = AG_IDLE;
+    ag_pending.clear();
+    frame_dirty = true;
+}
+
+fn agent_send() {
+    let text: string = fld_text[FLD_AGENT].trim();
+    if (len(text) == 0 || agent_busy()) { return; }
+    if (len(ag_key()) == 0 && ag_provider != "ollama" && ag_provider != "custom") {
+        ag_error = "Add an API key for " + provider_label(ag_provider) + " in Settings (or set " + provider_env(ag_provider) + ").";
+        return;
+    }
+    fld_set(FLD_AGENT, "");
+    ag_push("user", text, "", "", "");
+    ag_error = "";
+    ag_status = "";
+    ag_hops = 0;
+    ag_request();
+}
+
+// ---- system prompt ----------------------------------------------------------------------------------------
+
+fn agent_system(): string {
+    let agent_mode = ag_mode == "agent";
+    let groq = ag_provider == "groq";
+    let o = "You are Nexium, an AI assistant in a native Nexa IDE.\n";
+    o += "Nexa is a systems language (.nxa) that transpiles to C++ via NexaC.\n";
+    o += "Write real Nexa, not C++, unless the user is in inline_cpp! or asking about the compiler.\n";
+    o += "The chat renders Markdown: headings, **bold**, lists, `inline code`, and fenced code blocks.\n";
+    if (agent_mode) {
+        o += "You have tools. Use them instead of telling the user what to run.\n";
+        o += "run_command executes a real Windows cmd.exe command on this machine and returns stdout, stderr, and the exit code. ";
+        o += "Use it for git, builds, tests, installs, dir, where, powershell -Command, and any other shell work.\n";
+        o += "glob_files finds files. search_workspace greps the tree. delete_file and rename_file change the disk. ";
+        o += "Prefer edit_file for small edits. Prefer write_file for new files.\n";
+        o += "Do not invent Nexa APIs that are not in the syntax notes.\n";
+    }
+    if (len(folder) > 0) { o += "Open folder: " + folder + "\n"; }
+    if (is_file_tab()) { o += "Active file: " + (len(doc_path) > 0 ? doc_path : bufs[active].name) + "\n"; }
+    if (!groq || agent_mode) {
+        let budget = groq ? 3500 : 8000;
+        let per_file = groq ? 1000 : 2500;
+        let syntax = "";
+        for (rel in ["SYNTAX/Includes.txt", "SYNTAX/Core.txt", "SYNTAX/ControlFlow.txt", "SYNTAX/Modules.txt", "SYNTAX/Inline.txt", "SYNTAX/CLI.txt"]) {
+            let p = path_join(nexa_lang, rel.replace("/", "\\"));
+            if (!file.isfile(p)) { continue; }
+            let t: string = file.read(p);
+            syntax += "\n\n===== " + rel + " =====\n" + t.substring(0, per_file);
+            if (len(syntax) >= budget) { break; }
+        }
+        o += syntax.substring(0, budget);
+    }
+    if (agent_mode && is_file_tab()) {
+        let cap = groq ? 2500 : 8000;
+        o += "\n\n===== Active buffer (truncated) =====\n" + L.join("\n").substring(0, cap);
+    }
+    return o;
+}
+
+// ---- requests ---------------------------------------------------------------------------------------------
+
+let const OPENAI_TOOLS = R"JSON([{"type":"function","function":{"name":"read_file","description":"Read a file. Optional 1-based offset and limit in lines.","parameters":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}}},
+{"type":"function","function":{"name":"write_file","description":"Create or overwrite a file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
+{"type":"function","function":{"name":"edit_file","description":"Replace one unique old_string with new_string.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["path","old_string","new_string"]}}},
+{"type":"function","function":{"name":"list_dir","description":"List a directory.","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}},
+{"type":"function","function":{"name":"search_workspace","description":"Search workspace files for a string. Optional glob like *.nxa.","parameters":{"type":"object","properties":{"query":{"type":"string"},"glob":{"type":"string"}},"required":["query"]}}},
+{"type":"function","function":{"name":"glob_files","description":"Find files by glob (*.nxa, **/*.cpp).","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}}},
+{"type":"function","function":{"name":"delete_file","description":"Delete a file or folder.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
+{"type":"function","function":{"name":"rename_file","description":"Rename or move a file.","parameters":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"}},"required":["from","to"]}}},
+{"type":"function","function":{"name":"run_command","description":"Run a Windows cmd.exe command. Captures stdout/stderr and exit code. Use for git, builds, tests, installs, dir, powershell -Command, anything the user could type in a terminal. cwd defaults to the open folder. timeout_ms defaults to 60000.","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["command"]}}},
+{"type":"function","function":{"name":"run_nexa","description":"Build the Nexa project (or one file) with NexaC, and run it if run is true. Returns the output.","parameters":{"type":"object","properties":{"file":{"type":"string"},"run":{"type":"boolean"}}}}},
+{"type":"function","function":{"name":"workspace_info","description":"Open tabs, folder, selection.","parameters":{"type":"object","properties":{}}}}])JSON";
+
+// The Anthropic tool list, made from the OpenAI one.
+fn anthropic_tools(): Json {
+    let src: Json = json.parse(OPENAI_TOOLS);
+    let out: Json = json.array();
+    for (i, src.len()) {
+        let f: Json = src.get(i).get("function");
+        let t: Json = json.object();
+        t.set("name", f.get("name"));
+        t.set("description", f.get("description"));
+        t.set("input_schema", f.get("parameters"));
+        out.push(t);
+    }
+    return out;
+}
+
+fn ag_request() {
+    ag_hops++;
+    ag_state = AG_WAIT;
+    ag_status = "Thinking";
+    let system = agent_system();
+    let use_tools = ag_mode == "agent";
+    let body: Json = json.object();
+    body.set("model", json.string(ag_model()));
+    body.set("temperature", json.float(ag_temp));
+    let headers = "Content-Type: application/json";
+    let url = "";
+    if (ag_provider == "anthropic") {
+        body.set("max_tokens", json.int(8192));
+        body.set("system", json.string(system));
+        let msgs: Json = json.array();
+        for (i, len(ag_role)) {
+            let role: string = ag_role[i];
+            let content: string = ag_content[i];
+            let tname: string = ag_tool_name[i];
+            let m: Json = json.object();
+            if (role == "tool") {
+                let block: Json = json.object();
+                block.set("type", json.string("tool_result"));
+                block.set("tool_use_id", json.string(ag_tool_id[i]));
+                block.set("content", json.string(content));
+                let blocks: Json = json.array();
+                blocks.push(block);
+                m.set("role", json.string("user"));
+                m.set("content", blocks);
+            } else if (role == "assistant" && len(tname) > 0) {
+                let blocks: Json = json.array();
+                if (len(content) > 0) {
+                    let tb: Json = json.object();
+                    tb.set("type", json.string("text"));
+                    tb.set("text", json.string(content));
+                    blocks.push(tb);
+                }
+                let use: Json = json.object();
+                use.set("type", json.string("tool_use"));
+                use.set("id", json.string(ag_tool_id[i]));
+                use.set("name", json.string(tname));
+                let args: string = ag_tool_args[i];
+                let input: Json = json.parse(len(args) > 0 ? args : "{}");
+                if (!input.ok() || !input.is_object()) { input = json.object(); }
+                use.set("input", input);
+                blocks.push(use);
+                m.set("role", json.string("assistant"));
+                m.set("content", blocks);
+            } else if (role == "user" || role == "assistant") {
+                m.set("role", json.string(role));
+                m.set("content", json.string(content));
+            } else {
+                continue;
+            }
+            msgs.push(m);
+        }
+        body.set("messages", msgs);
+        if (use_tools) { body.set("tools", anthropic_tools()); }
+        headers += "\nx-api-key: " + ag_key() + "\nanthropic-version: 2023-06-01";
+        url = join_url(ag_url(), "/v1/messages");
+    } else {
+        body.set("max_tokens", json.int(ag_provider == "groq" ? 1000 : 4096));
+        let msgs: Json = json.array();
+        let sys: Json = json.object();
+        sys.set("role", json.string("system"));
+        sys.set("content", json.string(system));
+        msgs.push(sys);
+        for (i, len(ag_role)) {
+            let role: string = ag_role[i];
+            let content: string = ag_content[i];
+            let tname: string = ag_tool_name[i];
+            let m: Json = json.object();
+            if (role == "tool") {
+                m.set("role", json.string("tool"));
+                m.set("tool_call_id", json.string(ag_tool_id[i]));
+                m.set("content", json.string(content));
+            } else if (role == "assistant" && len(tname) > 0) {
+                m.set("role", json.string("assistant"));
+                if (len(content) > 0) { m.set("content", json.string(content)); } else { m.set("content", json.null()); }
+                let fnc: Json = json.object();
+                fnc.set("name", json.string(tname));
+                fnc.set("arguments", json.string(ag_tool_args[i]));
+                let call: Json = json.object();
+                call.set("id", json.string(ag_tool_id[i]));
+                call.set("type", json.string("function"));
+                call.set("function", fnc);
+                let calls: Json = json.array();
+                calls.push(call);
+                m.set("tool_calls", calls);
+            } else if (role == "user" || role == "assistant") {
+                m.set("role", json.string(role));
+                m.set("content", json.string(content));
+            } else {
+                continue;
+            }
+            msgs.push(m);
+        }
+        body.set("messages", msgs);
+        if (use_tools) { body.set("tools", json.parse(OPENAI_TOOLS)); }
+        if (len(ag_key()) > 0) { headers += "\nAuthorization: Bearer " + ag_key(); }
+        if (ag_provider == "openrouter") { headers += "\nHTTP-Referer: https://nexium.local\nX-Title: Nexium"; }
+        url = join_url(ag_url(), "/chat/completions");
+    }
+    ag_http = nx_http_start("POST", url, headers, json.stringify(body));
+}
+
+fn ag_fail(msg: string) {
+    ag_error = msg;
+    ag_state = AG_IDLE;
+    ag_status = "";
+    frame_dirty = true;
+}
+
+// Reads a finished response: text ends the turn, tool calls queue work.
+fn ag_response() {
+    let status: int = nx_http_status(ag_http);
+    let body: string = nx_http_body(ag_http);
+    let err: string = nx_http_error(ag_http);
+    nx_http_free(ag_http);
+    ag_http = -1;
+    if (len(err) > 0) {
+        ag_fail(err);
+        return;
+    }
+    let j: Json = json.parse(body);
+    if (!j.ok() || !j.is_object()) {
+        ag_fail(f"Unexpected response ({status}): " + body.substring(0, 400));
+        return;
+    }
+    if (j.has("error")) {
+        let e: Json = j.get("error");
+        let msg = f"API error ({status})";
+        if (e.is_object() && e.has("message")) { msg = e.get("message").as_string(); }
+        if (e.is_string()) { msg = e.as_string(); }
+        ag_fail(msg);
+        return;
+    }
+    let calls = 0;
+    if (ag_provider == "anthropic") {
+        if (!j.has("content")) {
+            ag_fail(f"No content in response ({status})");
+            return;
+        }
+        let content: Json = j.get("content");
+        let text = "";
+        for (i, content.len()) {
+            let b: Json = content.get(i);
+            let kind = b.get("type").as_string();
+            if (kind == "text") { text += b.get("text").as_string(); }
+            if (kind == "tool_use") {
+                ag_push("assistant", text, b.get("id").as_string(), b.get("name").as_string(), json.stringify(b.get("input")));
+                ag_pending.push(len(ag_role) - 1);
+                text = "";
+                calls++;
+            }
+        }
+        if (calls == 0) { ag_push("assistant", text, "", "", ""); }
+    } else {
+        if (!j.has("choices") || j.get("choices").len() == 0) {
+            ag_fail(f"No choices in response ({status}): " + body.substring(0, 300));
+            return;
+        }
+        let msg: Json = j.get("choices").get(0).get("message");
+        let text = "";
+        if (msg.has("content") && msg.get("content").is_string()) { text = msg.get("content").as_string(); }
+        if (msg.has("tool_calls") && msg.get("tool_calls").is_array()) {
+            let tc: Json = msg.get("tool_calls");
+            for (i, tc.len()) {
+                let c: Json = tc.get(i);
+                let f: Json = c.get("function");
+                let args = "{}";
+                if (f.has("arguments")) {
+                    let a: Json = f.get("arguments");
+                    args = a.is_string() ? a.as_string() : json.stringify(a);
+                }
+                ag_push("assistant", i == 0 ? text : "", c.get("id").as_string(), f.get("name").as_string(), args);
+                ag_pending.push(len(ag_role) - 1);
+                calls++;
+            }
+        }
+        if (calls == 0) { ag_push("assistant", text, "", "", ""); }
+    }
+    if (calls > 0) {
+        ag_state = AG_TOOLS;
+    } else {
+        ag_state = AG_IDLE;
+        ag_status = "";
+    }
+}
+
+// Advances the agent; called every frame.
+fn agent_poll() {
+    if (ag_state == AG_WAIT && ag_http >= 0 && nx_http_done(ag_http) == 1) {
+        ag_response();
+        frame_dirty = true;
+    }
+    if (ag_state == AG_PROC) {
+        let more: string = nx_proc_read(ag_proc);
+        ag_proc_out += more;
+        if (len(more) > 0) { feed_lines(1, more); }
+        let finished = nx_proc_running(ag_proc) == 0;
+        let timed_out = now_ms - ag_proc_start > ag_proc_timeout;
+        if (finished || timed_out) {
+            let code: int = nx_proc_exit_code(ag_proc);
+            if (timed_out && !finished) { nx_proc_kill(ag_proc); }
+            nx_proc_free(ag_proc);
+            ag_proc = -1;
+            let out = strip_ansi(ag_proc_out);
+            if (len(out) > 80000) { out = "... [truncated]\n" + out.substring(len(out) - 80000, -1); }
+            let res = f"exit {code}";
+            if (timed_out && !finished) { res += " (timed out)"; }
+            res += "\ncwd: " + ag_proc_cwd + "\n" + (len(out) == 0 ? "(no output)" : out);
+            if (len(out_partial) > 0) {
+                out_lines.push(out_partial);
+                out_partial = "";
+            }
+            log_out(f"[exit {code}]");
+            ag_tool_result(res);
+            ag_state = AG_TOOLS;
+        }
+        frame_dirty = true;
+    }
+    while (ag_state == AG_TOOLS) {
+        if (len(ag_pending) == 0) {
+            if (ag_hops >= 24) {
+                ag_fail("Stopped after 24 rounds of tool calls.");
+                return;
+            }
+            ag_request();
+            return;
+        }
+        let i: int = ag_pending[0];
+        ag_pending.remove(0);
+        ag_tool_idx = i;
+        let name: string = ag_tool_name[i];
+        ag_status = "Running " + name;
+        let args: Json = json.parse(ag_tool_args[i]);
+        if (!args.ok() || !args.is_object()) { args = json.object(); }
+        if (name == "run_command" || name == "run_nexa") {
+            if (tool_start_command(name, args)) {
+                ag_state = AG_PROC;
+                return;
+            }
+            continue;
+        }
+        ag_tool_result(run_tool(name, args));
+    }
+}
+
+fn ag_tool_result(res: string) {
+    let i = ag_tool_idx;
+    ag_push("tool", res, ag_tool_id[i], ag_tool_name[i], "");
+}
+
+// ---- tools -------------------------------------------------------------------------------------------------
+
+fn jstr(a: Json, key: string): string {
+    if (!a.has(key)) { return ""; }
+    let v: Json = a.get(key);
+    if (v.is_string()) { return v.as_string(); }
+    if (v.is_number()) { return (string)v.as_int(); }
+    return "";
+}
+
+fn jint(a: Json, key: string, dflt: int): int {
+    if (!a.has(key)) { return dflt; }
+    let v: Json = a.get(key);
+    if (v.is_number()) { return v.as_int(); }
+    if (v.is_string()) { return (int)v.as_string(); }
+    return dflt;
+}
+
+fn resolve_path(p: string): string {
+    let q = p.replace("/", "\\");
+    if (len(q) >= 2 && q[1] == ':') { return q; }
+    if (q.starts_with("\\")) { return q; }
+    if (len(folder) > 0) { return path_join(folder, q); }
+    return q;
+}
+
+// The text of a file: the open buffer's if it is open, else from disk.
+fn file_text(p: string): string {
+    let bi = find_buf(p);
+    if (bi >= 0) {
+        if (bi == active) { return L.join("\n"); }
+        let lines: []string = bufs[bi].lines;
+        return lines.join("\n");
+    }
+    let t: string = file.read(p);
+    return t.replace("\r\n", "\n");
+}
+
+// Puts new text into an open buffer as an undoable edit, then marks it saved.
+fn apply_to_buffer(p: string, text: string) {
+    let bi = find_buf(p);
+    if (bi < 0) { return; }
+    let keep = active;
+    switch_to(bi);
+    begin_edit("agent");
+    L = split_lines(text);
+    clamp_cursor();
+    end_edit(0);
+    doc_saved = doc_ver;
+    bufs[active].mtime = nx_mtime(p);
+    doc_store();
+    switch_to(keep);
+}
+
+fn write_text(p: string, text: string): bool {
+    let dir = file.dirname(p);
+    if (len(dir) > 0 && !file.isdir(dir)) { file.mkdir(dir); }
+    // keep the file's line endings
+    let out = text;
+    let bi = find_buf(p);
+    let crlf = false;
+    if (bi >= 0) {
+        crlf = bufs[bi].crlf;
+    } else if (file.isfile(p)) {
+        let old: string = file.read(p);
+        crlf = old.contains("\r\n");
+    }
+    if (crlf) { out = text.replace("\r\n", "\n").replace("\n", "\r\n"); }
+    if (!file.write(p, out)) { return false; }
+    apply_to_buffer(p, text);
+    return true;
+}
+
+fn tool_read(a: Json): string {
+    let p = resolve_path(jstr(a, "path"));
+    if (!file.isfile(p) && find_buf(p) < 0) { return "ERROR: file not found: " + p; }
+    let text = file_text(p);
+    let off = jint(a, "offset", 0);
+    let lim = jint(a, "limit", 0);
+    if (off > 0 || lim > 0) {
+        if (off < 1) { off = 1; }
+        if (lim <= 0) { lim = 400; }
+        let lines = text.split("\n");
+        let o = "";
+        let k = off - 1;
+        while (k < len(lines) && k < off - 1 + lim) {
+            o += f"{k + 1}| {lines[k]}\n";
+            k++;
+        }
+        if (k < len(lines)) { o += f"... ({len(lines) - k} more lines)\n"; }
+        return o;
+    }
+    if (len(text) > 120000) { return text.substring(0, 120000) + "\n... [truncated]"; }
+    return text;
+}
+
+fn tool_write(a: Json): string {
+    let p = resolve_path(jstr(a, "path"));
+    let content = jstr(a, "content");
+    if (!write_text(p, content)) { return "ERROR: could not write " + p; }
+    refresh_tree();
+    return f"Wrote {p} ({len(content)} bytes)";
+}
+
+fn tool_edit(a: Json): string {
+    let p = resolve_path(jstr(a, "path"));
+    let olds = jstr(a, "old_string");
+    let news = jstr(a, "new_string");
+    if (len(olds) == 0) { return "ERROR: old_string is empty"; }
+    if (!file.isfile(p) && find_buf(p) < 0) { return "ERROR: file not found: " + p; }
+    let text = file_text(p);
+    let o = olds.replace("\r\n", "\n");
+    let at = text.index_of(o);
+    if (at < 0) { return "ERROR: old_string not found in file"; }
+    if (text.index_of(o, at + 1) >= 0) { return "ERROR: old_string matched more than once; make it unique"; }
+    let t = text.substring(0, at) + news.replace("\r\n", "\n") + text.substring(at + len(o), -1);
+    if (!write_text(p, t)) { return "ERROR: could not write " + p; }
+    return "Edited " + p;
+}
+
+fn tool_list(a: Json): string {
+    let p = jstr(a, "path");
+    if (len(p) == 0) { p = folder; }
+    p = resolve_path(p);
+    if (!file.isdir(p)) { return "ERROR: not a directory: " + p; }
+    let o = "";
+    let names: []string = file.list(p);
+    for (nm in names) {
+        if (nm == "." || nm == "..") { continue; }
+        o += (file.isdir(path_join(p, nm)) ? "dir  " : "file ") + nm + "\n";
+    }
+    return len(o) == 0 ? "(empty)" : o;
+}
+
+// Glob matching with *, ** and ?, case-insensitive, / and \ the same.
+fn glob_at(p: string, pi: int, s: string, si: int): bool {
+    let i = pi;
+    let j = si;
+    while (i < len(p)) {
+        if (p[i] == '*' && i + 1 < len(p) && p[i + 1] == '*') {
+            i += 2;
+            if (i < len(p) && (p[i] == '/' || p[i] == '\\')) { i++; }
+            if (i >= len(p)) { return true; }
+            let t = j;
+            while (t <= len(s)) {
+                if (glob_at(p, i, s, t)) { return true; }
+                t++;
+            }
+            return false;
+        }
+        if (p[i] == '*') {
+            i++;
+            let t = j;
+            while (t <= len(s)) {
+                if (glob_at(p, i, s, t)) { return true; }
+                if (t < len(s) && (s[t] == '/' || s[t] == '\\')) { return false; }
+                t++;
+            }
+            return false;
+        }
+        if (j >= len(s)) { return false; }
+        if (p[i] == '?') {
+            if (s[j] == '/' || s[j] == '\\') { return false; }
+        } else {
+            let a = p.substring(i, 1).lower().replace("/", "\\");
+            let b = s.substring(j, 1).lower().replace("/", "\\");
+            if (a != b) { return false; }
+        }
+        i++;
+        j++;
+    }
+    return j == len(s);
+}
+
+fn glob_match(pat: string, rel: string): bool {
+    if (len(pat) == 0) { return true; }
+    return glob_at(pat, 0, rel, 0) || glob_at(pat, 0, file.basename(rel), 0);
+}
+
+fn tool_search(a: Json): string {
+    let q = jstr(a, "query");
+    if (len(q) == 0) { return "ERROR: query required"; }
+    if (len(folder) == 0) { return "ERROR: no folder open"; }
+    let g = jstr(a, "glob");
+    files_index_ms = 0;
+    ensure_files_index();
+    let o = "";
+    let hits = 0;
+    for (f in files_index) {
+        let rel = rel_path(f);
+        if (!is_text_file(f) || !glob_match(g, rel)) { continue; }
+        let text = file_text(f);
+        if (text.substring(0, 800).contains("\x00")) { continue; }
+        let lines = text.split("\n");
+        for (k, len(lines)) {
+            if (lines[k].contains(q)) {
+                o += f"{rel}:{k + 1}: {lines[k]}\n";
+                hits++;
+                if (hits >= 200) { return o; }
+            }
+        }
+    }
+    return hits == 0 ? "No matches" : o;
+}
+
+fn tool_glob(a: Json): string {
+    let pat = jstr(a, "pattern");
+    if (len(pat) == 0) { pat = jstr(a, "glob"); }
+    if (len(pat) == 0) { return "ERROR: pattern required"; }
+    if (len(folder) == 0) { return "ERROR: no folder open"; }
+    files_index_ms = 0;
+    ensure_files_index();
+    let o = "";
+    let n = 0;
+    for (f in files_index) {
+        let rel = rel_path(f);
+        if (glob_match(pat, rel)) {
+            o += rel + "\n";
+            n++;
+            if (n >= 500) { break; }
+        }
+    }
+    return n == 0 ? "No files matched" : o;
+}
+
+fn tool_delete(a: Json): string {
+    let p = resolve_path(jstr(a, "path"));
+    if (!file.exists(p)) { return "ERROR: not found: " + p; }
+    let i = len(bufs) - 1;
+    while (i >= 0) {
+        let bp: string = bufs[i].path;
+        if (len(bp) > 0 && bp.lower().starts_with(p.lower())) {
+            doc_store();
+            bufs[i].ver = bufs[i].saved;
+            if (i == active) { doc_saved = doc_ver; }
+            close_tab(i);
+        }
+        i--;
+    }
+    let ok = file.isdir(p) ? file.remove_all(p) : file.remove(p);
+    refresh_tree();
+    return ok ? "Deleted " + p : "ERROR: could not delete " + p;
+}
+
+fn tool_rename(a: Json): string {
+    let from = jstr(a, "from");
+    if (len(from) == 0) { from = jstr(a, "path"); }
+    let to = jstr(a, "to");
+    if (len(to) == 0) { to = jstr(a, "new_path"); }
+    if (len(from) == 0 || len(to) == 0) { return "ERROR: from and to required"; }
+    from = resolve_path(from);
+    to = resolve_path(to);
+    let dir = file.dirname(to);
+    if (len(dir) > 0 && !file.isdir(dir)) { file.mkdir(dir); }
+    if (!file.rename(from, to)) { return "ERROR: rename failed"; }
+    doc_store();
+    for (i, len(bufs)) {
+        let bp: string = bufs[i].path;
+        if (len(bp) > 0 && same_path(bp, from)) {
+            bufs[i].path = to;
+            bufs[i].name = file.basename(to);
+        }
+    }
+    let keep = active;
+    active = -1;
+    doc_load(keep);
+    refresh_tree();
+    return "Renamed " + from + " -> " + to;
+}
+
+fn tool_info(): string {
+    doc_store();
+    let o = "folder: " + folder + "\n";
+    if (is_file_tab()) {
+        o += "active: " + (len(doc_path) > 0 ? doc_path : bufs[active].name) + "\n";
+        o += f"cursor_line: {cy + 1}\n";
+        let sel = sel_text();
+        if (len(sel) > 0) { o += "selection:\n" + sel.substring(0, 4000) + "\n"; }
+    }
+    o += "open_tabs:\n";
+    for (i, len(bufs)) {
+        if (bufs[i].kind != 0) { continue; }
+        let p: string = bufs[i].path;
+        let nm: string = bufs[i].name;
+        o += "  " + (len(p) > 0 ? p : nm) + (buf_dirty(i) ? " *" : "") + "\n";
+    }
+    return o;
+}
+
+fn run_tool(name: string, a: Json): string {
+    switch (name) {
+        case "read_file": return tool_read(a);
+        case "write_file": return tool_write(a);
+        case "edit_file": return tool_edit(a);
+        case "list_dir": return tool_list(a);
+        case "search_workspace": return tool_search(a);
+        case "glob_files": return tool_glob(a);
+        case "delete_file": return tool_delete(a);
+        case "rename_file": return tool_rename(a);
+        case "workspace_info": return tool_info();
+        default: break;
+    }
+    return "ERROR: unknown tool " + name;
+}
+
+// Starts run_command / run_nexa; false (with the result recorded) if it could not start.
+fn tool_start_command(name: string, a: Json): bool {
+    let cmdline = "";
+    let cwd = "";
+    let timeout = 60000;
+    if (name == "run_command") {
+        cmdline = jstr(a, "command");
+        if (len(cmdline) == 0) { cmdline = jstr(a, "cmd"); }
+        cwd = jstr(a, "cwd");
+        if (len(cwd) == 0) { cwd = jstr(a, "working_directory"); }
+        timeout = jint(a, "timeout_ms", 60000);
+    } else {
+        save_all();
+        let c = find_compiler();
+        if (len(c) == 0) {
+            ag_tool_result("ERROR: the Nexa compiler was not found");
+            return false;
+        }
+        let f = jstr(a, "file");
+        let run = true;
+        if (a.has("run") && a.get("run").is_bool()) { run = a.get("run").as_bool(); }
+        let dir = project_dir();
+        let entry = "";
+        if (len(f) > 0) {
+            entry = resolve_path(f);
+            dir = file.dirname(entry);
+        }
+        if (len(dir) == 0) {
+            ag_tool_result("ERROR: no project folder");
+            return false;
+        }
+        if (len(entry) == 0 && file.isfile(path_join(dir, "nexapkg.json"))) {
+            cmdline = "\"" + c + "\" build";
+        } else {
+            if (len(entry) == 0) { entry = entry_file(dir); }
+            if (len(entry) == 0) {
+                ag_tool_result("ERROR: no .nxa file with fn main() found");
+                return false;
+            }
+            let exe = entry.substring(0, len(entry) - 4) + ".exe";
+            cmdline = "\"" + c + "\" \"" + entry + "\" -o \"" + exe + "\"";
+            if (run) { cmdline += " && \"" + exe + "\""; }
+        }
+        cwd = dir;
+        timeout = 120000;
+    }
+    if (len(cmdline) == 0) {
+        ag_tool_result("ERROR: command required");
+        return false;
+    }
+    if (len(cwd) == 0) { cwd = folder; } else { cwd = resolve_path(cwd); }
+    if (len(cwd) == 0 && is_file_tab() && len(doc_path) > 0) { cwd = file.dirname(doc_path); }
+    if (len(cwd) > 0 && !file.isdir(cwd)) {
+        ag_tool_result("ERROR: cwd not found: " + cwd);
+        return false;
+    }
+    show_panel_tab(1);
+    log_out("$ " + cmdline);
+    ag_proc = nx_proc_start(cmdline, cwd);
+    if (ag_proc < 0) {
+        ag_tool_result("ERROR: could not start the command");
+        return false;
+    }
+    ag_proc_out = "";
+    ag_proc_cwd = cwd;
+    ag_proc_start = now_ms;
+    ag_proc_timeout = clamp(timeout, 1000, 1800000);
+    return true;
+}
+
+// ---- panel ---------------------------------------------------------------------------------------------------
+
+// One line of the chat, laid out: its text and how to draw it.
+// style: 0 text, 1 heading, 2 bullet, 3 user, 4 muted, 5 error, 6 tool header, 100+lang code
+fn ag_wrap(s: string, w: int, size: int): []string {
+    let out: []string;
+    for (para in s.split("\n")) {
+        if (len(para) == 0) {
+            out.push("");
+            continue;
+        }
+        let words = para.split(" ");
+        let line_ = "";
+        for (wd in words) {
+            let t = len(line_) == 0 ? wd : line_ + " " + wd;
+            if (tw(t, size) > w && len(line_) > 0) {
+                out.push(line_);
+                line_ = wd;
+            } else {
+                line_ = t;
+            }
+            // a single word longer than the line is cut into pieces
+            while (tw(line_, size) > w && len(line_) > 1) {
+                let cut = len(line_) - 1;
+                while (cut > 1 && tw(line_.substring(0, cut), size) > w) { cut--; }
+                out.push(line_.substring(0, cut));
+                line_ = line_.substring(cut, -1);
+            }
+        }
+        out.push(line_);
+    }
+    return out;
+}
+
+// Removes the Markdown emphasis markers the chat does not draw.
+fn md_plain(s: string): string {
+    return s.replace("**", "").replace("__", "");
+}
+
+fn ag_layout(i: int, w: int) {
+    ag_lines.clear();
+    ag_styles.clear();
+    let role: string = ag_role[i];
+    let content: string = ag_content[i];
+    let tname: string = ag_tool_name[i];
+    if (role == "user") {
+        for (l in ag_wrap(content, w - px(24), UI)) {
+            ag_lines.push(l);
+            ag_styles.push(3);
+        }
+        return;
+    }
+    if (role == "tool") { return; }
+    if (len(content) > 0) {
+        let in_code = false;
+        let code_lang = 0;
+        for (raw in content.split("\n")) {
+            let t = raw.trim();
+            if (t.starts_with("```")) {
+                in_code = !in_code;
+                code_lang = fence_lang(t.substring(3, -1));
+                if (code_lang == L_PLAIN && len(t) == 3) { code_lang = L_NEXA; }
+                ag_lines.push("");
+                ag_styles.push(in_code ? 7 : 8);
+                continue;
+            }
+            if (in_code) {
+                ag_lines.push(raw.replace("\t", "    "));
+                ag_styles.push(100 + code_lang);
+                continue;
+            }
+            if (t.starts_with("#")) {
+                let h = t;
+                while (h.starts_with("#")) { h = h.substring(1, -1); }
+                for (l in ag_wrap(md_plain(h.trim()), w, UI)) {
+                    ag_lines.push(l);
+                    ag_styles.push(1);
+                }
+                continue;
+            }
+            if (t.starts_with("- ") || t.starts_with("* ")) {
+                let first = true;
+                for (l in ag_wrap(md_plain(t.substring(2, -1)), w - px(16), UI)) {
+                    ag_lines.push(l);
+                    ag_styles.push(first ? 2 : 9);
+                    first = false;
+                }
+                continue;
+            }
+            for (l in ag_wrap(md_plain(raw), w, UI)) {
+                ag_lines.push(l);
+                ag_styles.push(0);
+            }
+        }
+    }
+    if (len(tname) > 0) {
+        ag_lines.push(tname);
+        ag_styles.push(6);
+        if (ag_open[i]) {
+            // the result is the next tool message
+            let res = "";
+            if (i + 1 < len(ag_role) && ag_role[i + 1] == "tool") { res = ag_content[i + 1]; }
+            let args: string = ag_tool_args[i];
+            let shown = 0;
+            for (l in ("> " + args.substring(0, 600) + "\n" + res).split("\n")) {
+                if (shown >= 40) {
+                    ag_lines.push("...");
+                    ag_styles.push(104);
+                    break;
+                }
+                ag_lines.push(l.replace("\t", "    "));
+                ag_styles.push(100);
+                shown++;
+            }
+        }
+    }
+}
+
+fn line_h(style: int): int {
+    if (style >= 100) { return LH_MONO; }
+    if (style == 7 || style == 8) { return px(6); }
+    if (style == 1) { return ui.text_height(px(15)) + px(8); }
+    if (style == 6) { return px(28); }
+    return ui.text_height(UI) + px(5);
+}
+
+// Short description of a tool call for its card.
+fn tool_summary(i: int): string {
+    let a: Json = json.parse(ag_tool_args[i]);
+    if (!a.ok() || !a.is_object()) { return ""; }
+    for (k in ["path", "command", "query", "pattern", "from", "file"]) {
+        let v = jstr(a, k);
+        if (len(v) > 0) {
+            if (k == "path" || k == "from" || k == "file") { return rel_path(resolve_path(v)); }
+            return v;
+        }
+    }
+    return "";
+}
+
+fn tool_verb(name: string): string {
+    switch (name) {
+        case "read_file": return "Read";
+        case "write_file": return "Wrote";
+        case "edit_file": return "Edited";
+        case "list_dir": return "Listed";
+        case "search_workspace": return "Searched";
+        case "glob_files": return "Found files";
+        case "delete_file": return "Deleted";
+        case "rename_file": return "Renamed";
+        case "run_command": return "Ran";
+        case "run_nexa": return "Built";
+        case "workspace_info": return "Looked at the workspace";
+        default: break;
+    }
+    return name;
+}
+
+fn agent_x(): int {
+    return win_w - agent_w;
+}
+
+fn draw_agent() {
+    if (!show_agent) { return; }
+    let x = agent_x();
+    let y = TOOLBAR_H;
+    let w = agent_w;
+    let h = win_h - STATUS_H - y;
+    fill(x, y, w, h, C_SIDEBAR);
+    vline(x, y, h, C_BORDER);
+    shadow_v(x - px(6), y, h, false);
+    // header
+    fill(x + 1, y, w - 1, HEADER_H, C_SIDEBAR);
+    txt_v(x + px(16), y, HEADER_H, "AGENT", C_MUTED, UI_SMALL);
+    let bx = x + w - px(28);
+    if (icon_button(bx, y + px(8), "close", "Close (Ctrl+Shift+L)")) { show_agent = false; }
+    if (icon_button(bx - px(24), y + px(8), "gear", "Agent Settings")) {
+        open_special(1);
+        page_scroll = px(560);
+    }
+    if (icon_button(bx - px(48), y + px(8), "plus", "New Chat")) { agent_new_chat(); }
+    // mode, provider and model
+    let ry = y + HEADER_H;
+    let dw = (w - px(40)) / 3;
+    let modes = ["Agent", "Chat"];
+    let mi = ag_mode == "chat" ? 1 : 0;
+    let providers = provider_ids();
+    let pi = providers.index_of(ag_provider);
+    let plabels: []string;
+    for (p in providers) { plabels.push(provider_label(p)); }
+    let models = provider_models(ag_provider);
+    let mlabels: []string;
+    let mcur = 0;
+    for (k, len(models)) {
+        let m: string = models[k];
+        let bar = m.index_of("|");
+        mlabels.push(m.substring(bar + 1, -1));
+        if (m.substring(0, bar) == ag_model()) { mcur = k; }
+    }
+    // dropdowns go last so their open lists draw over the chat
+    let msg_top = ry + px(44);
+    let input_h = ag_input_h(w);
+    let msg_bottom = y + h - input_h - px(20);
+    draw_agent_messages(x, msg_top, w, msg_bottom - msg_top);
+    fill(x + 1, ry, w - 1, px(44), C_SIDEBAR);
+    hline(x + 1, msg_top - 1, w - 1, C_BORDER);
+    draw_agent_input(x, msg_bottom, w, y + h - msg_bottom);
+    let nm = ui.dropdown(x + px(12), ry + px(6), dw, modes, mi);
+    let np = ui.dropdown(x + px(20) + dw, ry + px(6), dw, plabels, pi);
+    let nmod = ui.dropdown(x + px(28) + dw * 2, ry + px(6), dw, mlabels, mcur);
+    if (nm != mi) {
+        ag_mode = nm == 1 ? "chat" : "agent";
+        save_settings();
+    }
+    if (np != pi && np >= 0) {
+        ag_provider = providers[np];
+        save_settings();
+    }
+    if (nmod != mcur && nmod >= 0 && nmod < len(models)) {
+        let m: string = models[nmod];
+        ag_models[ag_provider] = m.substring(0, m.index_of("|"));
+        ag_custom[ag_provider] = "";
+        save_settings();
+    }
+    // splitter highlight
+    if (drag == 7 || (hovered(x - px(2), y, px(5), h) && drag == 0)) { fill(x - 1, y, px(3), h, C_ACCENT); }
+}
+
+fn draw_agent_messages(x: int, y: int, w: int, h: int) {
+    let tw_ = w - px(32);
+    let tx = x + px(16);
+    // lay out every message (cached by width and content)
+    let total = px(12);
+    while (len(ag_layout_key) < len(ag_role)) {
+        ag_layout_key.push("");
+        ag_layout_h.push(0);
+    }
+    for (i, len(ag_role)) {
+        let key = f"{tw_}|{len(ag_content[i])}|{ag_open[i]}|{i + 1 < len(ag_role)}";
+        if (ag_layout_key[i] != key) {
+            ag_layout(i, tw_);
+            let hh = 0;
+            for (st in ag_styles) { hh += line_h(st); }
+            if (hh > 0) { hh += px(14); }
+            if (ag_role[i] == "user") { hh += px(10); }
+            ag_layout_key[i] = key;
+            ag_layout_h[i] = hh;
+        }
+        total += ag_layout_h[i];
+    }
+    let status_h = (agent_busy() || len(ag_error) > 0 || len(ag_status) > 0) ? px(40) : 0;
+    total += status_h;
+    let max_scroll = imax(0, total - h);
+    if (ag_follow) { ag_scroll = max_scroll; }
+    ag_scroll = clamp(ag_scroll, 0, max_scroll);
+    ag_msg_y = y;
+    ag_msg_h = h;
+    nx_clip(x + 1, y, x + w, y + h);
+    if (len(ag_role) == 0) {
+        let cy_ = y + imax(px(20), h / 2 - px(110));
+        draw_logo_c(x + (w - px(56)) / 2, cy_, px(56), false, 0x2C2C2C, 0x1F3A52);
+        let lines = ag_mode == "agent" ? "Ask about your code, or have the agent read and edit files, search the folder, run commands and build with NexaC." : "Ask about Nexa or your code. Switch to Agent to let it edit files and run commands.";
+        let py = cy_ + px(76);
+        for (l in ag_wrap(lines, w - px(60), UI)) {
+            let lw = tw(l, UI);
+            txt(x + (w - lw) / 2, py, l, C_MUTED, UI);
+            py += ui.text_height(UI) + px(5);
+        }
+        if (len(ag_key()) == 0 && ag_provider != "ollama" && ag_provider != "custom") {
+            py += px(10);
+            let lab = "Add an API key in Settings";
+            if (link_button(x + (w - tw(lab, UI)) / 2, py, lab)) {
+                open_special(1);
+                page_scroll = px(560);
+            }
+        }
+    }
+    let yy = y + px(12) - ag_scroll;
+    for (i, len(ag_role)) {
+        let hh: int = ag_layout_h[i];
+        if (hh == 0) { continue; }
+        if (yy + hh < y || yy > y + h) {
+            yy += hh;
+            continue;
+        }
+        ag_layout(i, tw_);
+        let role: string = ag_role[i];
+        if (role == "user") {
+            rrect(tx - px(4), yy, tw_ + px(8), hh - px(14), px(6), 0x2B2D30);
+            yy += px(5);
+        }
+        let ly = yy;
+        let code_top = -1;
+        let code_st = 0;
+        let code_dl = "";
+        for (k, len(ag_lines)) {
+            let st: int = ag_styles[k];
+            let s: string = ag_lines[k];
+            let lh = line_h(st);
+            if (st == 7) {
+                code_top = ly;
+                code_st = 0;
+                code_dl = "";
+            } else if (st >= 100) {
+                if (code_top < 0) { code_top = ly; }
+                fill(tx - px(4), ly, tw_ + px(8), lh, 0x141414);
+                let lang = st - 100;
+                // carried from line to line, so brackets and comments span the block
+                let cols = hl_line(lang, s, code_st, code_dl);
+                code_st = hl_out_state;
+                code_dl = hl_out_delim;
+                mono_colored(tx + px(4), ly + (lh - nx_font_h(PANEL_FONT)) / 2, s, cols, tw_ - px(8));
+            } else if (st == 8) {
+                code_top = -1;
+            } else if (st == 1) {
+                ui.heading(tx, ly + px(4), s, px(15));
+            } else if (st == 2 || st == 9) {
+                if (st == 2) { disc(tx + px(4), ly + lh / 2, px(2), C_TEXT); }
+                txt_inline(tx + px(14), ly + px(2), s);
+            } else if (st == 3) {
+                txt(tx + px(6), ly + px(2), s, C_BRIGHT, UI);
+            } else if (st == 6) {
+                // a tool call card
+                let res_ok = !(i + 1 < len(ag_role) && ag_content[i + 1].starts_with("ERROR"));
+                let running = i + 1 >= len(ag_role) || ag_role[i + 1] != "tool";
+                rrect(tx - px(4), ly + px(2), tw_ + px(8), lh - px(4), px(5), 0x252526);
+                let ic = running ? C_ACCENT : (res_ok ? C_OK : C_ERROR);
+                disc(tx + px(6), ly + lh / 2, px(3), ic);
+                let verb = tool_verb(s);
+                let vw = txt_v(tx + px(16), ly, lh, verb, C_TEXT, UI);
+                let sum = tool_summary(i);
+                txt_v(tx + px(22) + vw, ly, lh, fit(sum, tw_ - vw - px(52), UI), C_MUTED, UI);
+                draw_glyph(ag_open[i] ? "chevdown" : "chevright", tx + tw_ - px(18), ly + (lh - px(16)) / 2, px(16), C_MUTED);
+                if (clicked_in(tx - px(4), ly + px(2), tw_ + px(8), lh - px(4)) && inside(up_x, up_y, x, y, w, h)) {
+                    ag_open[i] = !ag_open[i];
+                    ag_follow = false;
+                }
+            } else if (len(s) > 0) {
+                txt_inline(tx, ly + px(2), s);
+            }
+            ly += lh;
+        }
+        // copy button on assistant answers
+        if (role == "assistant" && len(ag_content[i]) > 0 && hovered(x, yy, w, hh) && inside(mx, my, x, y, w, h)) {
+            if (icon_button(x + w - px(34), yy - px(4), "copy", "Copy")) { nx_clip_set(ag_content[i]); }
+        }
+        yy += hh - (role == "user" ? px(5) : 0);
+    }
+    if (status_h > 0) {
+        let sy_ = yy + px(4);
+        if (len(ag_error) > 0 && !agent_busy()) {
+            for (l in ag_wrap(ag_error, tw_, UI)) {
+                txt(tx, sy_, l, 0xF48771, UI);
+                sy_ += ui.text_height(UI) + px(4);
+            }
+        } else if (agent_busy()) {
+            let dots = ".".repeat((int)((now_ms / 400) % 4));
+            txt(tx, sy_, ag_status + dots, C_MUTED, UI);
+        } else {
+            txt(tx, sy_, ag_status, C_MUTED, UI);
+        }
+    }
+    nx_clip_off();
+    if (total > h) {
+        let th = imax(px(20), h * h / total);
+        let ty = y + (h - th) * ag_scroll / imax(1, max_scroll);
+        fill_a(x + w - px(8), ty, px(6), th, 0x797979, 70);
+    }
+}
+
+// The chat input grows with its text, up to eight lines.
+fn ag_input_lines(w: int): []string {
+    let t: string = fld_text[FLD_AGENT];
+    return ag_wrap(t, w - px(40) - px(64), UI);
+}
+
+fn ag_input_h(w: int): int {
+    let n = clamp(len(ag_input_lines(w)), 1, 8);
+    return n * (ui.text_height(UI) + px(5)) + px(22);
+}
+
+fn draw_agent_input(x: int, y: int, w: int, h: int) {
+    fill(x + 1, y, w - 1, h, C_SIDEBAR);
+    let bx = x + px(12);
+    let by = y + px(6);
+    let bw = w - px(24);
+    let bh = h - px(16);
+    ag_in_x = bx;
+    ag_in_y = by;
+    ag_in_w = bw;
+    ag_in_h = bh;
+    let focused = focus == F_AGENT;
+    rrect(bx, by, bw, bh, px(6), C_INPUT);
+    rrect_line(bx, by, bw, bh, px(6), focused ? C_ACCENT : C_INPUT_BORDER);
+    let t: string = fld_text[FLD_AGENT];
+    let lh = ui.text_height(UI) + px(5);
+    let lines = ag_input_lines(w);
+    let tx = bx + px(10);
+    let ty = by + px(8);
+    if (len(t) == 0) {
+        txt(tx, ty, ag_mode == "agent" ? "Ask the agent to do something..." : "Ask a question...", C_DIM, UI);
+    }
+    // caret: find the wrapped line holding it
+    let caret: int = fld_caret[FLD_AGENT];
+    let pos = 0;
+    let first = imax(0, len(lines) - 8);
+    for (k, len(lines)) {
+        let l: string = lines[k];
+        let lstart = t.index_of(l, pos);
+        if (lstart < 0) { lstart = pos; }
+        let lend = lstart + len(l);
+        if (k >= first) {
+            let ly = ty + (k - first) * lh;
+            if (focused && fld_has_sel(FLD_AGENT)) {
+                let a = imax(imin(fld_anchor[FLD_AGENT], caret), lstart);
+                let b = imin(imax(fld_anchor[FLD_AGENT], caret), lend);
+                if (b > a) { fill(tx + tw(t.substring(lstart, a - lstart), UI), ly, tw(t.substring(a, b - a), UI), lh - px(2), C_SELECTION); }
+            }
+            txt(tx, ly, l, C_TEXT, UI);
+            if (focused && caret_on() && caret >= lstart && (caret < lend || (caret == lend && (k == len(lines) - 1 || t.substring(lend, 1) != " ")))) {
+                fill(tx + tw(t.substring(lstart, caret - lstart), UI), ly, 1, lh - px(3), C_TEXT);
+            }
+        }
+        pos = lend;
+        while (pos < len(t) && (t[pos] == ' ' || t[pos] == '\n')) { pos++; }
+    }
+    // send / stop
+    let sx_ = bx + bw - px(58);
+    let sy_ = by + bh - px(30);
+    if (agent_busy()) {
+        if (ui.button(sx_, sy_, px(52), px(24), "Stop", "danger")) { agent_stop(); }
+    } else {
+        if (ui.button(sx_, sy_, px(52), px(24), "Send", "primary")) { agent_send(); }
+    }
+    txt(bx + px(10), by + bh - px(20), ag_mode == "agent" ? provider_label(ag_provider) + " · " + ag_model_label() : "Chat · " + ag_model_label(), C_DIM, UI_SMALL);
+}
+
+fn agent_key(vk: int, mods: int) {
+    let shift = (mods & M_SHIFT) != 0;
+    if (vk == K_ENTER && !shift) {
+        agent_send();
+        return;
+    }
+    if (vk == K_ENTER && shift) {
+        // fld_insert turns newlines into spaces, so splice it in directly
+        if (fld_has_sel(FLD_AGENT)) { fld_del_sel(FLD_AGENT); }
+        let t: string = fld_text[FLD_AGENT];
+        let c: int = fld_caret[FLD_AGENT];
+        fld_text[FLD_AGENT] = t.substring(0, c) + "\n" + t.substring(c, -1);
+        fld_caret[FLD_AGENT] = c + 1;
+        fld_anchor[FLD_AGENT] = c + 1;
+        return;
+    }
+    if (vk == K_ESC) {
+        if (agent_busy()) {
+            agent_stop();
+        } else {
+            focus = F_EDITOR;
+        }
+        return;
+    }
+    fld_key(FLD_AGENT, vk, mods);
+}
+
+fn agent_mouse(x: int, y: int, btn: int) {
+    if (inside(x, y, ag_in_x, ag_in_y, ag_in_w, ag_in_h)) {
+        focus = F_AGENT;
+        fld_caret[FLD_AGENT] = len(fld_text[FLD_AGENT]);
+        fld_anchor[FLD_AGENT] = fld_caret[FLD_AGENT];
+        return;
+    }
+    if (y >= TOOLBAR_H + HEADER_H + px(44)) { focus = F_AGENT; }
+}
+
+fn agent_wheel(delta: int) {
+    ag_scroll = imax(0, ag_scroll - delta * px(60) / 120);
+    ag_follow = false;
+    frame_dirty = true;
+}
+
+// ---- mono text ---------------------------------------------------------------------------------------------
+
+// Code-font text with per-byte colours, cut at max_w.
+fn mono_colored(x: int, y: int, s: string, cols: []int, max_w: int) {
+    nx_clip(x, y - px(2), x + max_w, y + nx_font_h(PANEL_FONT) + px(2));
+    let v = 0;
+    let j = 0;
+    let n = len(s);
+    let cw: int = nx_font_cw(PANEL_FONT);
+    while (j < n && v * cw < max_w) {
+        let cl = cp_len(s, j);
+        let b = ubyte(s, j);
+        if (b > 32) {
+            let c = j < len(cols) ? cols[j] : C_TEXT;
+            nx_text_cell(PANEL_FONT, x + v * cw, y, cw, s.substring(j, cl), c);
+        }
+        j += cl;
+        v++;
+    }
+    nx_clip_off();
+}
+
+// A line of chat text with `inline code` drawn in the code colour.
+fn txt_inline(x: int, y: int, s: string) {
+    if (!s.contains("`")) {
+        txt(x, y, s, C_TEXT, UI);
+        return;
+    }
+    let parts = s.split("`");
+    let px_ = x;
+    for (k, len(parts)) {
+        let part: string = parts[k];
+        if (k % 2 == 1) {
+            let w = tw(part, UI);
+            rrect(px_ - px(1), y - px(1), w + px(4), ui.text_height(UI) + px(2), px(3), 0x2A2A2A);
+            txt(px_ + px(1), y, part, 0xD7BA7D, UI);
+            px_ += w + px(5);
+        } else {
+            px_ += txt(px_, y, part, C_TEXT, UI);
+        }
+    }
+}

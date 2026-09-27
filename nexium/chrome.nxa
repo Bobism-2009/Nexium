@@ -10,7 +10,8 @@ fn layout() {
     side_y = top;
     side_h = bottom - top;
     main_x = ACT_W + (show_sidebar ? sidebar_w + 1 : 0);
-    main_w = win_w - main_x;
+    agent_w = clamp(agent_w, px(280), imax(px(280), win_w / 2));
+    main_w = win_w - main_x - (show_agent ? agent_w : 0);
     panel_h = clamp(panel_h, px(100), imax(px(100), bottom - top - px(140)));
     panel_y = show_panel ? bottom - panel_h : bottom;
     ed_x = main_x;
@@ -19,7 +20,7 @@ fn layout() {
     ed_h = panel_y - ed_y;
     gutter_w = px(18) + digits(imax(len(L), 99)) * CW + px(22);
     text_x = ed_x + gutter_w;
-    text_w = ed_w - gutter_w - SCROLL_W;
+    text_w = ed_w - gutter_w - SCROLL_W - mm_w();
 }
 
 // Wrapped text; returns the height it took.
@@ -46,7 +47,7 @@ fn para(x: int, y: int, w: int, s: string, c: int, size: int): int {
 }
 
 fn section_title(x: int, y: int, w: int, title: string) {
-    fill(x, y, w, HEADER_H, C_CHROME);
+    fill(x, y, w, HEADER_H, C_SIDEBAR);
     txt_v(x + px(20), y, HEADER_H, title, C_MUTED, UI_SMALL);
 }
 
@@ -90,7 +91,7 @@ fn draw_logo_c(x: int, y: int, s: int, back: bool, fg: int, bar: int) {
 // ---- title bar -------------------------------------------------------------------------------------
 
 fn draw_toolbar() {
-    fill(0, 0, win_w, TOOLBAR_H, C_CHROME);
+    fill(0, 0, win_w, TOOLBAR_H, C_TITLE);
     hline(0, TOOLBAR_H - 1, win_w, C_BORDER);
     draw_logo(px(10), (TOOLBAR_H - px(20)) / 2, px(20), true);
     let names = MENU_NAMES.split(" ");
@@ -169,7 +170,7 @@ fn toolbar_mouse(x: int, y: int) {
 fn icon_files(x: int, y: int, c: int) {
     // two sheets of paper
     outline(x + px(4), y + px(1), px(11), px(15), c);
-    fill(x + px(1), y + px(5), px(11), px(15), C_CHROME);
+    fill(x + px(1), y + px(5), px(11), px(15), C_ACTBAR);
     outline(x + px(1), y + px(5), px(11), px(15), c);
     hline(x + px(4), y + px(10), px(5), c);
     hline(x + px(4), y + px(13), px(5), c);
@@ -201,9 +202,9 @@ fn gear(cx_: int, cy_: int, r: int, c: int) {
 }
 
 fn draw_activity() {
-    fill(0, TOOLBAR_H, ACT_W, win_h - TOOLBAR_H - STATUS_H, C_CHROME);
+    fill(0, TOOLBAR_H, ACT_W, win_h - TOOLBAR_H - STATUS_H, C_ACTBAR);
     vline(ACT_W - 1, TOOLBAR_H, win_h - TOOLBAR_H - STATUS_H, C_BORDER);
-    let items = 2;
+    let items = 3;
     for (i, items) {
         let y = TOOLBAR_H + i * ACT_W;
         let on = show_sidebar && view == i;
@@ -212,9 +213,25 @@ fn draw_activity() {
         if (on) { fill(0, y, px(2), ACT_W, C_BRIGHT); }
         let ix = (ACT_W - px(20)) / 2;
         let iy = y + (ACT_W - px(20)) / 2;
-        if (i == 0) { icon_files(ix, iy, c); } else { icon_search(ix, iy, c); }
-        if (hov) { tooltip(i == 0 ? "Explorer (Ctrl+Shift+E)" : "Search (Ctrl+Shift+F)"); }
+        if (i == 0) {
+            icon_files(ix, iy, c);
+        } else if (i == 1) {
+            icon_search(ix, iy, c);
+        } else {
+            draw_glyph("outline", ix, iy, px(20), c);
+        }
+        if (hov) {
+            if (i == 0) { tooltip("Explorer (Ctrl+Shift+E)"); }
+            if (i == 1) { tooltip("Search (Ctrl+Shift+F)"); }
+            if (i == 2) { tooltip("Outline"); }
+        }
     }
+    // the agent toggle sits above settings
+    let ay_ = win_h - STATUS_H - ACT_W * 2;
+    let ahov = hovered(0, ay_, ACT_W, ACT_W);
+    if (show_agent) { fill(0, ay_, px(2), ACT_W, C_BRIGHT); }
+    draw_glyph("agent", (ACT_W - px(20)) / 2, ay_ + (ACT_W - px(20)) / 2, px(20), ahov || show_agent ? C_BRIGHT : 0x868686);
+    if (ahov) { tooltip("Agent (Ctrl+Shift+L)"); }
     let gy = win_h - STATUS_H - ACT_W;
     let ghov = hovered(0, gy, ACT_W, ACT_W);
     let gon = active_kind() == 1;
@@ -228,8 +245,14 @@ fn activity_mouse(x: int, y: int) {
         open_special(1);
         return;
     }
+    if (y >= gy - ACT_W) {
+        show_agent = !show_agent;
+        if (show_agent) { focus = F_AGENT; }
+        save_settings();
+        return;
+    }
     let i = (y - TOOLBAR_H) / ACT_W;
-    if (i < 0 || i > 1) { return; }
+    if (i < 0 || i > 2) { return; }
     if (show_sidebar && view == i) {
         show_sidebar = false;
     } else {
@@ -244,9 +267,16 @@ fn activity_mouse(x: int, y: int) {
 
 fn draw_sidebar() {
     if (!show_sidebar) { return; }
-    fill(side_x, side_y, sidebar_w, side_h, C_CHROME);
-    if (view == 0) { draw_explorer(); } else { draw_search_view(); }
+    fill(side_x, side_y, sidebar_w, side_h, C_SIDEBAR);
+    if (view == 0) {
+        draw_explorer();
+    } else if (view == 1) {
+        draw_search_view();
+    } else {
+        draw_outline();
+    }
     vline(side_x + sidebar_w, side_y, side_h, C_BORDER);
+    shadow_v(side_x + sidebar_w + 1, side_y, side_h, true);
     if (drag == 1 || (hovered(side_x + sidebar_w - px(2), side_y, px(5), side_h) && drag == 0)) {
         fill(side_x + sidebar_w - 1, side_y, px(3), side_h, C_ACCENT);
     }
@@ -262,7 +292,7 @@ fn tab_width(i: int): int {
 fn draw_tabs() {
     let x0 = main_x;
     let y = TOOLBAR_H;
-    fill(x0, y, main_w, TABS_H, C_CHROME);
+    fill(x0, y, main_w, TABS_H, C_TITLE);
     hline(x0, y + TABS_H - 1, main_w, C_BORDER);
     tab_xs.clear();
     tab_ws.clear();
@@ -396,8 +426,8 @@ fn draw_crumbs() {
 fn status_item(x: int, s: string, id: string, right: bool): int {
     let w = tw(s, UI_SMALL) + px(16);
     let ix = right ? x - w : x;
-    if (hovered(ix, win_h - STATUS_H, w, STATUS_H) && len(id) > 0) { fill(ix, win_h - STATUS_H + 1, w, STATUS_H - 1, 0x2B2B2B); }
-    txt_v(ix + px(8), win_h - STATUS_H, STATUS_H, s, C_TEXT, UI_SMALL);
+    if (hovered(ix, win_h - STATUS_H, w, STATUS_H) && len(id) > 0) { fill(ix, win_h - STATUS_H, w, STATUS_H, 0x1F77B4); }
+    txt_v(ix + px(8), win_h - STATUS_H, STATUS_H, s, C_BRIGHT, UI_SMALL);
     status_items_x.push(ix);
     status_items_w.push(w);
     status_items_id.push(id);
@@ -406,24 +436,23 @@ fn status_item(x: int, s: string, id: string, right: bool): int {
 
 fn draw_status() {
     let y = win_h - STATUS_H;
-    fill(0, y, win_w, STATUS_H, C_CHROME);
-    hline(0, y, win_w, C_BORDER);
+    fill(0, y, win_w, STATUS_H, C_STATUS);
     status_items_x.clear();
     status_items_w.clear();
     status_items_id.clear();
     // the remote-style block at the far left
     let bw = px(34);
-    fill(0, y, bw, STATUS_H, C_ACCENT);
+    fill(0, y, bw, STATUS_H, 0x16825D);
     draw_logo((bw - px(14)) / 2, y + (STATUS_H - px(14)) / 2, px(14), false);
     let x = bw + px(4);
     if (len(git_branch) > 0) {
         // a branch glyph: two dots and a line
         let gx = x + px(8);
         let cyy = y + STATUS_H / 2;
-        circle(gx + px(2), cyy - px(4), px(2), C_TEXT);
-        circle(gx + px(2), cyy + px(4), px(2), C_TEXT);
-        circle(gx + px(8), cyy - px(2), px(2), C_TEXT);
-        vline(gx + px(2), cyy - px(2), px(4), C_TEXT);
+        circle(gx + px(2), cyy - px(4), px(2), C_BRIGHT);
+        circle(gx + px(2), cyy + px(4), px(2), C_BRIGHT);
+        circle(gx + px(8), cyy - px(2), px(2), C_BRIGHT);
+        vline(gx + px(2), cyy - px(2), px(4), C_BRIGHT);
         x += px(12);
         x += status_item(x, git_branch, "", false);
     }
@@ -432,15 +461,15 @@ fn draw_status() {
     let warns = len(prob_file) - errs;
     let px0 = x;
     let pw = tw((string)errs, UI_SMALL) + tw((string)warns, UI_SMALL) + px(52);
-    if (hovered(px0, y, pw, STATUS_H)) { fill(px0, y + 1, pw, STATUS_H - 1, 0x2B2B2B); }
+    if (hovered(px0, y, pw, STATUS_H)) { fill(px0, y, pw, STATUS_H, 0x1F77B4); }
     let cyy = y + STATUS_H / 2;
-    circle(px0 + px(14), cyy, px(5), C_TEXT);
-    line(px0 + px(12), cyy - px(2), px0 + px(16), cyy + px(2), C_TEXT, 1);
-    line(px0 + px(16), cyy - px(2), px0 + px(12), cyy + px(2), C_TEXT, 1);
+    circle(px0 + px(14), cyy, px(5), C_BRIGHT);
+    line(px0 + px(12), cyy - px(2), px0 + px(16), cyy + px(2), C_BRIGHT, 1);
+    line(px0 + px(16), cyy - px(2), px0 + px(12), cyy + px(2), C_BRIGHT, 1);
     let tx = px0 + px(22);
-    tx += txt_v(tx, y, STATUS_H, (string)errs, C_TEXT, UI_SMALL) + px(8);
-    gfx.tri(tx + px(5), cyy - px(5), tx, cyy + px(4), tx + px(10), cyy + px(4), 204, 204, 204);
-    txt_v(tx + px(14), y, STATUS_H, (string)warns, C_TEXT, UI_SMALL);
+    tx += txt_v(tx, y, STATUS_H, (string)errs, C_BRIGHT, UI_SMALL) + px(8);
+    gfx.tri(tx + px(5), cyy - px(5), tx, cyy + px(4), tx + px(10), cyy + px(4), 255, 255, 255);
+    txt_v(tx + px(14), y, STATUS_H, (string)warns, C_BRIGHT, UI_SMALL);
     status_items_x.push(px0);
     status_items_w.push(pw);
     status_items_id.push("view.problems");
@@ -600,14 +629,14 @@ fn draw_settings_page() {
         set_args = run_args;
         set_loaded = true;
     }
-    clamp_page(px(780));
+    clamp_page(px(1260));
     let x = main_x + imax(px(40), (main_w - px(720)) / 2);
     let w = imin(px(720), main_w - px(80));
     let y = top + px(36) - page_scroll;
     ui.heading(x, y, "Settings", px(28));
     y += px(56);
 
-    ui.panel(x, y, w, px(206), "Text Editor");
+    ui.panel(x, y, w, px(300), "Text Editor");
     let iy = y + px(56);
     txt(x + px(20), iy, "Font Size", C_TEXT, UI);
     txt(x + px(20), iy + px(20), "Size of the code font, in pixels.", C_MUTED, UI_SMALL);
@@ -626,7 +655,23 @@ fn draw_settings_page() {
         auto_save = asv;
         save_settings();
     }
-    y += px(226);
+    iy += px(40);
+    let mm = ui.toggle(x + px(20), iy, "Show the minimap beside the scrollbar", show_minimap);
+    if (mm != show_minimap) {
+        show_minimap = mm;
+        save_settings();
+    }
+    iy += px(40);
+    txt(x + px(20), iy + px(8), "Font family", C_TEXT, UI);
+    if (len(set_font) == 0) { set_font = font_family; }
+    set_font = ui.textbox(x + px(140), iy, w - px(280), set_font, "Cascadia Mono;Consolas");
+    if (ui.button(x + w - px(128), iy, px(108), ui.text_height(UI) + px(16), "Apply", "secondary")) {
+        font_family = set_font.trim();
+        if (len(font_family) == 0) { font_family = "Cascadia Mono;Consolas"; }
+        metrics_init();
+        save_settings();
+    }
+    y += px(320);
 
     ui.panel(x, y, w, px(250), "Nexa");
     iy = y + px(56);
@@ -650,8 +695,85 @@ fn draw_settings_page() {
     }
     y += px(270);
 
+    draw_agent_settings(x, y, w);
+    y += px(390);
+
     ui.panel(x, y, w, px(120), "About");
     txt(x + px(20), y + px(56), "Nexium " + VERSION + ", written in Nexa and drawn with std/ui.", C_TEXT, UI);
     let cv = len(nexac_version) > 0 ? nexac_version : "NexaC not found on PATH";
     txt(x + px(20), y + px(80), cv + "   ·   settings: " + settings_path, C_MUTED, UI_SMALL);
+}
+
+fn draw_agent_settings(x: int, y: int, w: int) {
+    let providers = provider_ids();
+    if (set_provider != ag_provider) {
+        set_provider = ag_provider;
+        let k = "";
+        if (ag_keys.has(ag_provider)) { k = ag_keys[ag_provider]; }
+        fld_set(FLD_KEY, k);
+        set_url = ag_urls.has(ag_provider) ? ag_urls[ag_provider] : "";
+        set_custom = ag_custom.has(ag_provider) ? ag_custom[ag_provider] : "";
+    }
+    if (len(set_nexa_lang) == 0) { set_nexa_lang = nexa_lang; }
+    ui.panel(x, y, w, px(370), "Agent");
+    let iy = y + px(56);
+    let half = (w - px(60)) / 2;
+    txt(x + px(20), iy, "Provider", C_TEXT, UI);
+    txt(x + px(40) + half, iy, "Temperature", C_TEXT, UI);
+    let t100 = (int)(ag_temp * 100.0 + 0.5);
+    let nt = ui.slider(x + px(40) + half, iy + px(30), half - px(60), t100, 0, 100);
+    txt(x + w - px(56), iy + px(28), f"{(float)nt / 100.0:.2}", C_TEXT, UI);
+    if (nt != t100) {
+        ag_temp = (float)nt / 100.0;
+        save_settings();
+    }
+    iy += px(70);
+    txt(x + px(20), iy, "API key", C_TEXT, UI);
+    let env = provider_env(ag_provider);
+    let hint = len(env) > 0 ? "Stored in settings.json. Empty uses " + env + "." : "Not needed for this provider.";
+    txt(x + px(20), iy + px(20), hint, C_MUTED, UI_SMALL);
+    key_x = x + px(20);
+    key_y = iy + px(42);
+    key_w = w - px(40);
+    key_h = ui.text_height(UI) + px(16);
+    fld_draw(FLD_KEY, key_x, key_y, key_w, key_h, focus == F_KEY, len(ag_key()) > 0 ? "(using " + env + ")" : "sk-...");
+    iy += px(90);
+    txt(x + px(20), iy, "Base URL", C_TEXT, UI);
+    let nu = ui.textbox(x + px(20), iy + px(24), half, set_url, provider_url(ag_provider));
+    if (nu != set_url) {
+        set_url = nu;
+        ag_urls[ag_provider] = nu.trim();
+        save_settings();
+    }
+    txt(x + px(40) + half, iy, "Custom model id", C_TEXT, UI);
+    let nc = ui.textbox(x + px(40) + half, iy + px(24), half, set_custom, "overrides the model list");
+    if (nc != set_custom) {
+        set_custom = nc;
+        ag_custom[ag_provider] = nc.trim();
+        save_settings();
+    }
+    iy += px(80);
+    txt(x + px(20), iy, "Nexa-Lang folder", C_TEXT, UI);
+    txt(x + px(20), iy + px(20), "The agent reads its SYNTAX notes so it writes real Nexa.", C_MUTED, UI_SMALL);
+    let nl = ui.textbox(x + px(20), iy + px(42), w - px(40), set_nexa_lang, "D:\\Projects\\Nexa-Lang");
+    if (nl != set_nexa_lang) {
+        set_nexa_lang = nl;
+        nexa_lang = nl.trim();
+        save_settings();
+    }
+    // last, so its open list draws over the fields below it
+    let plabels: []string;
+    for (p in providers) { plabels.push(provider_label(p)); }
+    let pi = providers.index_of(ag_provider);
+    let np = ui.dropdown(x + px(20), y + px(56) + px(26), half, plabels, pi);
+    if (np != pi && np >= 0) {
+        ag_provider = providers[np];
+        save_settings();
+    }
+}
+
+fn key_field_changed() {
+    let k: string = fld_text[FLD_KEY];
+    ag_keys[ag_provider] = k.trim();
+    save_settings();
 }

@@ -1,7 +1,7 @@
 // Every global the IDE shares, in one place: NexaC emits globals in file order,
 // so they have to be declared before the functions that use them.
 
-let const VERSION: string = "2.0.0";
+let const VERSION: string = "2.1.0";
 
 // ---- colours (VS Code Dark Modern) ------------------------------------------------
 
@@ -459,3 +459,75 @@ let chord_k = false;
 let HC: []int;
 let test_mode = false;
 let page_scroll = 0;
+
+// ---- fonts (native ClearType text, see native_text.hpp) ------------------------------------------
+
+let CODE_FONT = -1;      // the editor
+let PANEL_FONT = -1;      // panel output, terminal, code in the agent chat
+let LH_MONO = 18;
+let font_family = "Cascadia Mono;Consolas";
+
+// ---- colours for the separate areas -------------------------------------------------------------
+
+let const C_TITLE = 0x141414;
+let const C_ACTBAR = 0x141414;
+let const C_SIDEBAR = 0x191919;
+let const C_PANEL = 0x191919;
+let const C_STATUS = 0x0E639C;
+
+// ---- agent ---------------------------------------------------------------------------------------------
+
+let const F_AGENT = 9;
+let const F_KEY = 10;
+let const FLD_AGENT = 6;
+let const FLD_KEY = 7;
+let show_agent = true;
+let agent_w = 380;
+let nexa_lang = "D:/Projects/Nexa-Lang";
+let ag_provider = "openai";
+let ag_mode = "agent";
+let ag_temp: float = 0.2;
+let ag_keys: map[string]string;
+let ag_urls: map[string]string;
+let ag_models: map[string]string;
+let ag_custom: map[string]string;
+let ag_role: []string;
+let ag_content: []string;
+let ag_tool_id: []string;
+let ag_tool_name: []string;
+let ag_tool_args: []string;
+let ag_open: []bool;
+let ag_pending: []int;
+let ag_tool_idx = 0;
+let ag_state = 0;
+let ag_http = -1;
+let ag_hops = 0;
+let ag_error = "";
+let ag_status = "";
+let ag_proc = -1;
+let ag_proc_out = "";
+let ag_proc_cwd = "";
+let ag_proc_start = 0;
+let ag_proc_timeout = 60000;
+let ag_scroll = 0;
+let ag_follow = true;
+let ag_lines: []string;
+let ag_styles: []int;
+let ag_layout_key: []string;
+let ag_layout_h: []int;
+let ag_msg_y = 0;
+let ag_msg_h = 0;
+let ag_in_x = 0;
+let ag_in_y = 0;
+let ag_in_w = 0;
+let ag_in_h = 0;
+let set_url = "";
+let set_custom = "";
+let set_nexa_lang = "";
+let set_font = "";
+let set_provider = "";
+let outline_scroll = 0;
+let key_x = 0;
+let key_y = 0;
+let key_w = 0;
+let key_h = 0;

@@ -54,6 +54,10 @@ fn cmd_init() {
     cmd("view.problems", "View: Show Problems", "Ctrl+Shift+M");
     cmd("view.output", "View: Show Output", "Ctrl+Shift+U");
     cmd("view.terminal", "View: Toggle Terminal", "Ctrl+`");
+    cmd("view.agent", "View: Toggle Agent", "Ctrl+Shift+L");
+    cmd("agent.new", "Agent: New Chat", "");
+    cmd("view.outline", "View: Show Outline", "");
+    cmd("view.minimap", "View: Toggle Minimap", "");
     cmd("view.zoomIn", "View: Increase Font Size", "Ctrl+=");
     cmd("view.zoomOut", "View: Decrease Font Size", "Ctrl+-");
     cmd("view.zoomReset", "View: Reset Font Size", "Ctrl+0");
@@ -184,6 +188,24 @@ fn run_cmd(id: string) {
                 focus = F_TERM;
             }
             break;
+        case "view.agent":
+            show_agent = !show_agent;
+            focus = show_agent ? F_AGENT : F_EDITOR;
+            save_settings();
+            break;
+        case "agent.new":
+            show_agent = true;
+            agent_new_chat();
+            focus = F_AGENT;
+            break;
+        case "view.outline":
+            show_sidebar = true;
+            view = 2;
+            break;
+        case "view.minimap":
+            show_minimap = !show_minimap;
+            save_settings();
+            break;
         case "view.zoomIn": set_font_size(font_size + 1); break;
         case "view.zoomOut": set_font_size(font_size - 1); break;
         case "view.zoomReset": set_font_size(14); break;
@@ -252,7 +274,7 @@ fn menu_items(m: int): []string {
     if (m == 0) { return ["file.new", "file.open", "file.openFolder", "-", "file.save", "file.saveAs", "file.saveAll", "-", "file.revert", "file.close", "file.closeAll", "file.closeFolder", "-", "app.settings", "-", "app.exit"]; }
     if (m == 1) { return ["edit.undo", "edit.redo", "-", "edit.cut", "edit.copy", "edit.paste", "-", "edit.find", "edit.replace", "edit.findInFiles", "-", "edit.comment", "edit.trim", "edit.upper", "edit.lower"]; }
     if (m == 2) { return ["sel.all", "sel.line", "-", "sel.copyUp", "sel.copyDown", "sel.moveUp", "sel.moveDown", "sel.duplicate", "sel.deleteLine", "-", "sel.indent", "sel.outdent"]; }
-    if (m == 3) { return ["view.palette", "view.quickOpen", "-", "view.explorer", "view.search", "view.problems", "view.output", "view.terminal", "-", "view.sidebar", "view.panel", "view.whitespace", "-", "view.zoomIn", "view.zoomOut", "view.zoomReset"]; }
+    if (m == 3) { return ["view.palette", "view.quickOpen", "-", "view.explorer", "view.search", "view.outline", "view.problems", "view.output", "view.terminal", "view.agent", "-", "view.sidebar", "view.panel", "view.minimap", "view.whitespace", "-", "view.zoomIn", "view.zoomOut", "view.zoomReset"]; }
     if (m == 4) { return ["view.quickOpen", "go.line", "go.symbol", "go.definition", "go.bracket", "-", "go.nextTab", "go.prevTab"]; }
     if (m == 5) { return ["run.run", "run.build", "run.stop", "-", "run.check"]; }
     if (m == 6) { return ["view.terminal", "term.new", "term.clear", "-", "run.run", "run.build"]; }

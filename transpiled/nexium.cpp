@@ -2369,6 +2369,8 @@ static int imin(int, int);
 static int imax(int, int);
 static int keycap(int, int, const std::string&);
 static void metrics_init();
+static void shadow_h(int, int, int, bool);
+static void shadow_v(int, int, int, bool);
 static void draw_glyph(const std::string&, int, int, int, int);
 static int ubyte(const std::string&, int);
 static std::string utf8(int);
@@ -2544,6 +2546,10 @@ static void find_as_you_type();
 static int digits(int);
 static void collect_doc_diags();
 static void draw_squiggle(int, int, int, int);
+static int mm_w();
+static int mm_first();
+static void draw_minimap();
+static void minimap_drag();
 static void draw_editor();
 static void draw_gutter(int, int, int);
 static void draw_scrollbar();
@@ -2586,6 +2592,10 @@ static void quick_accept();
 static void quick_key_press(int, int);
 static void draw_quick();
 static bool quick_mouse(int, int);
+static int sym_color(int);
+static std::string sym_kind_name(int);
+static void draw_outline();
+static void outline_mouse(int, int);
 static void cmd(std::string, std::string, std::string);
 static void cmd_init();
 static int cmd_index(const std::string&);
@@ -2626,7 +2636,7 @@ static void maybe_check();
 static int problem_counts_err();
 static void ensure_terminal();
 static void term_key(int, int);
-static int mono(int, int, const std::string&, int, int);
+static int mono(int, int, std::string, int, int);
 static int out_color(const std::string&);
 static void panel_tabs_draw(int, int, int);
 static void draw_panel();
@@ -2634,6 +2644,64 @@ static void draw_problems(int, int, int, int);
 static void draw_lines(int, int, int, int, int);
 static void panel_mouse(int, int, int, int);
 static void panel_wheel(int);
+static std::vector<std::string> provider_ids();
+static std::string provider_label(const std::string&);
+static std::string provider_url(const std::string&);
+static std::string provider_env(const std::string&);
+static std::vector<std::string> provider_models(const std::string&);
+static std::string ag_key();
+static std::string ag_url();
+static std::string ag_model();
+static std::string ag_model_label();
+static std::string join_url(const std::string&, const std::string&);
+static void ag_push(std::string, std::string, std::string, std::string, std::string);
+static void agent_new_chat();
+static bool agent_busy();
+static void agent_stop();
+static void agent_send();
+static std::string agent_system();
+static __nexa_json anthropic_tools();
+static void ag_request();
+static void ag_fail(std::string);
+static void ag_response();
+static void agent_poll();
+static void ag_tool_result(std::string);
+static std::string jstr(const __nexa_json&, const std::string&);
+static int jint(const __nexa_json&, const std::string&, int);
+static std::string resolve_path(const std::string&);
+static std::string file_text(const std::string&);
+static void apply_to_buffer(std::string, std::string);
+static bool write_text(std::string, std::string);
+static std::string tool_read(const __nexa_json&);
+static std::string tool_write(__nexa_json);
+static std::string tool_edit(__nexa_json);
+static std::string tool_list(const __nexa_json&);
+static bool glob_at(const std::string&, int, const std::string&, int);
+static bool glob_match(const std::string&, const std::string&);
+static std::string tool_search(__nexa_json);
+static std::string tool_glob(__nexa_json);
+static std::string tool_delete(__nexa_json);
+static std::string tool_rename(__nexa_json);
+static std::string tool_info();
+static std::string run_tool(std::string, __nexa_json);
+static bool tool_start_command(std::string, __nexa_json);
+static std::vector<std::string> ag_wrap(const std::string&, int, int);
+static std::string md_plain(const std::string&);
+static void ag_layout(int, int);
+static int line_h(int);
+static std::string tool_summary(int);
+static std::string tool_verb(const std::string&);
+static int agent_x();
+static void draw_agent();
+static void draw_agent_messages(int, int, int, int);
+static std::vector<std::string> ag_input_lines(int);
+static int ag_input_h(int);
+static void draw_agent_input(int, int, int, int);
+static void agent_key(int, int);
+static void agent_mouse(int, int, int);
+static void agent_wheel(int);
+static void mono_colored(int, int, std::string, std::vector<int>, int);
+static void txt_inline(int, int, const std::string&);
 static void layout();
 static int para(int, int, int, const std::string&, int, int);
 static void section_title(int, int, int, const std::string&);
@@ -2663,6 +2731,8 @@ static bool link_button(int, int, const std::string&);
 static void clamp_page(int);
 static void draw_welcome();
 static void draw_settings_page();
+static void draw_agent_settings(int, int, int);
+static void key_field_changed();
 static std::string settings_file();
 static void load_settings();
 static void save_settings();
@@ -2685,7 +2755,7 @@ static void open_arg(std::string);
 static void test_hook();
 static std::string buf_title_key();
 
-const std::string VERSION = "2.0.0";
+const std::string VERSION = "2.1.0";
 const int C_EDITOR = 0x1F1F1F;
 const int C_CHROME = 0x181818;
 const int C_BORDER = 0x2B2B2B;
@@ -3043,6 +3113,69 @@ bool chord_k = false;
 std::vector<int> HC;
 bool test_mode = false;
 int page_scroll = 0;
+int CODE_FONT = -1;
+int PANEL_FONT = -1;
+int LH_MONO = 18;
+std::string font_family = "Cascadia Mono;Consolas";
+const int C_TITLE = 0x141414;
+const int C_ACTBAR = 0x141414;
+const int C_SIDEBAR = 0x191919;
+const int C_PANEL = 0x191919;
+const int C_STATUS = 0x0E639C;
+const int F_AGENT = 9;
+const int F_KEY = 10;
+const int FLD_AGENT = 6;
+const int FLD_KEY = 7;
+bool show_agent = true;
+int agent_w = 380;
+std::string nexa_lang = "D:/Projects/Nexa-Lang";
+std::string ag_provider = "openai";
+std::string ag_mode = "agent";
+double ag_temp = 0.2;
+std::map<std::string, std::string> ag_keys;
+std::map<std::string, std::string> ag_urls;
+std::map<std::string, std::string> ag_models;
+std::map<std::string, std::string> ag_custom;
+std::vector<std::string> ag_role;
+std::vector<std::string> ag_content;
+std::vector<std::string> ag_tool_id;
+std::vector<std::string> ag_tool_name;
+std::vector<std::string> ag_tool_args;
+std::vector<bool> ag_open;
+std::vector<int> ag_pending;
+int ag_tool_idx = 0;
+int ag_state = 0;
+int ag_http = -1;
+int ag_hops = 0;
+std::string ag_error = "";
+std::string ag_status = "";
+int ag_proc = -1;
+std::string ag_proc_out = "";
+std::string ag_proc_cwd = "";
+int ag_proc_start = 0;
+int ag_proc_timeout = 60000;
+int ag_scroll = 0;
+bool ag_follow = true;
+std::vector<std::string> ag_lines;
+std::vector<int> ag_styles;
+std::vector<std::string> ag_layout_key;
+std::vector<int> ag_layout_h;
+int ag_msg_y = 0;
+int ag_msg_h = 0;
+int ag_in_x = 0;
+int ag_in_y = 0;
+int ag_in_w = 0;
+int ag_in_h = 0;
+std::string set_url = "";
+std::string set_custom = "";
+std::string set_nexa_lang = "";
+std::string set_font = "";
+std::string set_provider = "";
+int outline_scroll = 0;
+int key_x = 0;
+int key_y = 0;
+int key_w = 0;
+int key_h = 0;
 
 static int px(int v) {
     return static_cast<int>(((v * SCALE) + 0.5));
@@ -3213,11 +3346,15 @@ static void metrics_init() {
     ROW_H = px(22);
     HEADER_H = px(35);
     SCROLL_W = px(14);
-    LH = (__nexa_ui_text_height(FS) + px(5));
-    CW = ((__nexa_ui_text_width(std::string("0000000000"), FS) + 5) / 10);
+    nx_font_free_all();
+    CODE_FONT = nx_font(font_family.c_str(), FS, 0);
+    PANEL_FONT = nx_font(font_family.c_str(), px(13), 0);
+    CW = nx_font_cw(CODE_FONT);
     if (CW < 4) {
         CW = 4;
     }
+    LH = imax((nx_font_h(CODE_FONT) + px(3)), (FS * 140 / 100));
+    LH_MONO = (nx_font_h(PANEL_FONT) + px(4));
     glyph_s.clear();
     for (int i = 0; i < 128; i++) {
         if (i < 33 || i == 127) {
@@ -3232,6 +3369,22 @@ static void metrics_init() {
             glyph_w[i] = w;
             glyph_off[i] = ((CW - w) / 2);
         }
+    }
+}
+
+static void shadow_h(int x, int y, int w, bool down) {
+    std::vector<int> alphas = std::vector<int>{60, 38, 22, 11, 4};
+    for (int k = 0; k < 5; k++) {
+        int yy = ((down) ? ((y + k)) : ((y - 1 - k)));
+        fill_a(x, yy, w, 1, 0x000000, alphas[k]);
+    }
+}
+
+static void shadow_v(int x, int y, int h, bool right) {
+    std::vector<int> alphas = std::vector<int>{4, 11, 22, 38, 60};
+    for (int k = 0; k < 5; k++) {
+        int xx = ((right) ? ((x + 5 - k)) : ((x + k + 1)));
+        fill_a(xx, y, 1, h, 0x000000, alphas[k]);
     }
 }
 
@@ -3267,7 +3420,7 @@ static void draw_glyph(const std::string& kind, int x, int y, int s, int c) {
         fill((m + px(4)), n, 1, px(7), c);
     } else if (kind == "refresh") {
         circle(m, n, px(5), c);
-        fill((m + px(2)), (n - px(6)), px(4), px(4), C_CHROME);
+        fill((m + px(2)), (n - px(6)), px(4), px(4), C_SIDEBAR);
         __nexa_gfx_fill_tri((m + px(1)), (n - px(7)), (m + px(6)), (n - px(5)), (m + px(2)), (n - px(1)), ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
     } else if (kind == "collapse") {
         outline((m - px(6)), (n - px(6)), px(10), px(10), c);
@@ -3293,6 +3446,18 @@ static void draw_glyph(const std::string& kind, int x, int y, int s, int c) {
         __nexa_gfx_fill_tri((m - px(5)), (n - px(2)), (m + px(5)), (n - px(2)), m, (n + px(1)), ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
         outline((m - px(5)), (n - px(2)), px(11), px(8), c);
         fill(m, (n + px(1)), 1, px(5), c);
+    } else if (kind == "gear") {
+        gear(m, n, px(7), c);
+    } else if (kind == "outline") {
+        for (int k = 0; k < 3; k++) {
+            fill((m - px(6)), (n - px(5) + (k * px(5))), px(2), px(2), c);
+            fill((m - px(2)), (n - px(5) + (k * px(5))), px(8), 1, c);
+        }
+    } else if (kind == "agent") {
+        rrect_line((m - px(7)), (n - px(6)), px(14), px(10), px(3), c);
+        __nexa_gfx_fill_tri((m - px(3)), (n + px(4)), (m + px(1)), (n + px(4)), (m - px(4)), (n + px(8)), ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
+        fill((m - px(3)), (n - px(2)), px(2), px(2), c);
+        fill((m + px(2)), (n - px(2)), px(2), px(2), c);
     } else if (kind == "file") {
         outline((m - px(4)), (n - px(6)), px(9), px(12), c);
         fill((m - px(2)), (n - px(2)), px(5), 1, c);
@@ -3713,6 +3878,18 @@ static void fld_draw(int id, int x, int y, int w, int h, bool focused, std::stri
     fill(x, y, w, h, C_INPUT);
     outline(x, y, w, h, ((focused) ? (C_ACCENT) : (C_INPUT_BORDER)));
     std::string t = fld_text[id];
+    if (id == FLD_KEY) {
+        std::string dots = ([](const std::string& __s, int __n){ std::string __o; for (int __i = 0; __i < __n; __i++) __o += __s; return __o; })("\xE2\x80\xA2", imin((int)((t).size()), 60));
+        if ((int)((t).size()) == 0) {
+            txt((x + px(6)), (y + ((h - __nexa_ui_text_height(UI)) / 2)), placeholder, C_DIM, UI);
+        } else {
+            txt((x + px(6)), (y + ((h - __nexa_ui_text_height(UI)) / 2)), dots, C_TEXT, UI);
+        }
+        if (focused && caret_on()) {
+            fill((x + px(6) + tw(dots, UI)), (y + px(4)), 1, (h - px(8)), C_TEXT);
+        }
+        return;
+    }
     int pad = px(6);
     int inner = (w - (pad * 2));
     int cxp = tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, fld_caret[id]), UI);
@@ -6382,6 +6559,11 @@ static void ed_mouse_down(int x, int y, int clicks, int mods) {
     bool shift = ((mods & M_SHIFT) != 0);
     bool ctrl = ((mods & M_CTRL) != 0);
     int sbx = (ed_x + ed_w - SCROLL_W);
+    if (mm_w() > 0 && x >= (sbx - mm_w()) && x < sbx) {
+        drag = 6;
+        minimap_drag();
+        return;
+    }
     if (x >= sbx) {
         int total = (((int)((L).size()) * LH) + code_h());
         int th = imax(px(20), (code_h() * code_h() / imax(total, 1)));
@@ -7119,7 +7301,7 @@ static void open_find(bool replace) {
 static void find_layout() {
     fw_w = imin(px(440), (ed_w - px(40)));
     fw_h = ((find_replace) ? (px(66)) : (px(36)));
-    fw_x = (ed_x + ed_w - fw_w - SCROLL_W - px(6));
+    fw_x = (ed_x + ed_w - fw_w - SCROLL_W - mm_w() - px(6));
     fw_y = ed_y;
 }
 
@@ -7302,6 +7484,91 @@ static void draw_squiggle(int x1, int x2, int y, int c) {
     }
 }
 
+static int mm_w() {
+    if (show_minimap && is_file_tab() && ed_w > px(500)) {
+        return px(70);
+    }
+    return 0;
+}
+
+static int mm_first() {
+    int rows = (ed_h / 2);
+    int max_first = imax(0, ((int)((L).size()) - rows));
+    return (max_first * sy / imax(1, max_sy()));
+}
+
+static void draw_minimap() {
+    int w = mm_w();
+    if (w == 0) {
+        return;
+    }
+    int x = (ed_x + ed_w - SCROLL_W - w);
+    fill(x, ed_y, w, ed_h, C_EDITOR);
+    int first = mm_first();
+    int rows = (ed_h / 2);
+    int k = first;
+    while (k < (int)((L).size()) && k < (first + rows)) {
+        std::string s = L[k];
+        int y = (ed_y + ((k - first) * 2));
+        std::string t = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(s);
+        int c = 0x5A5A5A;
+        if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "//") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "#") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "/*") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "*")) {
+            c = 0x3F5F37;
+        }
+        if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "fn ") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "struct ") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "enum ")) {
+            c = 0x6F6A8C;
+        }
+        int v = 0;
+        int j = 0;
+        int run = -1;
+        while (j < (int)((s).size()) && v < (w - px(6))) {
+            int b = ubyte(s, j);
+            if (b == 32 || b == 9) {
+                if (run >= 0) {
+                    fill((x + px(4) + run), y, (v - run), 1, c);
+                    run = -1;
+                }
+                if (b == 9) {
+                    v = (((v / 4) + 1) * 4);
+                } else {
+                    v = v + 1;
+                }
+                j = j + 1;
+                continue;
+            }
+            if (run < 0) {
+                run = v;
+            }
+            v = v + 1;
+            j = next_i(s, j);
+        }
+        if (run >= 0) {
+            fill((x + px(4) + run), y, (v - run), 1, c);
+        }
+        k = k + 1;
+    }
+    for (int d = 0; d < (int)((doc_diag_lines).size()); d++) {
+        int dl = doc_diag_lines[d];
+        if (dl >= first && dl < (first + rows)) {
+            fill(x, (ed_y + ((dl - first) * 2)), w, 2, ((doc_diag_err[d]) ? (0x7A2A2A) : (0x6A5A10)));
+        }
+    }
+    int vy = (ed_y + (((sy / LH) - first) * 2));
+    int vh = (visible_lines() * 2);
+    bool hov = (hovered(x, ed_y, w, ed_h) || drag == 6);
+    fill_a(x, vy, w, vh, 0xFFFFFF, ((hov) ? (30) : (16)));
+    int cyy = (ed_y + ((cy - first) * 2));
+    if (cy >= first && cy < (first + rows)) {
+        fill(x, cyy, w, 2, 0x3A5A80);
+    }
+}
+
+static void minimap_drag() {
+    int line_ = (mm_first() + ((my - ed_y) / 2));
+    sy = clamp(((line_ - (visible_lines() / 2)) * LH), 0, max_sy());
+    frame_dirty = true;
+}
+
 static void draw_editor() {
     fill(ed_x, ed_y, ed_w, ed_h, C_EDITOR);
     clamp_scroll();
@@ -7312,7 +7579,7 @@ static void draw_editor() {
     hl_ensure(last);
     sel_bounds();
     bool sel = has_sel();
-    int ty = ((LH - __nexa_ui_text_height(FS)) / 2);
+    int ty = ((LH - nx_font_h(CODE_FONT)) / 2);
     int vmin = ((sx / CW) - 1);
     int vmax = (((sx + text_w) / CW) + 1);
     bool focused = (focus == F_EDITOR || focus == F_FIND || focus == F_REPLACE);
@@ -7341,6 +7608,7 @@ static void draw_editor() {
     }
     int cur_hit = ((find_open) ? (current_hit()) : (-1));
     match_brackets();
+    nx_clip(text_x, ed_y, (ed_x + ed_w - SCROLL_W - mm_w()), (ed_y + ed_h));
     int k = first;
     while (k < last) {
         int y = (ed_y + ((k - first) * LH) - off);
@@ -7416,7 +7684,7 @@ static void draw_editor() {
             if (b == 9) {
                 int nv = (((v / 4) + 1) * 4);
                 if (show_ws && v >= vmin) {
-                    txt((text_x + (v * CW) - sx + (CW / 2)), gy, "\xE2\x86\x92", 0x3B3B3B, FS);
+                    nx_text_cell(CODE_FONT, (text_x + (v * CW) - sx), gy, CW, "\xE2\x86\x92", 0x3B3B3B);
                 }
                 v = nv;
                 j = j + 1;
@@ -7429,7 +7697,7 @@ static void draw_editor() {
                 if (v >= vmin) {
                     if (b > 32) {
                         int c = cols[j];
-                        __nexa_ui_text((text_x + (v * CW) - sx + glyph_off[b]), gy, std::string(glyph_s[b]), FS, ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
+                        nx_text_cell(CODE_FONT, (text_x + (v * CW) - sx), gy, CW, glyph_s[b].c_str(), c);
                     } else if (b == 32 && show_ws) {
                         fill((text_x + (v * CW) - sx + (CW / 2)), (y + (LH / 2)), px(2), px(2), 0x3B3B3B);
                     }
@@ -7438,10 +7706,8 @@ static void draw_editor() {
             } else {
                 int cl = cp_len(s, j);
                 if (v >= vmin) {
-                    std::string ch = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, j, cl);
                     int c = cols[j];
-                    int w = tw(ch, FS);
-                    __nexa_ui_text((text_x + (v * CW) - sx + ((CW - w) / 2)), gy, std::string(ch), FS, ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
+                    nx_text_cell(CODE_FONT, (text_x + (v * CW) - sx), gy, CW, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, j, cl).c_str(), c);
                 }
                 j = j + cl;
             }
@@ -7456,6 +7722,7 @@ static void draw_editor() {
         }
         k = k + 1;
     }
+    nx_clip_off();
     if (focused && is_file_tab() && caret_on()) {
         int cyp = (ed_y + (cy * LH) - sy);
         int cxp = (text_x + (vcol(L[cy], cx) * CW) - sx);
@@ -7464,6 +7731,7 @@ static void draw_editor() {
         }
     }
     draw_gutter(first, last, off);
+    draw_minimap();
     draw_scrollbar();
     draw_find();
     draw_hover_diag();
@@ -7473,7 +7741,7 @@ static void draw_gutter(int first, int last, int off) {
     int gx = (text_x - gutter_w);
     fill(gx, ed_y, gutter_w, ed_h, C_EDITOR);
     int nw = (digits((int)((L).size())) * CW);
-    int ty = ((LH - __nexa_ui_text_height(FS)) / 2);
+    int ty = ((LH - nx_font_h(CODE_FONT)) / 2);
     int k = first;
     while (k < last) {
         int y = (ed_y + ((k - first) * LH) - off);
@@ -7482,10 +7750,7 @@ static void draw_gutter(int first, int last, int off) {
         bool active_line = (k == cy);
         int c = ((active_line) ? (0xCCCCCC) : (C_DIM));
         int x = (gx + px(18) + nw - w);
-        for (int i = 0; i < (int)((label).size()); i++) {
-            int b = ubyte(label, i);
-            __nexa_ui_text((x + (i * CW) + glyph_off[b]), (y + ty), std::string(glyph_s[b]), FS, ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
-        }
+        nx_text(CODE_FONT, x, (y + ty), label.c_str(), c);
         for (int d = 0; d < (int)((doc_diag_lines).size()); d++) {
             if (doc_diag_lines[d] == k) {
                 disc((gx + px(8)), (y + (LH / 2)), px(4), ((doc_diag_err[d]) ? (C_ERROR) : (C_WARNING)));
@@ -7858,7 +8123,7 @@ static void draw_explorer() {
         }
         i = i + 1;
     }
-    fill(x, hy, w, ROW_H, C_CHROME);
+    fill(x, hy, w, ROW_H, C_SIDEBAR);
     chevron((x + px(10)), (hy + (ROW_H / 2)), (!tree_collapsed), C_TEXT);
     txt_bold((x + px(20)), hy, ROW_H, fit(upper_s(__nexa_file_basename((folder).c_str())), (w - px(120)), UI_SMALL), UI_SMALL);
     if (hovered(x, side_y, w, side_h)) {
@@ -8613,6 +8878,89 @@ static bool quick_mouse(int x, int y) {
     return true;
 }
 
+static int sym_color(int kind) {
+    if (kind == 1) {
+        return 0xB180D7;
+    }
+    if (kind == 2 || kind == 3) {
+        return 0xEE9D28;
+    }
+    return 0x75BEFF;
+}
+
+static std::string sym_kind_name(int kind) {
+    if (kind == 1) {
+        return "function";
+    }
+    if (kind == 2) {
+        return "struct";
+    }
+    if (kind == 3) {
+        return "enum";
+    }
+    return "variable";
+}
+
+static void draw_outline() {
+    int x = side_x;
+    int w = sidebar_w;
+    section_title(x, side_y, w, "OUTLINE");
+    int top = (side_y + HEADER_H);
+    if (!(is_file_tab())) {
+        txt((x + px(20)), (top + px(6)), "The active editor has no symbols.", C_MUTED, UI);
+        return;
+    }
+    collect_symbols();
+    if ((int)((sym_names).size()) == 0) {
+        txt((x + px(20)), (top + px(6)), "No symbols found in this file.", C_MUTED, UI);
+        return;
+    }
+    int cur = -1;
+    for (int i = 0; i < (int)((sym_lines).size()); i++) {
+        if (sym_lines[i] <= cy) {
+            cur = i;
+        }
+    }
+    int body_h = (side_y + side_h - top);
+    outline_scroll = clamp(outline_scroll, 0, imax(0, (((int)((sym_names).size()) * ROW_H) - body_h)));
+    int i = (outline_scroll / ROW_H);
+    while (i < (int)((sym_names).size())) {
+        int y = (top + (i * ROW_H) - outline_scroll);
+        if (y >= (side_y + side_h)) {
+            break;
+        }
+        if (i == cur) {
+            fill(x, y, w, ROW_H, C_ACTIVE);
+        } else if (hovered(x, y, w, ROW_H)) {
+            fill(x, y, w, ROW_H, C_HOVER);
+        }
+        int kind = sym_kinds[i];
+        draw_glyph("symbol", (x + px(14)), (y + ((ROW_H - px(16)) / 2)), px(16), sym_color(kind));
+        int nw = txt_v((x + px(36)), y, ROW_H, fit(sym_names[i], (w - px(110)), UI), C_TEXT, UI);
+        txt_v((x + px(44) + nw), y, ROW_H, sym_kind_name(kind), C_DIM, UI_SMALL);
+        std::string ln = (std::string("") + std::to_string((sym_lines[i] + 1)));
+        txt_v((x + w - tw(ln, UI_SMALL) - px(14)), y, ROW_H, ln, C_DIM, UI_SMALL);
+        i = i + 1;
+    }
+}
+
+static void outline_mouse(int x, int y) {
+    int top = (side_y + HEADER_H);
+    if (!(is_file_tab()) || y < top) {
+        return;
+    }
+    collect_symbols();
+    int i = ((y - top + outline_scroll) / ROW_H);
+    if (i < 0 || i >= (int)((sym_names).size())) {
+        return;
+    }
+    int ln = sym_lines[i];
+    int col = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(L[ln], sym_names[i]);
+    set_cursor(ln, imax(col, 0), false);
+    reveal(true);
+    focus = F_EDITOR;
+}
+
 static void cmd(std::string id, std::string label, std::string keys) {
     cmd_ids.push_back(id);
     cmd_labels.push_back(label);
@@ -8667,6 +9015,10 @@ static void cmd_init() {
     cmd("view.problems", "View: Show Problems", "Ctrl+Shift+M");
     cmd("view.output", "View: Show Output", "Ctrl+Shift+U");
     cmd("view.terminal", "View: Toggle Terminal", "Ctrl+`");
+    cmd("view.agent", "View: Toggle Agent", "Ctrl+Shift+L");
+    cmd("agent.new", "Agent: New Chat", "");
+    cmd("view.outline", "View: Show Outline", "");
+    cmd("view.minimap", "View: Toggle Minimap", "");
     cmd("view.zoomIn", "View: Increase Font Size", "Ctrl+=");
     cmd("view.zoomOut", "View: Decrease Font Size", "Ctrl+-");
     cmd("view.zoomReset", "View: Reset Font Size", "Ctrl+0");
@@ -8932,6 +9284,24 @@ static void run_cmd(std::string id) {
             focus = F_TERM;
         }
     }
+    else if (id == "view.agent") {
+        show_agent = (!show_agent);
+        focus = ((show_agent) ? (F_AGENT) : (F_EDITOR));
+        save_settings();
+    }
+    else if (id == "agent.new") {
+        show_agent = true;
+        agent_new_chat();
+        focus = F_AGENT;
+    }
+    else if (id == "view.outline") {
+        show_sidebar = true;
+        view = 2;
+    }
+    else if (id == "view.minimap") {
+        show_minimap = (!show_minimap);
+        save_settings();
+    }
     else if (id == "view.zoomIn") {
         set_font_size((font_size + 1));
     }
@@ -9051,7 +9421,7 @@ static std::vector<std::string> menu_items(int m) {
         return std::vector<std::string>{"sel.all", "sel.line", "-", "sel.copyUp", "sel.copyDown", "sel.moveUp", "sel.moveDown", "sel.duplicate", "sel.deleteLine", "-", "sel.indent", "sel.outdent"};
     }
     if (m == 3) {
-        return std::vector<std::string>{"view.palette", "view.quickOpen", "-", "view.explorer", "view.search", "view.problems", "view.output", "view.terminal", "-", "view.sidebar", "view.panel", "view.whitespace", "-", "view.zoomIn", "view.zoomOut", "view.zoomReset"};
+        return std::vector<std::string>{"view.palette", "view.quickOpen", "-", "view.explorer", "view.search", "view.outline", "view.problems", "view.output", "view.terminal", "view.agent", "-", "view.sidebar", "view.panel", "view.minimap", "view.whitespace", "-", "view.zoomIn", "view.zoomOut", "view.zoomReset"};
     }
     if (m == 4) {
         return std::vector<std::string>{"view.quickOpen", "go.line", "go.symbol", "go.definition", "go.bracket", "-", "go.nextTab", "go.prevTab"};
@@ -9838,27 +10208,14 @@ static void term_key(int vk, int mods) {
     term_follow = true;
 }
 
-static int mono(int x, int y, const std::string& s, int c, int max_w) {
-    int v = 0;
-    int j = 0;
-    int n = (int)((s).size());
-    int cols = (max_w / CW);
-    while (j < n && v < cols) {
-        int b = ubyte(s, j);
-        if (b < 128) {
-            if (b > 32) {
-                __nexa_ui_text((x + (v * CW) + glyph_off[b]), y, std::string(glyph_s[b]), FS, ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
-            }
-            j = j + 1;
-        } else {
-            int cl = cp_len(s, j);
-            std::string ch = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, j, cl);
-            __nexa_ui_text((x + (v * CW) + ((CW - tw(ch, FS)) / 2)), y, std::string(ch), FS, ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
-            j = j + cl;
-        }
-        v = v + 1;
+static int mono(int x, int y, std::string s, int c, int max_w) {
+    if (max_w <= 0) {
+        return 0;
     }
-    return (v * CW);
+    nx_clip(x, (y - px(2)), (x + max_w), (y + LH_MONO));
+    int w = nx_text(PANEL_FONT, x, y, s.c_str(), c);
+    nx_clip_off();
+    return imin(w, max_w);
 }
 
 static int out_color(const std::string& s) {
@@ -9952,7 +10309,8 @@ static void draw_panel() {
     int w = main_w;
     int y = panel_y;
     int h = (win_h - STATUS_H - panel_y);
-    fill(x, y, w, h, C_CHROME);
+    fill(x, y, w, h, C_PANEL);
+    shadow_h(x, y, w, false);
     hline(x, y, w, C_BORDER);
     panel_tabs_draw(x, y, w);
     int by = (y + px(35));
@@ -10006,7 +10364,7 @@ static void draw_lines(int x, int y, int w, int h, int which) {
     int n = ((which == 1) ? ((int)((out_lines).size())) : ((int)((term_lines).size())));
     int extra = ((which == 2) ? (1) : ((((int)((out_partial).size()) > 0) ? (1) : (0))));
     int total = (n + extra);
-    int rows = imax(1, ((h - px(8)) / LH));
+    int rows = imax(1, ((h - px(8)) / LH_MONO));
     int scroll = ((which == 1) ? (out_scroll) : (term_scroll));
     bool follow = ((which == 1) ? (out_follow) : (term_follow));
     int max_scroll = imax(0, (total - rows));
@@ -10021,11 +10379,11 @@ static void draw_lines(int x, int y, int w, int h, int which) {
     }
     int tx = (x + px(20));
     int maxw = (w - px(40));
-    int ty = ((LH - __nexa_ui_text_height(FS)) / 2);
+    int ty = ((LH_MONO - nx_font_h(PANEL_FONT)) / 2);
     int r = 0;
     while (r < rows && (scroll + r) < total) {
         int i = (scroll + r);
-        int ly = (y + px(4) + (r * LH));
+        int ly = (y + px(4) + (r * LH_MONO));
         if (i < n) {
             std::string s = ((which == 1) ? (out_lines[i]) : (term_lines[i]));
             mono(tx, (ly + ty), s, ((which == 1) ? (out_color(s)) : (C_TEXT)), maxw);
@@ -10036,8 +10394,8 @@ static void draw_lines(int x, int y, int w, int h, int which) {
             std::string inp = fld_text[FLD_TERM];
             int iw = mono((tx + pw), (ly + ty), inp, C_BRIGHT, (maxw - pw));
             if (focus == F_TERM && caret_on()) {
-                int cv = vcol(inp, fld_caret[FLD_TERM]);
-                fill((tx + pw + (cv * CW)), ly, px(2), LH, C_TEXT);
+                int cxp = nx_text_w(PANEL_FONT, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(inp, 0, fld_caret[FLD_TERM]).c_str());
+                fill((tx + pw + cxp), ly, px(2), LH_MONO, C_TEXT);
             }
             if (term_proc < 0 && (int)((term_lines).size()) == 0) {
                 txt(tx, (ly + ty), "Starting terminal...", C_MUTED, UI);
@@ -10072,8 +10430,7 @@ static void panel_mouse(int x, int y, int btn, int clicks) {
         focus = F_TERM;
         ensure_terminal();
     } else if (panel_tab == 1 && clicks >= 2) {
-        int rows = imax(1, ((panel_body_h - px(8)) / LH));
-        int i = (out_scroll + ((y - panel_body_y - px(4)) / LH));
+        int i = (out_scroll + ((y - panel_body_y - px(4)) / LH_MONO));
         if (i >= 0 && i < (int)((out_lines).size())) {
             int before = (int)((prob_file).size());
             parse_problems(out_lines[i], "build");
@@ -10106,19 +10463,1720 @@ static void panel_wheel(int delta) {
     } else if (panel_tab == 1) {
         out_scroll = imax(0, (out_scroll - n));
         out_follow = false;
-        int rows = imax(1, ((panel_body_h - px(8)) / LH));
+        int rows = imax(1, ((panel_body_h - px(8)) / LH_MONO));
         if (out_scroll >= ((int)((out_lines).size()) - rows)) {
             out_follow = true;
         }
     } else {
         term_scroll = imax(0, (term_scroll - n));
         term_follow = false;
-        int rows = imax(1, ((panel_body_h - px(8)) / LH));
+        int rows = imax(1, ((panel_body_h - px(8)) / LH_MONO));
         if (term_scroll >= ((int)((term_lines).size()) + 1 - rows)) {
             term_follow = true;
         }
     }
     frame_dirty = true;
+}
+
+const int AG_IDLE = 0;
+const int AG_WAIT = 1;
+const int AG_TOOLS = 2;
+const int AG_PROC = 3;
+
+static std::vector<std::string> provider_ids() {
+    return std::vector<std::string>{"openai", "anthropic", "openrouter", "groq", "ollama", "custom"};
+}
+
+static std::string provider_label(const std::string& id) {
+    if (id == "openai") {
+        return "OpenAI";
+    }
+    else if (id == "anthropic") {
+        return "Anthropic";
+    }
+    else if (id == "openrouter") {
+        return "OpenRouter";
+    }
+    else if (id == "groq") {
+        return "Groq";
+    }
+    else if (id == "ollama") {
+        return "Ollama";
+    }
+    else if (id == "custom") {
+        return "Custom";
+    }
+    else {
+    }
+    return id;
+}
+
+static std::string provider_url(const std::string& id) {
+    if (id == "anthropic") {
+        return "https://api.anthropic.com";
+    }
+    else if (id == "openrouter") {
+        return "https://openrouter.ai/api/v1";
+    }
+    else if (id == "groq") {
+        return "https://api.groq.com/openai/v1";
+    }
+    else if (id == "ollama") {
+        return "http://127.0.0.1:11434/v1";
+    }
+    else {
+    }
+    return "https://api.openai.com/v1";
+}
+
+static std::string provider_env(const std::string& id) {
+    if (id == "openai") {
+        return "OPENAI_API_KEY";
+    }
+    else if (id == "anthropic") {
+        return "ANTHROPIC_API_KEY";
+    }
+    else if (id == "openrouter") {
+        return "OPENROUTER_API_KEY";
+    }
+    else if (id == "groq") {
+        return "GROQ_API_KEY";
+    }
+    else {
+    }
+    return "";
+}
+
+static std::vector<std::string> provider_models(const std::string& id) {
+    if (id == "openai") {
+        return std::vector<std::string>{"gpt-4.1|GPT-4.1", "gpt-4o|GPT-4o", "gpt-4o-mini|GPT-4o mini", "o3|o3", "o4-mini|o4-mini", "gpt-4.1-mini|GPT-4.1 mini"};
+    }
+    else if (id == "anthropic") {
+        return std::vector<std::string>{"claude-sonnet-5|Claude Sonnet 5", "claude-opus-5-5|Claude Opus 5.5", "claude-fable-5-1|Claude Fable 5.1", "claude-haiku-4-5-20251001|Claude Haiku 4.5", "claude-sonnet-4-20250514|Claude Sonnet 4"};
+    }
+    else if (id == "openrouter") {
+        return std::vector<std::string>{"anthropic/claude-sonnet-4|Claude Sonnet 4", "openai/gpt-4o|GPT-4o", "google/gemini-2.5-pro|Gemini 2.5 Pro", "qwen/qwen3-coder|Qwen3 Coder", "deepseek/deepseek-chat|DeepSeek V3"};
+    }
+    else if (id == "groq") {
+        return std::vector<std::string>{"openai/gpt-oss-20b|GPT OSS 20B", "openai/gpt-oss-120b|GPT OSS 120B", "qwen/qwen3.6-27b|Qwen3.6 27B", "groq/compound|Groq Compound", "groq/compound-mini|Compound Mini"};
+    }
+    else if (id == "ollama") {
+        return std::vector<std::string>{"llama3.2|Llama 3.2", "qwen2.5-coder|Qwen2.5 Coder", "deepseek-coder-v2|DeepSeek Coder V2", "codellama|Code Llama"};
+    }
+    else {
+    }
+    return std::vector<std::string>{"custom|Custom model"};
+}
+
+static std::string ag_key() {
+    if (((ag_keys).find(ag_provider) != (ag_keys).end()) && (int)((ag_keys[ag_provider]).size()) > 0) {
+        return ag_keys[ag_provider];
+    }
+    std::string env = provider_env(ag_provider);
+    if ((int)((env).size()) > 0) {
+        std::string v = nx_env(env.c_str());
+        return v;
+    }
+    return "";
+}
+
+static std::string ag_url() {
+    if (((ag_urls).find(ag_provider) != (ag_urls).end()) && (int)((ag_urls[ag_provider]).size()) > 0) {
+        return ag_urls[ag_provider];
+    }
+    return provider_url(ag_provider);
+}
+
+static std::string ag_model() {
+    if (((ag_custom).find(ag_provider) != (ag_custom).end()) && (int)((ag_custom[ag_provider]).size()) > 0) {
+        return ag_custom[ag_provider];
+    }
+    if (((ag_models).find(ag_provider) != (ag_models).end()) && (int)((ag_models[ag_provider]).size()) > 0) {
+        return ag_models[ag_provider];
+    }
+    std::vector<std::string> m = provider_models(ag_provider);
+    return ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(m[0], 0, ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(m[0], "|"));
+}
+
+static std::string ag_model_label() {
+    std::string id = ag_model();
+    {
+        const std::vector<std::string>& __nexa_forin_0 = provider_models(ag_provider);
+        for (const std::string& m : __nexa_forin_0) {
+            int bar = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(m, "|");
+            if (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(m, 0, bar) == id) {
+                return ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(m, (bar + 1), -1);
+            }
+        }
+    }
+    return id;
+}
+
+static std::string join_url(const std::string& base, const std::string& path) {
+    std::string b = base;
+    while (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(b, "/")) {
+        b = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(b, 0, ((int)((b).size()) - 1));
+    }
+    return (b + path);
+}
+
+static void ag_push(std::string role, std::string content, std::string tid, std::string tname, std::string targs) {
+    ag_role.push_back(role);
+    ag_content.push_back(content);
+    ag_tool_id.push_back(tid);
+    ag_tool_name.push_back(tname);
+    ag_tool_args.push_back(targs);
+    ag_open.push_back(false);
+    ag_follow = true;
+    frame_dirty = true;
+}
+
+static void agent_new_chat() {
+    agent_stop();
+    ag_role.clear();
+    ag_content.clear();
+    ag_tool_id.clear();
+    ag_tool_name.clear();
+    ag_tool_args.clear();
+    ag_open.clear();
+    ag_error = "";
+    ag_status = "";
+    ag_scroll = 0;
+    ag_layout_key.clear();
+    ag_layout_h.clear();
+}
+
+static bool agent_busy() {
+    return (ag_state != AG_IDLE);
+}
+
+static void agent_stop() {
+    if (ag_http >= 0) {
+        nx_http_free(ag_http);
+        ag_http = -1;
+    }
+    if (ag_proc >= 0) {
+        nx_proc_free(ag_proc);
+        ag_proc = -1;
+    }
+    if (ag_state != AG_IDLE) {
+        ag_status = "Stopped";
+    }
+    ag_state = AG_IDLE;
+    ag_pending.clear();
+    frame_dirty = true;
+}
+
+static void agent_send() {
+    std::string text = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(fld_text[FLD_AGENT]);
+    if ((int)((text).size()) == 0 || agent_busy()) {
+        return;
+    }
+    if ((int)((ag_key()).size()) == 0 && ag_provider != "ollama" && ag_provider != "custom") {
+        ag_error = (std::string("Add an API key for ") + provider_label(ag_provider) + " in Settings (or set " + provider_env(ag_provider) + ").");
+        return;
+    }
+    fld_set(FLD_AGENT, "");
+    ag_push("user", text, "", "", "");
+    ag_error = "";
+    ag_status = "";
+    ag_hops = 0;
+    ag_request();
+}
+
+static std::string agent_system() {
+    bool agent_mode = (ag_mode == "agent");
+    bool groq = (ag_provider == "groq");
+    std::string o = "You are Nexium, an AI assistant in a native Nexa IDE.\n";
+    o += "Nexa is a systems language (.nxa) that transpiles to C++ via NexaC.\n";
+    o += "Write real Nexa, not C++, unless the user is in inline_cpp! or asking about the compiler.\n";
+    o += "The chat renders Markdown: headings, **bold**, lists, `inline code`, and fenced code blocks.\n";
+    if (agent_mode) {
+        o += "You have tools. Use them instead of telling the user what to run.\n";
+        o += "run_command executes a real Windows cmd.exe command on this machine and returns stdout, stderr, and the exit code. ";
+        o += "Use it for git, builds, tests, installs, dir, where, powershell -Command, and any other shell work.\n";
+        o += "glob_files finds files. search_workspace greps the tree. delete_file and rename_file change the disk. ";
+        o += "Prefer edit_file for small edits. Prefer write_file for new files.\n";
+        o += "Do not invent Nexa APIs that are not in the syntax notes.\n";
+    }
+    if ((int)((folder).size()) > 0) {
+        o += (std::string("Open folder: ") + folder + "\n");
+    }
+    if (is_file_tab()) {
+        o += (std::string("Active file: ") + (((int)((doc_path).size()) > 0) ? (doc_path) : (bufs[active].name)) + "\n");
+    }
+    if (!(groq) || agent_mode) {
+        int budget = ((groq) ? (3500) : (8000));
+        int per_file = ((groq) ? (1000) : (2500));
+        std::string syntax = "";
+        {
+            const std::vector<std::string>& __nexa_forin_0 = std::vector<std::string>{"SYNTAX/Includes.txt", "SYNTAX/Core.txt", "SYNTAX/ControlFlow.txt", "SYNTAX/Modules.txt", "SYNTAX/Inline.txt", "SYNTAX/CLI.txt"};
+            for (const std::string& rel : __nexa_forin_0) {
+                std::string p = path_join(nexa_lang, ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(rel, "/", "\\"));
+                if (!(__nexa_file_isfile((p).c_str()))) {
+                    continue;
+                }
+                std::string t = __nexa_file_read((p).c_str());
+                syntax += (std::string("\n\n===== ") + rel + " =====\n" + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, per_file));
+                if ((int)((syntax).size()) >= budget) {
+                    break;
+                }
+            }
+        }
+        o += ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(syntax, 0, budget);
+    }
+    if (agent_mode && is_file_tab()) {
+        int cap = ((groq) ? (2500) : (8000));
+        o += (std::string("\n\n===== Active buffer (truncated) =====\n") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(([&](){ const auto& __nexa_v = L; std::string __nexa_s = "\n"; std::string __nexa_o; for (size_t __nexa_i = 0; __nexa_i < __nexa_v.size(); __nexa_i++) { if (__nexa_i) __nexa_o += __nexa_s; __nexa_o += __nexa_v[__nexa_i]; } return __nexa_o; })(), 0, cap));
+    }
+    return o;
+}
+
+const std::string OPENAI_TOOLS = "[{\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"description\":\"Read a file. Optional 1-based offset and limit in lines.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"path\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"description\":\"Create or overwrite a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"edit_file\",\"description\":\"Replace one unique old_string with new_string.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old_string\":{\"type\":\"string\"},\"new_string\":{\"type\":\"string\"}},\"required\":[\"path\",\"old_string\",\"new_string\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"list_dir\",\"description\":\"List a directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}}},\n{\"type\":\"function\",\"function\":{\"name\":\"search_workspace\",\"description\":\"Search workspace files for a string. Optional glob like *.nxa.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"}},\"required\":[\"query\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"glob_files\",\"description\":\"Find files by glob (*.nxa, **/*.cpp).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"}},\"required\":[\"pattern\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"delete_file\",\"description\":\"Delete a file or folder.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"rename_file\",\"description\":\"Rename or move a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"from\":{\"type\":\"string\"},\"to\":{\"type\":\"string\"}},\"required\":[\"from\",\"to\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"run_command\",\"description\":\"Run a Windows cmd.exe command. Captures stdout/stderr and exit code. Use for git, builds, tests, installs, dir, powershell -Command, anything the user could type in a terminal. cwd defaults to the open folder. timeout_ms defaults to 60000.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"cwd\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}},\"required\":[\"command\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"run_nexa\",\"description\":\"Build the Nexa project (or one file) with NexaC, and run it if run is true. Returns the output.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"file\":{\"type\":\"string\"},\"run\":{\"type\":\"boolean\"}}}}},\n{\"type\":\"function\",\"function\":{\"name\":\"workspace_info\",\"description\":\"Open tabs, folder, selection.\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]";
+
+static __nexa_json anthropic_tools() {
+    __nexa_json src = __nexa_json_parse(OPENAI_TOOLS);
+    __nexa_json out = __nexa_json::arr();
+    for (int i = 0; i < src.len(); i++) {
+        __nexa_json f = src.get_at(i).get("function");
+        __nexa_json t = __nexa_json::obj();
+        t.set("name", f.get("name"));
+        t.set("description", f.get("description"));
+        t.set("input_schema", f.get("parameters"));
+        out.push(t);
+    }
+    return out;
+}
+
+static void ag_request() {
+    ag_hops = ag_hops + 1;
+    ag_state = AG_WAIT;
+    ag_status = "Thinking";
+    std::string system = agent_system();
+    bool use_tools = (ag_mode == "agent");
+    __nexa_json body = __nexa_json::obj();
+    body.set("model", __nexa_json::str(ag_model()));
+    body.set("temperature", __nexa_json::number(ag_temp));
+    std::string headers = "Content-Type: application/json";
+    std::string url = "";
+    if (ag_provider == "anthropic") {
+        body.set("max_tokens", __nexa_json::number(static_cast<double>(8192)));
+        body.set("system", __nexa_json::str(system));
+        __nexa_json msgs = __nexa_json::arr();
+        for (int i = 0; i < (int)((ag_role).size()); i++) {
+            std::string role = ag_role[i];
+            std::string content = ag_content[i];
+            std::string tname = ag_tool_name[i];
+            __nexa_json m = __nexa_json::obj();
+            if (role == "tool") {
+                __nexa_json block = __nexa_json::obj();
+                block.set("type", __nexa_json::str("tool_result"));
+                block.set("tool_use_id", __nexa_json::str(ag_tool_id[i]));
+                block.set("content", __nexa_json::str(content));
+                __nexa_json blocks = __nexa_json::arr();
+                blocks.push(block);
+                m.set("role", __nexa_json::str("user"));
+                m.set("content", blocks);
+            } else if (role == "assistant" && (int)((tname).size()) > 0) {
+                __nexa_json blocks = __nexa_json::arr();
+                if ((int)((content).size()) > 0) {
+                    __nexa_json tb = __nexa_json::obj();
+                    tb.set("type", __nexa_json::str("text"));
+                    tb.set("text", __nexa_json::str(content));
+                    blocks.push(tb);
+                }
+                __nexa_json use = __nexa_json::obj();
+                use.set("type", __nexa_json::str("tool_use"));
+                use.set("id", __nexa_json::str(ag_tool_id[i]));
+                use.set("name", __nexa_json::str(tname));
+                std::string args = ag_tool_args[i];
+                __nexa_json input = __nexa_json_parse((((int)((args).size()) > 0) ? (args) : (std::string("{}"))));
+                if (!(input.ok()) || !(input.is_object())) {
+                    input = __nexa_json::obj();
+                }
+                use.set("input", input);
+                blocks.push(use);
+                m.set("role", __nexa_json::str("assistant"));
+                m.set("content", blocks);
+            } else if (role == "user" || role == "assistant") {
+                m.set("role", __nexa_json::str(role));
+                m.set("content", __nexa_json::str(content));
+            } else {
+                continue;
+            }
+            msgs.push(m);
+        }
+        body.set("messages", msgs);
+        if (use_tools) {
+            body.set("tools", anthropic_tools());
+        }
+        headers += (std::string("\nx-api-key: ") + ag_key() + "\nanthropic-version: 2023-06-01");
+        url = join_url(ag_url(), "/v1/messages");
+    } else {
+        body.set("max_tokens", __nexa_json::number(static_cast<double>(((ag_provider == "groq") ? (1000) : (4096)))));
+        __nexa_json msgs = __nexa_json::arr();
+        __nexa_json sys = __nexa_json::obj();
+        sys.set("role", __nexa_json::str("system"));
+        sys.set("content", __nexa_json::str(system));
+        msgs.push(sys);
+        for (int i = 0; i < (int)((ag_role).size()); i++) {
+            std::string role = ag_role[i];
+            std::string content = ag_content[i];
+            std::string tname = ag_tool_name[i];
+            __nexa_json m = __nexa_json::obj();
+            if (role == "tool") {
+                m.set("role", __nexa_json::str("tool"));
+                m.set("tool_call_id", __nexa_json::str(ag_tool_id[i]));
+                m.set("content", __nexa_json::str(content));
+            } else if (role == "assistant" && (int)((tname).size()) > 0) {
+                m.set("role", __nexa_json::str("assistant"));
+                if ((int)((content).size()) > 0) {
+                    m.set("content", __nexa_json::str(content));
+                } else {
+                    m.set("content", __nexa_json::nullv());
+                }
+                __nexa_json fnc = __nexa_json::obj();
+                fnc.set("name", __nexa_json::str(tname));
+                fnc.set("arguments", __nexa_json::str(ag_tool_args[i]));
+                __nexa_json call = __nexa_json::obj();
+                call.set("id", __nexa_json::str(ag_tool_id[i]));
+                call.set("type", __nexa_json::str("function"));
+                call.set("function", fnc);
+                __nexa_json calls = __nexa_json::arr();
+                calls.push(call);
+                m.set("tool_calls", calls);
+            } else if (role == "user" || role == "assistant") {
+                m.set("role", __nexa_json::str(role));
+                m.set("content", __nexa_json::str(content));
+            } else {
+                continue;
+            }
+            msgs.push(m);
+        }
+        body.set("messages", msgs);
+        if (use_tools) {
+            body.set("tools", __nexa_json_parse(OPENAI_TOOLS));
+        }
+        if ((int)((ag_key()).size()) > 0) {
+            headers += (std::string("\nAuthorization: Bearer ") + ag_key());
+        }
+        if (ag_provider == "openrouter") {
+            headers += "\nHTTP-Referer: https://nexium.local\nX-Title: Nexium";
+        }
+        url = join_url(ag_url(), "/chat/completions");
+    }
+    ag_http = nx_http_start("POST", url.c_str(), headers.c_str(), (body).stringify().c_str());
+}
+
+static void ag_fail(std::string msg) {
+    ag_error = msg;
+    ag_state = AG_IDLE;
+    ag_status = "";
+    frame_dirty = true;
+}
+
+static void ag_response() {
+    int status = nx_http_status(ag_http);
+    std::string body = nx_http_body(ag_http);
+    std::string err = nx_http_error(ag_http);
+    nx_http_free(ag_http);
+    ag_http = -1;
+    if ((int)((err).size()) > 0) {
+        ag_fail(err);
+        return;
+    }
+    __nexa_json j = __nexa_json_parse(body);
+    if (!(j.ok()) || !(j.is_object())) {
+        ag_fail((std::string("Unexpected response (") + std::to_string(status) + "): " + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(body, 0, 400)));
+        return;
+    }
+    if (j.has("error")) {
+        __nexa_json e = j.get("error");
+        std::string msg = (std::string("API error (") + std::to_string(status) + ")");
+        if (e.is_object() && e.has("message")) {
+            msg = e.get("message").as_string();
+        }
+        if (e.is_string()) {
+            msg = e.as_string();
+        }
+        ag_fail(msg);
+        return;
+    }
+    int calls = 0;
+    if (ag_provider == "anthropic") {
+        if (!(j.has("content"))) {
+            ag_fail((std::string("No content in response (") + std::to_string(status) + ")"));
+            return;
+        }
+        __nexa_json content = j.get("content");
+        std::string text = "";
+        for (int i = 0; i < content.len(); i++) {
+            __nexa_json b = content.get_at(i);
+            std::string kind = b.get("type").as_string();
+            if (kind == "text") {
+                text += b.get("text").as_string();
+            }
+            if (kind == "tool_use") {
+                ag_push("assistant", text, b.get("id").as_string(), b.get("name").as_string(), (b.get("input")).stringify());
+                ag_pending.push_back(((int)((ag_role).size()) - 1));
+                text = "";
+                calls = calls + 1;
+            }
+        }
+        if (calls == 0) {
+            ag_push("assistant", text, "", "", "");
+        }
+    } else {
+        if (!(j.has("choices")) || j.get("choices").len() == 0) {
+            ag_fail((std::string("No choices in response (") + std::to_string(status) + "): " + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(body, 0, 300)));
+            return;
+        }
+        __nexa_json msg = j.get("choices").get_at(0).get("message");
+        std::string text = "";
+        if (msg.has("content") && msg.get("content").is_string()) {
+            text = msg.get("content").as_string();
+        }
+        if (msg.has("tool_calls") && msg.get("tool_calls").is_array()) {
+            __nexa_json tc = msg.get("tool_calls");
+            for (int i = 0; i < tc.len(); i++) {
+                __nexa_json c = tc.get_at(i);
+                __nexa_json f = c.get("function");
+                std::string args = "{}";
+                if (f.has("arguments")) {
+                    __nexa_json a = f.get("arguments");
+                    args = ((a.is_string()) ? (a.as_string()) : ((a).stringify()));
+                }
+                ag_push("assistant", ((i == 0) ? (text) : (std::string(""))), c.get("id").as_string(), f.get("name").as_string(), args);
+                ag_pending.push_back(((int)((ag_role).size()) - 1));
+                calls = calls + 1;
+            }
+        }
+        if (calls == 0) {
+            ag_push("assistant", text, "", "", "");
+        }
+    }
+    if (calls > 0) {
+        ag_state = AG_TOOLS;
+    } else {
+        ag_state = AG_IDLE;
+        ag_status = "";
+    }
+}
+
+static void agent_poll() {
+    if (ag_state == AG_WAIT && ag_http >= 0 && nx_http_done(ag_http) == 1) {
+        ag_response();
+        frame_dirty = true;
+    }
+    if (ag_state == AG_PROC) {
+        std::string more = nx_proc_read(ag_proc);
+        ag_proc_out += more;
+        if ((int)((more).size()) > 0) {
+            feed_lines(1, more);
+        }
+        bool finished = (nx_proc_running(ag_proc) == 0);
+        bool timed_out = ((now_ms - ag_proc_start) > ag_proc_timeout);
+        if (finished || timed_out) {
+            int code = nx_proc_exit_code(ag_proc);
+            if (timed_out && !(finished)) {
+                nx_proc_kill(ag_proc);
+            }
+            nx_proc_free(ag_proc);
+            ag_proc = -1;
+            std::string out = strip_ansi(ag_proc_out);
+            if ((int)((out).size()) > 80000) {
+                out = (std::string("... [truncated]\n") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(out, ((int)((out).size()) - 80000), -1));
+            }
+            std::string res = (std::string("exit ") + std::to_string(code));
+            if (timed_out && !(finished)) {
+                res += " (timed out)";
+            }
+            res += (std::string("\ncwd: ") + ag_proc_cwd + "\n" + (((int)((out).size()) == 0) ? (std::string("(no output)")) : (out)));
+            if ((int)((out_partial).size()) > 0) {
+                out_lines.push_back(out_partial);
+                out_partial = "";
+            }
+            log_out((std::string("[exit ") + std::to_string(code) + "]"));
+            ag_tool_result(res);
+            ag_state = AG_TOOLS;
+        }
+        frame_dirty = true;
+    }
+    while (ag_state == AG_TOOLS) {
+        if ((int)((ag_pending).size()) == 0) {
+            if (ag_hops >= 24) {
+                ag_fail("Stopped after 24 rounds of tool calls.");
+                return;
+            }
+            ag_request();
+            return;
+        }
+        int i = ag_pending[0];
+        ([&](){ auto& __nexa_v = ag_pending; int __nexa_i = 0; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+        ag_tool_idx = i;
+        std::string name = ag_tool_name[i];
+        ag_status = (std::string("Running ") + name);
+        __nexa_json args = __nexa_json_parse(ag_tool_args[i]);
+        if (!(args.ok()) || !(args.is_object())) {
+            args = __nexa_json::obj();
+        }
+        if (name == "run_command" || name == "run_nexa") {
+            if (tool_start_command(name, args)) {
+                ag_state = AG_PROC;
+                return;
+            }
+            continue;
+        }
+        ag_tool_result(run_tool(name, args));
+    }
+}
+
+static void ag_tool_result(std::string res) {
+    int i = ag_tool_idx;
+    ag_push("tool", res, ag_tool_id[i], ag_tool_name[i], "");
+}
+
+static std::string jstr(const __nexa_json& a, const std::string& key) {
+    if (!(a.has(key))) {
+        return "";
+    }
+    __nexa_json v = a.get(key);
+    if (v.is_string()) {
+        return v.as_string();
+    }
+    if (v.is_number()) {
+        return std::to_string(v.as_int());
+    }
+    return "";
+}
+
+static int jint(const __nexa_json& a, const std::string& key, int dflt) {
+    if (!(a.has(key))) {
+        return dflt;
+    }
+    __nexa_json v = a.get(key);
+    if (v.is_number()) {
+        return v.as_int();
+    }
+    if (v.is_string()) {
+        return ([](const std::string& __s){ char* __e=nullptr; long __v=std::strtol(__s.c_str(),&__e,10); return (__e==__s.c_str())?0:static_cast<int>(__v); })(std::string(v.as_string()));
+    }
+    return dflt;
+}
+
+static std::string resolve_path(const std::string& p) {
+    std::string q = ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(p, "/", "\\");
+    if ((int)((q).size()) >= 2 && q[1] == ':') {
+        return q;
+    }
+    if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(q, "\\")) {
+        return q;
+    }
+    if ((int)((folder).size()) > 0) {
+        return path_join(folder, q);
+    }
+    return q;
+}
+
+static std::string file_text(const std::string& p) {
+    int bi = find_buf(p);
+    if (bi >= 0) {
+        if (bi == active) {
+            return ([&](){ const auto& __nexa_v = L; std::string __nexa_s = "\n"; std::string __nexa_o; for (size_t __nexa_i = 0; __nexa_i < __nexa_v.size(); __nexa_i++) { if (__nexa_i) __nexa_o += __nexa_s; __nexa_o += __nexa_v[__nexa_i]; } return __nexa_o; })();
+        }
+        std::vector<std::string> lines = bufs[bi].lines;
+        return ([&](){ const auto& __nexa_v = lines; std::string __nexa_s = "\n"; std::string __nexa_o; for (size_t __nexa_i = 0; __nexa_i < __nexa_v.size(); __nexa_i++) { if (__nexa_i) __nexa_o += __nexa_s; __nexa_o += __nexa_v[__nexa_i]; } return __nexa_o; })();
+    }
+    std::string t = __nexa_file_read((p).c_str());
+    return ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(t, "\r\n", "\n");
+}
+
+static void apply_to_buffer(std::string p, std::string text) {
+    int bi = find_buf(p);
+    if (bi < 0) {
+        return;
+    }
+    int keep = active;
+    switch_to(bi);
+    begin_edit("agent");
+    L = split_lines(text);
+    clamp_cursor();
+    end_edit(0);
+    doc_saved = doc_ver;
+    bufs[active].mtime = nx_mtime(p.c_str());
+    doc_store();
+    switch_to(keep);
+}
+
+static bool write_text(std::string p, std::string text) {
+    std::string dir = __nexa_file_dirname((p).c_str());
+    if ((int)((dir).size()) > 0 && !(__nexa_file_isdir((dir).c_str()))) {
+        (void)__nexa_file_mkdir((dir).c_str());
+    }
+    std::string out = text;
+    int bi = find_buf(p);
+    bool crlf = false;
+    if (bi >= 0) {
+        crlf = bufs[bi].crlf;
+    } else if (__nexa_file_isfile((p).c_str())) {
+        std::string old = __nexa_file_read((p).c_str());
+        crlf = ([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(old, "\r\n");
+    }
+    if (crlf) {
+        out = ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(text, "\r\n", "\n"), "\n", "\r\n");
+    }
+    if (!(([&](const std::string& __nexa_fc) -> int { return __nexa_file_write((p).c_str(), __nexa_fc.data(), __nexa_fc.size(), 0); })(out))) {
+        return false;
+    }
+    apply_to_buffer(p, text);
+    return true;
+}
+
+static std::string tool_read(const __nexa_json& a) {
+    std::string p = resolve_path(jstr(a, "path"));
+    if (!(__nexa_file_isfile((p).c_str())) && find_buf(p) < 0) {
+        return (std::string("ERROR: file not found: ") + p);
+    }
+    std::string text = file_text(p);
+    int off = jint(a, "offset", 0);
+    int lim = jint(a, "limit", 0);
+    if (off > 0 || lim > 0) {
+        if (off < 1) {
+            off = 1;
+        }
+        if (lim <= 0) {
+            lim = 400;
+        }
+        std::vector<std::string> lines = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(text, "\n");
+        std::string o = "";
+        int k = (off - 1);
+        while (k < (int)((lines).size()) && k < (off - 1 + lim)) {
+            o += (std::string("") + std::to_string((k + 1)) + "| " + lines[k] + "\n");
+            k = k + 1;
+        }
+        if (k < (int)((lines).size())) {
+            o += (std::string("... (") + std::to_string(((int)((lines).size()) - k)) + " more lines)\n");
+        }
+        return o;
+    }
+    if ((int)((text).size()) > 120000) {
+        return (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(text, 0, 120000) + "\n... [truncated]");
+    }
+    return text;
+}
+
+static std::string tool_write(__nexa_json a) {
+    std::string p = resolve_path(jstr(a, "path"));
+    std::string content = jstr(a, "content");
+    if (!(write_text(p, content))) {
+        return (std::string("ERROR: could not write ") + p);
+    }
+    refresh_tree();
+    return (std::string("Wrote ") + p + " (" + std::to_string((int)((content).size())) + " bytes)");
+}
+
+static std::string tool_edit(__nexa_json a) {
+    std::string p = resolve_path(jstr(a, "path"));
+    std::string olds = jstr(a, "old_string");
+    std::string news = jstr(a, "new_string");
+    if ((int)((olds).size()) == 0) {
+        return "ERROR: old_string is empty";
+    }
+    if (!(__nexa_file_isfile((p).c_str())) && find_buf(p) < 0) {
+        return (std::string("ERROR: file not found: ") + p);
+    }
+    std::string text = file_text(p);
+    std::string o = ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(olds, "\r\n", "\n");
+    int at = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(text, o);
+    if (at < 0) {
+        return "ERROR: old_string not found in file";
+    }
+    if (([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(text, o, (at + 1)) >= 0) {
+        return "ERROR: old_string matched more than once; make it unique";
+    }
+    std::string t = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(text, 0, at) + ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(news, "\r\n", "\n") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(text, (at + (int)((o).size())), -1));
+    if (!(write_text(p, t))) {
+        return (std::string("ERROR: could not write ") + p);
+    }
+    return (std::string("Edited ") + p);
+}
+
+static std::string tool_list(const __nexa_json& a) {
+    std::string p = jstr(a, "path");
+    if ((int)((p).size()) == 0) {
+        p = folder;
+    }
+    p = resolve_path(p);
+    if (!(__nexa_file_isdir((p).c_str()))) {
+        return (std::string("ERROR: not a directory: ") + p);
+    }
+    std::string o = "";
+    std::vector<std::string> names = __nexa_file_list((p).c_str());
+    {
+        const std::vector<std::string>& __nexa_forin_1 = names;
+        for (const std::string& nm : __nexa_forin_1) {
+            if (nm == "." || nm == "..") {
+                continue;
+            }
+            o += (((__nexa_file_isdir((path_join(p, nm)).c_str())) ? (std::string("dir  ")) : (std::string("file "))) + nm + "\n");
+        }
+    }
+    return (((int)((o).size()) == 0) ? (std::string("(empty)")) : (o));
+}
+
+static bool glob_at(const std::string& p, int pi, const std::string& s, int si) {
+    int i = pi;
+    int j = si;
+    while (i < (int)((p).size())) {
+        if (p[i] == '*' && (i + 1) < (int)((p).size()) && p[(i + 1)] == '*') {
+            i = i + 2;
+            if (i < (int)((p).size()) && (p[i] == '/' || p[i] == '\\')) {
+                i = i + 1;
+            }
+            if (i >= (int)((p).size())) {
+                return true;
+            }
+            int t = j;
+            while (t <= (int)((s).size())) {
+                if (glob_at(p, i, s, t)) {
+                    return true;
+                }
+                t = t + 1;
+            }
+            return false;
+        }
+        if (p[i] == '*') {
+            i = i + 1;
+            int t = j;
+            while (t <= (int)((s).size())) {
+                if (glob_at(p, i, s, t)) {
+                    return true;
+                }
+                if (t < (int)((s).size()) && (s[t] == '/' || s[t] == '\\')) {
+                    return false;
+                }
+                t = t + 1;
+            }
+            return false;
+        }
+        if (j >= (int)((s).size())) {
+            return false;
+        }
+        if (p[i] == '?') {
+            if (s[j] == '/' || s[j] == '\\') {
+                return false;
+            }
+        } else {
+            std::string a = ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(p, i, 1)), "/", "\\");
+            std::string b = ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, j, 1)), "/", "\\");
+            if (a != b) {
+                return false;
+            }
+        }
+        i = i + 1;
+        j = j + 1;
+    }
+    return (j == (int)((s).size()));
+}
+
+static bool glob_match(const std::string& pat, const std::string& rel) {
+    if ((int)((pat).size()) == 0) {
+        return true;
+    }
+    return (glob_at(pat, 0, rel, 0) || glob_at(pat, 0, __nexa_file_basename((rel).c_str()), 0));
+}
+
+static std::string tool_search(__nexa_json a) {
+    std::string q = jstr(a, "query");
+    if ((int)((q).size()) == 0) {
+        return "ERROR: query required";
+    }
+    if ((int)((folder).size()) == 0) {
+        return "ERROR: no folder open";
+    }
+    std::string g = jstr(a, "glob");
+    files_index_ms = 0;
+    ensure_files_index();
+    std::string o = "";
+    int hits = 0;
+    {
+        const std::vector<std::string>& __nexa_forin_1 = files_index;
+        for (const std::string& f : __nexa_forin_1) {
+            std::string rel = rel_path(f);
+            if (!(is_text_file(f)) || !(glob_match(g, rel))) {
+                continue;
+            }
+            std::string text = file_text(f);
+            if (([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(text, 0, 800), std::string("\x00", 1))) {
+                continue;
+            }
+            std::vector<std::string> lines = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(text, "\n");
+            for (int k = 0; k < (int)((lines).size()); k++) {
+                if (([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(lines[k], q)) {
+                    o += (std::string("") + rel + ":" + std::to_string((k + 1)) + ": " + lines[k] + "\n");
+                    hits = hits + 1;
+                    if (hits >= 200) {
+                        return o;
+                    }
+                }
+            }
+        }
+    }
+    return ((hits == 0) ? (std::string("No matches")) : (o));
+}
+
+static std::string tool_glob(__nexa_json a) {
+    std::string pat = jstr(a, "pattern");
+    if ((int)((pat).size()) == 0) {
+        pat = jstr(a, "glob");
+    }
+    if ((int)((pat).size()) == 0) {
+        return "ERROR: pattern required";
+    }
+    if ((int)((folder).size()) == 0) {
+        return "ERROR: no folder open";
+    }
+    files_index_ms = 0;
+    ensure_files_index();
+    std::string o = "";
+    int n = 0;
+    {
+        const std::vector<std::string>& __nexa_forin_1 = files_index;
+        for (const std::string& f : __nexa_forin_1) {
+            std::string rel = rel_path(f);
+            if (glob_match(pat, rel)) {
+                o += (rel + "\n");
+                n = n + 1;
+                if (n >= 500) {
+                    break;
+                }
+            }
+        }
+    }
+    return ((n == 0) ? (std::string("No files matched")) : (o));
+}
+
+static std::string tool_delete(__nexa_json a) {
+    std::string p = resolve_path(jstr(a, "path"));
+    if (!(__nexa_file_exists((p).c_str()))) {
+        return (std::string("ERROR: not found: ") + p);
+    }
+    int i = ((int)((bufs).size()) - 1);
+    while (i >= 0) {
+        std::string bp = bufs[i].path;
+        if ((int)((bp).size()) > 0 && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(bp), ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(p))) {
+            doc_store();
+            bufs[i].ver = bufs[i].saved;
+            if (i == active) {
+                doc_saved = doc_ver;
+            }
+            close_tab(i);
+        }
+        i = i - 1;
+    }
+    int ok = ((__nexa_file_isdir((p).c_str())) ? (__nexa_file_remove_all((p).c_str())) : (__nexa_file_remove((p).c_str())));
+    refresh_tree();
+    return ((ok) ? ((std::string("Deleted ") + p)) : ((std::string("ERROR: could not delete ") + p)));
+}
+
+static std::string tool_rename(__nexa_json a) {
+    std::string from = jstr(a, "from");
+    if ((int)((from).size()) == 0) {
+        from = jstr(a, "path");
+    }
+    std::string to = jstr(a, "to");
+    if ((int)((to).size()) == 0) {
+        to = jstr(a, "new_path");
+    }
+    if ((int)((from).size()) == 0 || (int)((to).size()) == 0) {
+        return "ERROR: from and to required";
+    }
+    from = resolve_path(from);
+    to = resolve_path(to);
+    std::string dir = __nexa_file_dirname((to).c_str());
+    if ((int)((dir).size()) > 0 && !(__nexa_file_isdir((dir).c_str()))) {
+        (void)__nexa_file_mkdir((dir).c_str());
+    }
+    if (!(__nexa_file_rename((from).c_str(), (to).c_str()))) {
+        return "ERROR: rename failed";
+    }
+    doc_store();
+    for (int i = 0; i < (int)((bufs).size()); i++) {
+        std::string bp = bufs[i].path;
+        if ((int)((bp).size()) > 0 && same_path(bp, from)) {
+            bufs[i].path = to;
+            bufs[i].name = __nexa_file_basename((to).c_str());
+        }
+    }
+    int keep = active;
+    active = -1;
+    doc_load(keep);
+    refresh_tree();
+    return (std::string("Renamed ") + from + " -> " + to);
+}
+
+static std::string tool_info() {
+    doc_store();
+    std::string o = (std::string("folder: ") + folder + "\n");
+    if (is_file_tab()) {
+        o += (std::string("active: ") + (((int)((doc_path).size()) > 0) ? (doc_path) : (bufs[active].name)) + "\n");
+        o += (std::string("cursor_line: ") + std::to_string((cy + 1)) + "\n");
+        std::string sel = sel_text();
+        if ((int)((sel).size()) > 0) {
+            o += (std::string("selection:\n") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(sel, 0, 4000) + "\n");
+        }
+    }
+    o += "open_tabs:\n";
+    for (int i = 0; i < (int)((bufs).size()); i++) {
+        if (bufs[i].kind != 0) {
+            continue;
+        }
+        std::string p = bufs[i].path;
+        std::string nm = bufs[i].name;
+        o += (std::string("  ") + (((int)((p).size()) > 0) ? (p) : (nm)) + ((buf_dirty(i)) ? (std::string(" *")) : (std::string(""))) + "\n");
+    }
+    return o;
+}
+
+static std::string run_tool(std::string name, __nexa_json a) {
+    if (name == "read_file") {
+        return tool_read(a);
+    }
+    else if (name == "write_file") {
+        return tool_write(a);
+    }
+    else if (name == "edit_file") {
+        return tool_edit(a);
+    }
+    else if (name == "list_dir") {
+        return tool_list(a);
+    }
+    else if (name == "search_workspace") {
+        return tool_search(a);
+    }
+    else if (name == "glob_files") {
+        return tool_glob(a);
+    }
+    else if (name == "delete_file") {
+        return tool_delete(a);
+    }
+    else if (name == "rename_file") {
+        return tool_rename(a);
+    }
+    else if (name == "workspace_info") {
+        return tool_info();
+    }
+    else {
+    }
+    return (std::string("ERROR: unknown tool ") + name);
+}
+
+static bool tool_start_command(std::string name, __nexa_json a) {
+    std::string cmdline = "";
+    std::string cwd = "";
+    int timeout = 60000;
+    if (name == "run_command") {
+        cmdline = jstr(a, "command");
+        if ((int)((cmdline).size()) == 0) {
+            cmdline = jstr(a, "cmd");
+        }
+        cwd = jstr(a, "cwd");
+        if ((int)((cwd).size()) == 0) {
+            cwd = jstr(a, "working_directory");
+        }
+        timeout = jint(a, "timeout_ms", 60000);
+    } else {
+        save_all();
+        std::string c = find_compiler();
+        if ((int)((c).size()) == 0) {
+            ag_tool_result("ERROR: the Nexa compiler was not found");
+            return false;
+        }
+        std::string f = jstr(a, "file");
+        bool run = true;
+        if (a.has("run") && a.get("run").is_bool()) {
+            run = a.get("run").as_bool();
+        }
+        std::string dir = project_dir();
+        std::string entry = "";
+        if ((int)((f).size()) > 0) {
+            entry = resolve_path(f);
+            dir = __nexa_file_dirname((entry).c_str());
+        }
+        if ((int)((dir).size()) == 0) {
+            ag_tool_result("ERROR: no project folder");
+            return false;
+        }
+        if ((int)((entry).size()) == 0 && __nexa_file_isfile((path_join(dir, "nexapkg.json")).c_str())) {
+            cmdline = (std::string("\"") + c + "\" build");
+        } else {
+            if ((int)((entry).size()) == 0) {
+                entry = entry_file(dir);
+            }
+            if ((int)((entry).size()) == 0) {
+                ag_tool_result("ERROR: no .nxa file with fn main() found");
+                return false;
+            }
+            std::string exe = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(entry, 0, ((int)((entry).size()) - 4)) + ".exe");
+            cmdline = (std::string("\"") + c + "\" \"" + entry + "\" -o \"" + exe + "\"");
+            if (run) {
+                cmdline += (std::string(" && \"") + exe + "\"");
+            }
+        }
+        cwd = dir;
+        timeout = 120000;
+    }
+    if ((int)((cmdline).size()) == 0) {
+        ag_tool_result("ERROR: command required");
+        return false;
+    }
+    if ((int)((cwd).size()) == 0) {
+        cwd = folder;
+    } else {
+        cwd = resolve_path(cwd);
+    }
+    if ((int)((cwd).size()) == 0 && is_file_tab() && (int)((doc_path).size()) > 0) {
+        cwd = __nexa_file_dirname((doc_path).c_str());
+    }
+    if ((int)((cwd).size()) > 0 && !(__nexa_file_isdir((cwd).c_str()))) {
+        ag_tool_result((std::string("ERROR: cwd not found: ") + cwd));
+        return false;
+    }
+    show_panel_tab(1);
+    log_out((std::string("$ ") + cmdline));
+    ag_proc = nx_proc_start(cmdline.c_str(), cwd.c_str());
+    if (ag_proc < 0) {
+        ag_tool_result("ERROR: could not start the command");
+        return false;
+    }
+    ag_proc_out = "";
+    ag_proc_cwd = cwd;
+    ag_proc_start = now_ms;
+    ag_proc_timeout = clamp(timeout, 1000, 1800000);
+    return true;
+}
+
+static std::vector<std::string> ag_wrap(const std::string& s, int w, int size) {
+    std::vector<std::string> out;
+    {
+        const std::vector<std::string>& __nexa_forin_3 = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(s, "\n");
+        for (const std::string& para : __nexa_forin_3) {
+            if ((int)((para).size()) == 0) {
+                out.push_back("");
+                continue;
+            }
+            std::vector<std::string> words = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(para, " ");
+            std::string line_ = "";
+            {
+                const std::vector<std::string>& __nexa_forin_4 = words;
+                for (const std::string& wd : __nexa_forin_4) {
+                    std::string t = (((int)((line_).size()) == 0) ? (wd) : ((line_ + " " + wd)));
+                    if (tw(t, size) > w && (int)((line_).size()) > 0) {
+                        out.push_back(line_);
+                        line_ = wd;
+                    } else {
+                        line_ = t;
+                    }
+                    while (tw(line_, size) > w && (int)((line_).size()) > 1) {
+                        int cut = ((int)((line_).size()) - 1);
+                        while (cut > 1 && tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(line_, 0, cut), size) > w) {
+                            cut = cut - 1;
+                        }
+                        out.push_back(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(line_, 0, cut));
+                        line_ = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(line_, cut, -1);
+                    }
+                }
+            }
+            out.push_back(line_);
+        }
+    }
+    return out;
+}
+
+static std::string md_plain(const std::string& s) {
+    return ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(s, "**", ""), "__", "");
+}
+
+static void ag_layout(int i, int w) {
+    ag_lines.clear();
+    ag_styles.clear();
+    std::string role = ag_role[i];
+    std::string content = ag_content[i];
+    std::string tname = ag_tool_name[i];
+    if (role == "user") {
+        {
+            const std::vector<std::string>& __nexa_forin_2 = ag_wrap(content, (w - px(24)), UI);
+            for (const std::string& l : __nexa_forin_2) {
+                ag_lines.push_back(l);
+                ag_styles.push_back(3);
+            }
+        }
+        return;
+    }
+    if (role == "tool") {
+        return;
+    }
+    if ((int)((content).size()) > 0) {
+        bool in_code = false;
+        int code_lang = 0;
+        {
+            const std::vector<std::string>& __nexa_forin_3 = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(content, "\n");
+            for (const std::string& raw : __nexa_forin_3) {
+                std::string t = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(raw);
+                if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "```")) {
+                    in_code = (!in_code);
+                    code_lang = fence_lang(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 3, -1));
+                    if (code_lang == L_PLAIN && (int)((t).size()) == 3) {
+                        code_lang = L_NEXA;
+                    }
+                    ag_lines.push_back("");
+                    ag_styles.push_back(((in_code) ? (7) : (8)));
+                    continue;
+                }
+                if (in_code) {
+                    ag_lines.push_back(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(raw, "\t", "    "));
+                    ag_styles.push_back((100 + code_lang));
+                    continue;
+                }
+                if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "#")) {
+                    std::string h = t;
+                    while (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(h, "#")) {
+                        h = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(h, 1, -1);
+                    }
+                    {
+                        const std::vector<std::string>& __nexa_forin_4 = ag_wrap(md_plain(([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(h)), w, UI);
+                        for (const std::string& l : __nexa_forin_4) {
+                            ag_lines.push_back(l);
+                            ag_styles.push_back(1);
+                        }
+                    }
+                    continue;
+                }
+                if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "- ") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "* ")) {
+                    bool first = true;
+                    {
+                        const std::vector<std::string>& __nexa_forin_5 = ag_wrap(md_plain(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 2, -1)), (w - px(16)), UI);
+                        for (const std::string& l : __nexa_forin_5) {
+                            ag_lines.push_back(l);
+                            ag_styles.push_back(((first) ? (2) : (9)));
+                            first = false;
+                        }
+                    }
+                    continue;
+                }
+                {
+                    const std::vector<std::string>& __nexa_forin_6 = ag_wrap(md_plain(raw), w, UI);
+                    for (const std::string& l : __nexa_forin_6) {
+                        ag_lines.push_back(l);
+                        ag_styles.push_back(0);
+                    }
+                }
+            }
+        }
+    }
+    if ((int)((tname).size()) > 0) {
+        ag_lines.push_back(tname);
+        ag_styles.push_back(6);
+        if (ag_open[i]) {
+            std::string res = "";
+            if ((i + 1) < (int)((ag_role).size()) && ag_role[(i + 1)] == "tool") {
+                res = ag_content[(i + 1)];
+            }
+            std::string args = ag_tool_args[i];
+            int shown = 0;
+            {
+                const std::vector<std::string>& __nexa_forin_7 = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })((std::string("> ") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(args, 0, 600) + "\n" + res), "\n");
+                for (const std::string& l : __nexa_forin_7) {
+                    if (shown >= 40) {
+                        ag_lines.push_back("...");
+                        ag_styles.push_back(104);
+                        break;
+                    }
+                    ag_lines.push_back(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(l, "\t", "    "));
+                    ag_styles.push_back(100);
+                    shown = shown + 1;
+                }
+            }
+        }
+    }
+}
+
+static int line_h(int style) {
+    if (style >= 100) {
+        return LH_MONO;
+    }
+    if (style == 7 || style == 8) {
+        return px(6);
+    }
+    if (style == 1) {
+        return (__nexa_ui_text_height(px(15)) + px(8));
+    }
+    if (style == 6) {
+        return px(28);
+    }
+    return (__nexa_ui_text_height(UI) + px(5));
+}
+
+static std::string tool_summary(int i) {
+    __nexa_json a = __nexa_json_parse(ag_tool_args[i]);
+    if (!(a.ok()) || !(a.is_object())) {
+        return "";
+    }
+    {
+        const std::vector<std::string>& __nexa_forin_1 = std::vector<std::string>{"path", "command", "query", "pattern", "from", "file"};
+        for (const std::string& k : __nexa_forin_1) {
+            std::string v = jstr(a, k);
+            if ((int)((v).size()) > 0) {
+                if (k == "path" || k == "from" || k == "file") {
+                    return rel_path(resolve_path(v));
+                }
+                return v;
+            }
+        }
+    }
+    return "";
+}
+
+static std::string tool_verb(const std::string& name) {
+    if (name == "read_file") {
+        return "Read";
+    }
+    else if (name == "write_file") {
+        return "Wrote";
+    }
+    else if (name == "edit_file") {
+        return "Edited";
+    }
+    else if (name == "list_dir") {
+        return "Listed";
+    }
+    else if (name == "search_workspace") {
+        return "Searched";
+    }
+    else if (name == "glob_files") {
+        return "Found files";
+    }
+    else if (name == "delete_file") {
+        return "Deleted";
+    }
+    else if (name == "rename_file") {
+        return "Renamed";
+    }
+    else if (name == "run_command") {
+        return "Ran";
+    }
+    else if (name == "run_nexa") {
+        return "Built";
+    }
+    else if (name == "workspace_info") {
+        return "Looked at the workspace";
+    }
+    else {
+    }
+    return name;
+}
+
+static int agent_x() {
+    return (win_w - agent_w);
+}
+
+static void draw_agent() {
+    if (!(show_agent)) {
+        return;
+    }
+    int x = agent_x();
+    int y = TOOLBAR_H;
+    int w = agent_w;
+    int h = (win_h - STATUS_H - y);
+    fill(x, y, w, h, C_SIDEBAR);
+    vline(x, y, h, C_BORDER);
+    shadow_v((x - px(6)), y, h, false);
+    fill((x + 1), y, (w - 1), HEADER_H, C_SIDEBAR);
+    txt_v((x + px(16)), y, HEADER_H, "AGENT", C_MUTED, UI_SMALL);
+    int bx = (x + w - px(28));
+    if (icon_button(bx, (y + px(8)), "close", "Close (Ctrl+Shift+L)")) {
+        show_agent = false;
+    }
+    if (icon_button((bx - px(24)), (y + px(8)), "gear", "Agent Settings")) {
+        open_special(1);
+        page_scroll = px(560);
+    }
+    if (icon_button((bx - px(48)), (y + px(8)), "plus", "New Chat")) {
+        agent_new_chat();
+    }
+    int ry = (y + HEADER_H);
+    int dw = ((w - px(40)) / 3);
+    std::vector<std::string> modes = std::vector<std::string>{"Agent", "Chat"};
+    int mi = ((ag_mode == "chat") ? (1) : (0));
+    std::vector<std::string> providers = provider_ids();
+    int pi = ([&](){ const auto& __nexa_v = providers; const auto& __nexa_x = ag_provider; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
+    std::vector<std::string> plabels;
+    {
+        const std::vector<std::string>& __nexa_forin_0 = providers;
+        for (const std::string& p : __nexa_forin_0) {
+            plabels.push_back(provider_label(p));
+        }
+    }
+    std::vector<std::string> models = provider_models(ag_provider);
+    std::vector<std::string> mlabels;
+    int mcur = 0;
+    for (int k = 0; k < (int)((models).size()); k++) {
+        std::string m = models[k];
+        int bar = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(m, "|");
+        mlabels.push_back(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(m, (bar + 1), -1));
+        if (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(m, 0, bar) == ag_model()) {
+            mcur = k;
+        }
+    }
+    int msg_top = (ry + px(44));
+    int input_h = ag_input_h(w);
+    int msg_bottom = (y + h - input_h - px(20));
+    draw_agent_messages(x, msg_top, w, (msg_bottom - msg_top));
+    fill((x + 1), ry, (w - 1), px(44), C_SIDEBAR);
+    hline((x + 1), (msg_top - 1), (w - 1), C_BORDER);
+    draw_agent_input(x, msg_bottom, w, (y + h - msg_bottom));
+    int nm = __nexa_ui_dropdown((x + px(12)), (ry + px(6)), dw, modes, mi);
+    int np = __nexa_ui_dropdown((x + px(20) + dw), (ry + px(6)), dw, plabels, pi);
+    int nmod = __nexa_ui_dropdown((x + px(28) + (dw * 2)), (ry + px(6)), dw, mlabels, mcur);
+    if (nm != mi) {
+        ag_mode = ((nm == 1) ? (std::string("chat")) : (std::string("agent")));
+        save_settings();
+    }
+    if (np != pi && np >= 0) {
+        ag_provider = providers[np];
+        save_settings();
+    }
+    if (nmod != mcur && nmod >= 0 && nmod < (int)((models).size())) {
+        std::string m = models[nmod];
+        ag_models[ag_provider] = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(m, 0, ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(m, "|"));
+        ag_custom[ag_provider] = "";
+        save_settings();
+    }
+    if (drag == 7 || (hovered((x - px(2)), y, px(5), h) && drag == 0)) {
+        fill((x - 1), y, px(3), h, C_ACCENT);
+    }
+}
+
+static void draw_agent_messages(int x, int y, int w, int h) {
+    int tw_ = (w - px(32));
+    int tx = (x + px(16));
+    int total = px(12);
+    while ((int)((ag_layout_key).size()) < (int)((ag_role).size())) {
+        ag_layout_key.push_back("");
+        ag_layout_h.push_back(0);
+    }
+    for (int i = 0; i < (int)((ag_role).size()); i++) {
+        std::string key = (std::string("") + std::to_string(tw_) + "|" + std::to_string((int)((ag_content[i]).size())) + "|" + std::string(ag_open[i] ? "true" : "false") + "|" + std::string(((i + 1) < (int)((ag_role).size())) ? "true" : "false"));
+        if (ag_layout_key[i] != key) {
+            ag_layout(i, tw_);
+            int hh = 0;
+            {
+                const std::vector<int>& __nexa_forin_4 = ag_styles;
+                for (const int& st : __nexa_forin_4) {
+                    hh = hh + line_h(st);
+                }
+            }
+            if (hh > 0) {
+                hh = hh + px(14);
+            }
+            if (ag_role[i] == "user") {
+                hh = hh + px(10);
+            }
+            ag_layout_key[i] = key;
+            ag_layout_h[i] = hh;
+        }
+        total = total + ag_layout_h[i];
+    }
+    int status_h = ((agent_busy() || (int)((ag_error).size()) > 0 || (int)((ag_status).size()) > 0) ? (px(40)) : (0));
+    total = total + status_h;
+    int max_scroll = imax(0, (total - h));
+    if (ag_follow) {
+        ag_scroll = max_scroll;
+    }
+    ag_scroll = clamp(ag_scroll, 0, max_scroll);
+    ag_msg_y = y;
+    ag_msg_h = h;
+    nx_clip((x + 1), y, (x + w), (y + h));
+    if ((int)((ag_role).size()) == 0) {
+        int cy_ = (y + imax(px(20), ((h / 2) - px(110))));
+        draw_logo_c((x + ((w - px(56)) / 2)), cy_, px(56), false, 0x2C2C2C, 0x1F3A52);
+        std::string lines = ((ag_mode == "agent") ? (std::string("Ask about your code, or have the agent read and edit files, search the folder, run commands and build with NexaC.")) : (std::string("Ask about Nexa or your code. Switch to Agent to let it edit files and run commands.")));
+        int py = (cy_ + px(76));
+        {
+            const std::vector<std::string>& __nexa_forin_5 = ag_wrap(lines, (w - px(60)), UI);
+            for (const std::string& l : __nexa_forin_5) {
+                int lw = tw(l, UI);
+                txt((x + ((w - lw) / 2)), py, l, C_MUTED, UI);
+                py = py + (__nexa_ui_text_height(UI) + px(5));
+            }
+        }
+        if ((int)((ag_key()).size()) == 0 && ag_provider != "ollama" && ag_provider != "custom") {
+            py = py + px(10);
+            std::string lab = "Add an API key in Settings";
+            if (link_button((x + ((w - tw(lab, UI)) / 2)), py, lab)) {
+                open_special(1);
+                page_scroll = px(560);
+            }
+        }
+    }
+    int yy = (y + px(12) - ag_scroll);
+    for (int i = 0; i < (int)((ag_role).size()); i++) {
+        int hh = ag_layout_h[i];
+        if (hh == 0) {
+            continue;
+        }
+        if ((yy + hh) < y || yy > (y + h)) {
+            yy = yy + hh;
+            continue;
+        }
+        ag_layout(i, tw_);
+        std::string role = ag_role[i];
+        if (role == "user") {
+            rrect((tx - px(4)), yy, (tw_ + px(8)), (hh - px(14)), px(6), 0x2B2D30);
+            yy = yy + px(5);
+        }
+        int ly = yy;
+        int code_top = -1;
+        int code_st = 0;
+        std::string code_dl = "";
+        for (int k = 0; k < (int)((ag_lines).size()); k++) {
+            int st = ag_styles[k];
+            std::string s = ag_lines[k];
+            int lh = line_h(st);
+            if (st == 7) {
+                code_top = ly;
+                code_st = 0;
+                code_dl = "";
+            } else if (st >= 100) {
+                if (code_top < 0) {
+                    code_top = ly;
+                }
+                fill((tx - px(4)), ly, (tw_ + px(8)), lh, 0x141414);
+                int lang = (st - 100);
+                std::vector<int> cols = hl_line(lang, s, code_st, code_dl);
+                code_st = hl_out_state;
+                code_dl = hl_out_delim;
+                mono_colored((tx + px(4)), (ly + ((lh - nx_font_h(PANEL_FONT)) / 2)), s, cols, (tw_ - px(8)));
+            } else if (st == 8) {
+                code_top = -1;
+            } else if (st == 1) {
+                __nexa_ui_heading(tx, (ly + px(4)), std::string(s), px(15));
+            } else if (st == 2 || st == 9) {
+                if (st == 2) {
+                    disc((tx + px(4)), (ly + (lh / 2)), px(2), C_TEXT);
+                }
+                txt_inline((tx + px(14)), (ly + px(2)), s);
+            } else if (st == 3) {
+                txt((tx + px(6)), (ly + px(2)), s, C_BRIGHT, UI);
+            } else if (st == 6) {
+                bool res_ok = (!((i + 1) < (int)((ag_role).size()) && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(ag_content[(i + 1)], "ERROR")));
+                bool running = ((i + 1) >= (int)((ag_role).size()) || ag_role[(i + 1)] != "tool");
+                rrect((tx - px(4)), (ly + px(2)), (tw_ + px(8)), (lh - px(4)), px(5), 0x252526);
+                int ic = ((running) ? (C_ACCENT) : (((res_ok) ? (C_OK) : (C_ERROR))));
+                disc((tx + px(6)), (ly + (lh / 2)), px(3), ic);
+                std::string verb = tool_verb(s);
+                int vw = txt_v((tx + px(16)), ly, lh, verb, C_TEXT, UI);
+                std::string sum = tool_summary(i);
+                txt_v((tx + px(22) + vw), ly, lh, fit(sum, (tw_ - vw - px(52)), UI), C_MUTED, UI);
+                draw_glyph(((ag_open[i]) ? (std::string("chevdown")) : (std::string("chevright"))), (tx + tw_ - px(18)), (ly + ((lh - px(16)) / 2)), px(16), C_MUTED);
+                if (clicked_in((tx - px(4)), (ly + px(2)), (tw_ + px(8)), (lh - px(4))) && inside(up_x, up_y, x, y, w, h)) {
+                    ag_open[i] = (!ag_open[i]);
+                    ag_follow = false;
+                }
+            } else if ((int)((s).size()) > 0) {
+                txt_inline(tx, (ly + px(2)), s);
+            }
+            ly = ly + lh;
+        }
+        if (role == "assistant" && (int)((ag_content[i]).size()) > 0 && hovered(x, yy, w, hh) && inside(mx, my, x, y, w, h)) {
+            if (icon_button((x + w - px(34)), (yy - px(4)), "copy", "Copy")) {
+                nx_clip_set(ag_content[i].c_str());
+            }
+        }
+        yy = yy + (hh - ((role == "user") ? (px(5)) : (0)));
+    }
+    if (status_h > 0) {
+        int sy_ = (yy + px(4));
+        if ((int)((ag_error).size()) > 0 && !(agent_busy())) {
+            {
+                const std::vector<std::string>& __nexa_forin_6 = ag_wrap(ag_error, tw_, UI);
+                for (const std::string& l : __nexa_forin_6) {
+                    txt(tx, sy_, l, 0xF48771, UI);
+                    sy_ = sy_ + (__nexa_ui_text_height(UI) + px(4));
+                }
+            }
+        } else if (agent_busy()) {
+            std::string dots = ([](const std::string& __s, int __n){ std::string __o; for (int __i = 0; __i < __n; __i++) __o += __s; return __o; })(".", static_cast<int>((now_ms / 400 % 4)));
+            txt(tx, sy_, (ag_status + dots), C_MUTED, UI);
+        } else {
+            txt(tx, sy_, ag_status, C_MUTED, UI);
+        }
+    }
+    nx_clip_off();
+    if (total > h) {
+        int th = imax(px(20), (h * h / total));
+        int ty = (y + ((h - th) * ag_scroll / imax(1, max_scroll)));
+        fill_a((x + w - px(8)), ty, px(6), th, 0x797979, 70);
+    }
+}
+
+static std::vector<std::string> ag_input_lines(int w) {
+    std::string t = fld_text[FLD_AGENT];
+    return ag_wrap(t, (w - px(40) - px(64)), UI);
+}
+
+static int ag_input_h(int w) {
+    int n = clamp((int)((ag_input_lines(w)).size()), 1, 8);
+    return ((n * (__nexa_ui_text_height(UI) + px(5))) + px(22));
+}
+
+static void draw_agent_input(int x, int y, int w, int h) {
+    fill((x + 1), y, (w - 1), h, C_SIDEBAR);
+    int bx = (x + px(12));
+    int by = (y + px(6));
+    int bw = (w - px(24));
+    int bh = (h - px(16));
+    ag_in_x = bx;
+    ag_in_y = by;
+    ag_in_w = bw;
+    ag_in_h = bh;
+    bool focused = (focus == F_AGENT);
+    rrect(bx, by, bw, bh, px(6), C_INPUT);
+    rrect_line(bx, by, bw, bh, px(6), ((focused) ? (C_ACCENT) : (C_INPUT_BORDER)));
+    std::string t = fld_text[FLD_AGENT];
+    int lh = (__nexa_ui_text_height(UI) + px(5));
+    std::vector<std::string> lines = ag_input_lines(w);
+    int tx = (bx + px(10));
+    int ty = (by + px(8));
+    if ((int)((t).size()) == 0) {
+        txt(tx, ty, ((ag_mode == "agent") ? (std::string("Ask the agent to do something...")) : (std::string("Ask a question..."))), C_DIM, UI);
+    }
+    int caret = fld_caret[FLD_AGENT];
+    int pos = 0;
+    int first = imax(0, ((int)((lines).size()) - 8));
+    for (int k = 0; k < (int)((lines).size()); k++) {
+        std::string l = lines[k];
+        int lstart = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(t, l, pos);
+        if (lstart < 0) {
+            lstart = pos;
+        }
+        int lend = (lstart + (int)((l).size()));
+        if (k >= first) {
+            int ly = (ty + ((k - first) * lh));
+            if (focused && fld_has_sel(FLD_AGENT)) {
+                int a = imax(imin(fld_anchor[FLD_AGENT], caret), lstart);
+                int b = imin(imax(fld_anchor[FLD_AGENT], caret), lend);
+                if (b > a) {
+                    fill((tx + tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, lstart, (a - lstart)), UI)), ly, tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, a, (b - a)), UI), (lh - px(2)), C_SELECTION);
+                }
+            }
+            txt(tx, ly, l, C_TEXT, UI);
+            if (focused && caret_on() && caret >= lstart && (caret < lend || (caret == lend && (k == ((int)((lines).size()) - 1) || ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, lend, 1) != " ")))) {
+                fill((tx + tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, lstart, (caret - lstart)), UI)), ly, 1, (lh - px(3)), C_TEXT);
+            }
+        }
+        pos = lend;
+        while (pos < (int)((t).size()) && (t[pos] == ' ' || t[pos] == '\n')) {
+            pos = pos + 1;
+        }
+    }
+    int sx_ = (bx + bw - px(58));
+    int sy_ = (by + bh - px(30));
+    if (agent_busy()) {
+        if (__nexa_ui_button(sx_, sy_, px(52), px(24), std::string("Stop"), std::string("danger"))) {
+            agent_stop();
+        }
+    } else {
+        if (__nexa_ui_button(sx_, sy_, px(52), px(24), std::string("Send"), std::string("primary"))) {
+            agent_send();
+        }
+    }
+    txt((bx + px(10)), (by + bh - px(20)), ((ag_mode == "agent") ? ((provider_label(ag_provider) + " \xC2\xB7 " + ag_model_label())) : ((std::string("Chat \xC2\xB7 ") + ag_model_label()))), C_DIM, UI_SMALL);
+}
+
+static void agent_key(int vk, int mods) {
+    bool shift = ((mods & M_SHIFT) != 0);
+    if (vk == K_ENTER && !(shift)) {
+        agent_send();
+        return;
+    }
+    if (vk == K_ENTER && shift) {
+        if (fld_has_sel(FLD_AGENT)) {
+            fld_del_sel(FLD_AGENT);
+        }
+        std::string t = fld_text[FLD_AGENT];
+        int c = fld_caret[FLD_AGENT];
+        fld_text[FLD_AGENT] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, c) + "\n" + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, c, -1));
+        fld_caret[FLD_AGENT] = (c + 1);
+        fld_anchor[FLD_AGENT] = (c + 1);
+        return;
+    }
+    if (vk == K_ESC) {
+        if (agent_busy()) {
+            agent_stop();
+        } else {
+            focus = F_EDITOR;
+        }
+        return;
+    }
+    fld_key(FLD_AGENT, vk, mods);
+}
+
+static void agent_mouse(int x, int y, int btn) {
+    if (inside(x, y, ag_in_x, ag_in_y, ag_in_w, ag_in_h)) {
+        focus = F_AGENT;
+        fld_caret[FLD_AGENT] = (int)((fld_text[FLD_AGENT]).size());
+        fld_anchor[FLD_AGENT] = fld_caret[FLD_AGENT];
+        return;
+    }
+    if (y >= (TOOLBAR_H + HEADER_H + px(44))) {
+        focus = F_AGENT;
+    }
+}
+
+static void agent_wheel(int delta) {
+    ag_scroll = imax(0, (ag_scroll - (delta * px(60) / 120)));
+    ag_follow = false;
+    frame_dirty = true;
+}
+
+static void mono_colored(int x, int y, std::string s, std::vector<int> cols, int max_w) {
+    nx_clip(x, (y - px(2)), (x + max_w), (y + nx_font_h(PANEL_FONT) + px(2)));
+    int v = 0;
+    int j = 0;
+    int n = (int)((s).size());
+    int cw = nx_font_cw(PANEL_FONT);
+    while (j < n && (v * cw) < max_w) {
+        int cl = cp_len(s, j);
+        int b = ubyte(s, j);
+        if (b > 32) {
+            int c = ((j < (int)((cols).size())) ? (cols[j]) : (C_TEXT));
+            nx_text_cell(PANEL_FONT, (x + (v * cw)), y, cw, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, j, cl).c_str(), c);
+        }
+        j = j + cl;
+        v = v + 1;
+    }
+    nx_clip_off();
+}
+
+static void txt_inline(int x, int y, const std::string& s) {
+    if (!(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(s, "`"))) {
+        txt(x, y, s, C_TEXT, UI);
+        return;
+    }
+    std::vector<std::string> parts = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(s, "`");
+    int px_ = x;
+    for (int k = 0; k < (int)((parts).size()); k++) {
+        std::string part = parts[k];
+        if ((k % 2) == 1) {
+            int w = tw(part, UI);
+            rrect((px_ - px(1)), (y - px(1)), (w + px(4)), (__nexa_ui_text_height(UI) + px(2)), px(3), 0x2A2A2A);
+            txt((px_ + px(1)), y, part, 0xD7BA7D, UI);
+            px_ = px_ + (w + px(5));
+        } else {
+            px_ = px_ + txt(px_, y, part, C_TEXT, UI);
+        }
+    }
 }
 
 static void layout() {
@@ -10129,7 +12187,8 @@ static void layout() {
     side_y = top;
     side_h = (bottom - top);
     main_x = (ACT_W + ((show_sidebar) ? ((sidebar_w + 1)) : (0)));
-    main_w = (win_w - main_x);
+    agent_w = clamp(agent_w, px(280), imax(px(280), (win_w / 2)));
+    main_w = (win_w - main_x - ((show_agent) ? (agent_w) : (0)));
     panel_h = clamp(panel_h, px(100), imax(px(100), (bottom - top - px(140))));
     panel_y = ((show_panel) ? ((bottom - panel_h)) : (bottom));
     ed_x = main_x;
@@ -10138,7 +12197,7 @@ static void layout() {
     ed_h = (panel_y - ed_y);
     gutter_w = (px(18) + (digits(imax((int)((L).size()), 99)) * CW) + px(22));
     text_x = (ed_x + gutter_w);
-    text_w = (ed_w - gutter_w - SCROLL_W);
+    text_w = (ed_w - gutter_w - SCROLL_W - mm_w());
 }
 
 static int para(int x, int y, int w, const std::string& s, int c, int size) {
@@ -10167,7 +12226,7 @@ static int para(int x, int y, int w, const std::string& s, int c, int size) {
 }
 
 static void section_title(int x, int y, int w, const std::string& title) {
-    fill(x, y, w, HEADER_H, C_CHROME);
+    fill(x, y, w, HEADER_H, C_SIDEBAR);
     txt_v((x + px(20)), y, HEADER_H, title, C_MUTED, UI_SMALL);
 }
 
@@ -10213,7 +12272,7 @@ static void draw_logo_c(int x, int y, int s, bool back, int fg, int bar) {
 }
 
 static void draw_toolbar() {
-    fill(0, 0, win_w, TOOLBAR_H, C_CHROME);
+    fill(0, 0, win_w, TOOLBAR_H, C_TITLE);
     hline(0, (TOOLBAR_H - 1), win_w, C_BORDER);
     draw_logo(px(10), ((TOOLBAR_H - px(20)) / 2), px(20), true);
     std::vector<std::string> names = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(MENU_NAMES, " ");
@@ -10301,7 +12360,7 @@ static void toolbar_mouse(int x, int y) {
 
 static void icon_files(int x, int y, int c) {
     outline((x + px(4)), (y + px(1)), px(11), px(15), c);
-    fill((x + px(1)), (y + px(5)), px(11), px(15), C_CHROME);
+    fill((x + px(1)), (y + px(5)), px(11), px(15), C_ACTBAR);
     outline((x + px(1)), (y + px(5)), px(11), px(15), c);
     hline((x + px(4)), (y + px(10)), px(5), c);
     hline((x + px(4)), (y + px(13)), px(5), c);
@@ -10332,9 +12391,9 @@ static void gear(int cx_, int cy_, int r, int c) {
 }
 
 static void draw_activity() {
-    fill(0, TOOLBAR_H, ACT_W, (win_h - TOOLBAR_H - STATUS_H), C_CHROME);
+    fill(0, TOOLBAR_H, ACT_W, (win_h - TOOLBAR_H - STATUS_H), C_ACTBAR);
     vline((ACT_W - 1), TOOLBAR_H, (win_h - TOOLBAR_H - STATUS_H), C_BORDER);
-    int items = 2;
+    int items = 3;
     for (int i = 0; i < items; i++) {
         int y = (TOOLBAR_H + (i * ACT_W));
         bool on = (show_sidebar && view == i);
@@ -10347,12 +12406,31 @@ static void draw_activity() {
         int iy = (y + ((ACT_W - px(20)) / 2));
         if (i == 0) {
             icon_files(ix, iy, c);
-        } else {
+        } else if (i == 1) {
             icon_search(ix, iy, c);
+        } else {
+            draw_glyph("outline", ix, iy, px(20), c);
         }
         if (hov) {
-            tooltip(((i == 0) ? (std::string("Explorer (Ctrl+Shift+E)")) : (std::string("Search (Ctrl+Shift+F)"))));
+            if (i == 0) {
+                tooltip("Explorer (Ctrl+Shift+E)");
+            }
+            if (i == 1) {
+                tooltip("Search (Ctrl+Shift+F)");
+            }
+            if (i == 2) {
+                tooltip("Outline");
+            }
         }
+    }
+    int ay_ = (win_h - STATUS_H - (ACT_W * 2));
+    bool ahov = hovered(0, ay_, ACT_W, ACT_W);
+    if (show_agent) {
+        fill(0, ay_, px(2), ACT_W, C_BRIGHT);
+    }
+    draw_glyph("agent", ((ACT_W - px(20)) / 2), (ay_ + ((ACT_W - px(20)) / 2)), px(20), ((ahov || show_agent) ? (C_BRIGHT) : (0x868686)));
+    if (ahov) {
+        tooltip("Agent (Ctrl+Shift+L)");
     }
     int gy = (win_h - STATUS_H - ACT_W);
     bool ghov = hovered(0, gy, ACT_W, ACT_W);
@@ -10369,8 +12447,16 @@ static void activity_mouse(int x, int y) {
         open_special(1);
         return;
     }
+    if (y >= (gy - ACT_W)) {
+        show_agent = (!show_agent);
+        if (show_agent) {
+            focus = F_AGENT;
+        }
+        save_settings();
+        return;
+    }
     int i = ((y - TOOLBAR_H) / ACT_W);
-    if (i < 0 || i > 1) {
+    if (i < 0 || i > 2) {
         return;
     }
     if (show_sidebar && view == i) {
@@ -10389,13 +12475,16 @@ static void draw_sidebar() {
     if (!(show_sidebar)) {
         return;
     }
-    fill(side_x, side_y, sidebar_w, side_h, C_CHROME);
+    fill(side_x, side_y, sidebar_w, side_h, C_SIDEBAR);
     if (view == 0) {
         draw_explorer();
-    } else {
+    } else if (view == 1) {
         draw_search_view();
+    } else {
+        draw_outline();
     }
     vline((side_x + sidebar_w), side_y, side_h, C_BORDER);
+    shadow_v((side_x + sidebar_w + 1), side_y, side_h, true);
     if (drag == 1 || (hovered((side_x + sidebar_w - px(2)), side_y, px(5), side_h) && drag == 0)) {
         fill((side_x + sidebar_w - 1), side_y, px(3), side_h, C_ACCENT);
     }
@@ -10409,7 +12498,7 @@ static int tab_width(int i) {
 static void draw_tabs() {
     int x0 = main_x;
     int y = TOOLBAR_H;
-    fill(x0, y, main_w, TABS_H, C_CHROME);
+    fill(x0, y, main_w, TABS_H, C_TITLE);
     hline(x0, (y + TABS_H - 1), main_w, C_BORDER);
     tab_xs.clear();
     tab_ws.clear();
@@ -10559,9 +12648,9 @@ static int status_item(int x, std::string s, std::string id, bool right) {
     int w = (tw(s, UI_SMALL) + px(16));
     int ix = ((right) ? ((x - w)) : (x));
     if (hovered(ix, (win_h - STATUS_H), w, STATUS_H) && (int)((id).size()) > 0) {
-        fill(ix, (win_h - STATUS_H + 1), w, (STATUS_H - 1), 0x2B2B2B);
+        fill(ix, (win_h - STATUS_H), w, STATUS_H, 0x1F77B4);
     }
-    txt_v((ix + px(8)), (win_h - STATUS_H), STATUS_H, s, C_TEXT, UI_SMALL);
+    txt_v((ix + px(8)), (win_h - STATUS_H), STATUS_H, s, C_BRIGHT, UI_SMALL);
     status_items_x.push_back(ix);
     status_items_w.push_back(w);
     status_items_id.push_back(id);
@@ -10570,22 +12659,21 @@ static int status_item(int x, std::string s, std::string id, bool right) {
 
 static void draw_status() {
     int y = (win_h - STATUS_H);
-    fill(0, y, win_w, STATUS_H, C_CHROME);
-    hline(0, y, win_w, C_BORDER);
+    fill(0, y, win_w, STATUS_H, C_STATUS);
     status_items_x.clear();
     status_items_w.clear();
     status_items_id.clear();
     int bw = px(34);
-    fill(0, y, bw, STATUS_H, C_ACCENT);
+    fill(0, y, bw, STATUS_H, 0x16825D);
     draw_logo(((bw - px(14)) / 2), (y + ((STATUS_H - px(14)) / 2)), px(14), false);
     int x = (bw + px(4));
     if ((int)((git_branch).size()) > 0) {
         int gx = (x + px(8));
         int cyy = (y + (STATUS_H / 2));
-        circle((gx + px(2)), (cyy - px(4)), px(2), C_TEXT);
-        circle((gx + px(2)), (cyy + px(4)), px(2), C_TEXT);
-        circle((gx + px(8)), (cyy - px(2)), px(2), C_TEXT);
-        vline((gx + px(2)), (cyy - px(2)), px(4), C_TEXT);
+        circle((gx + px(2)), (cyy - px(4)), px(2), C_BRIGHT);
+        circle((gx + px(2)), (cyy + px(4)), px(2), C_BRIGHT);
+        circle((gx + px(8)), (cyy - px(2)), px(2), C_BRIGHT);
+        vline((gx + px(2)), (cyy - px(2)), px(4), C_BRIGHT);
         x = x + px(12);
         x = x + status_item(x, git_branch, "", false);
     }
@@ -10594,16 +12682,16 @@ static void draw_status() {
     int px0 = x;
     int pw = (tw(std::to_string(errs), UI_SMALL) + tw(std::to_string(warns), UI_SMALL) + px(52));
     if (hovered(px0, y, pw, STATUS_H)) {
-        fill(px0, (y + 1), pw, (STATUS_H - 1), 0x2B2B2B);
+        fill(px0, y, pw, STATUS_H, 0x1F77B4);
     }
     int cyy = (y + (STATUS_H / 2));
-    circle((px0 + px(14)), cyy, px(5), C_TEXT);
-    line((px0 + px(12)), (cyy - px(2)), (px0 + px(16)), (cyy + px(2)), C_TEXT, 1);
-    line((px0 + px(16)), (cyy - px(2)), (px0 + px(12)), (cyy + px(2)), C_TEXT, 1);
+    circle((px0 + px(14)), cyy, px(5), C_BRIGHT);
+    line((px0 + px(12)), (cyy - px(2)), (px0 + px(16)), (cyy + px(2)), C_BRIGHT, 1);
+    line((px0 + px(16)), (cyy - px(2)), (px0 + px(12)), (cyy + px(2)), C_BRIGHT, 1);
     int tx = (px0 + px(22));
-    tx = tx + (txt_v(tx, y, STATUS_H, std::to_string(errs), C_TEXT, UI_SMALL) + px(8));
-    __nexa_gfx_tri((tx + px(5)), (cyy - px(5)), tx, (cyy + px(4)), (tx + px(10)), (cyy + px(4)), 204, 204, 204);
-    txt_v((tx + px(14)), y, STATUS_H, std::to_string(warns), C_TEXT, UI_SMALL);
+    tx = tx + (txt_v(tx, y, STATUS_H, std::to_string(errs), C_BRIGHT, UI_SMALL) + px(8));
+    __nexa_gfx_tri((tx + px(5)), (cyy - px(5)), tx, (cyy + px(4)), (tx + px(10)), (cyy + px(4)), 255, 255, 255);
+    txt_v((tx + px(14)), y, STATUS_H, std::to_string(warns), C_BRIGHT, UI_SMALL);
     status_items_x.push_back(px0);
     status_items_w.push_back(pw);
     status_items_id.push_back("view.problems");
@@ -10775,13 +12863,13 @@ static void draw_settings_page() {
         set_args = run_args;
         set_loaded = true;
     }
-    clamp_page(px(780));
+    clamp_page(px(1260));
     int x = (main_x + imax(px(40), ((main_w - px(720)) / 2)));
     int w = imin(px(720), (main_w - px(80)));
     int y = (top + px(36) - page_scroll);
     __nexa_ui_heading(x, y, std::string("Settings"), px(28));
     y = y + px(56);
-    __nexa_ui_panel(x, y, w, px(206), std::string("Text Editor"));
+    __nexa_ui_panel(x, y, w, px(300), std::string("Text Editor"));
     int iy = (y + px(56));
     txt((x + px(20)), iy, "Font Size", C_TEXT, UI);
     txt((x + px(20)), (iy + px(20)), "Size of the code font, in pixels.", C_MUTED, UI_SMALL);
@@ -10802,7 +12890,27 @@ static void draw_settings_page() {
         auto_save = asv;
         save_settings();
     }
-    y = y + px(226);
+    iy = iy + px(40);
+    bool mm = __nexa_ui_toggle((x + px(20)), iy, std::string("Show the minimap beside the scrollbar"), static_cast<bool>(show_minimap));
+    if (mm != show_minimap) {
+        show_minimap = mm;
+        save_settings();
+    }
+    iy = iy + px(40);
+    txt((x + px(20)), (iy + px(8)), "Font family", C_TEXT, UI);
+    if ((int)((set_font).size()) == 0) {
+        set_font = font_family;
+    }
+    set_font = __nexa_ui_textbox((x + px(140)), iy, (w - px(280)), std::string(set_font), std::string("Cascadia Mono;Consolas"));
+    if (__nexa_ui_button((x + w - px(128)), iy, px(108), (__nexa_ui_text_height(UI) + px(16)), std::string("Apply"), std::string("secondary"))) {
+        font_family = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(set_font);
+        if ((int)((font_family).size()) == 0) {
+            font_family = "Cascadia Mono;Consolas";
+        }
+        metrics_init();
+        save_settings();
+    }
+    y = y + px(320);
     __nexa_ui_panel(x, y, w, px(250), std::string("Nexa"));
     iy = (y + px(56));
     txt((x + px(20)), iy, "Compiler", C_TEXT, UI);
@@ -10824,10 +12932,94 @@ static void draw_settings_page() {
         save_settings();
     }
     y = y + px(270);
+    draw_agent_settings(x, y, w);
+    y = y + px(390);
     __nexa_ui_panel(x, y, w, px(120), std::string("About"));
     txt((x + px(20)), (y + px(56)), (std::string("Nexium ") + VERSION + ", written in Nexa and drawn with std/ui."), C_TEXT, UI);
     std::string cv = (((int)((nexac_version).size()) > 0) ? (nexac_version) : (std::string("NexaC not found on PATH")));
     txt((x + px(20)), (y + px(80)), (cv + "   \xC2\xB7   settings: " + settings_path), C_MUTED, UI_SMALL);
+}
+
+static void draw_agent_settings(int x, int y, int w) {
+    std::vector<std::string> providers = provider_ids();
+    if (set_provider != ag_provider) {
+        set_provider = ag_provider;
+        std::string k = "";
+        if (((ag_keys).find(ag_provider) != (ag_keys).end())) {
+            k = ag_keys[ag_provider];
+        }
+        fld_set(FLD_KEY, k);
+        set_url = ((((ag_urls).find(ag_provider) != (ag_urls).end())) ? (ag_urls[ag_provider]) : (std::string("")));
+        set_custom = ((((ag_custom).find(ag_provider) != (ag_custom).end())) ? (ag_custom[ag_provider]) : (std::string("")));
+    }
+    if ((int)((set_nexa_lang).size()) == 0) {
+        set_nexa_lang = nexa_lang;
+    }
+    __nexa_ui_panel(x, y, w, px(370), std::string("Agent"));
+    int iy = (y + px(56));
+    int half = ((w - px(60)) / 2);
+    txt((x + px(20)), iy, "Provider", C_TEXT, UI);
+    txt((x + px(40) + half), iy, "Temperature", C_TEXT, UI);
+    int t100 = static_cast<int>(((ag_temp * 100.0) + 0.5));
+    int nt = __nexa_ui_slider((x + px(40) + half), (iy + px(30)), (half - px(60)), static_cast<int>(t100), 0, 100);
+    txt((x + w - px(56)), (iy + px(28)), (std::string("") + __nexa_fmt_f(static_cast<double>((static_cast<double>(nt) / 100.0)), " ", '>', 0, 0, false, 2, 0)), C_TEXT, UI);
+    if (nt != t100) {
+        ag_temp = (static_cast<double>(nt) / 100.0);
+        save_settings();
+    }
+    iy = iy + px(70);
+    txt((x + px(20)), iy, "API key", C_TEXT, UI);
+    std::string env = provider_env(ag_provider);
+    std::string hint = (((int)((env).size()) > 0) ? ((std::string("Stored in settings.json. Empty uses ") + env + ".")) : (std::string("Not needed for this provider.")));
+    txt((x + px(20)), (iy + px(20)), hint, C_MUTED, UI_SMALL);
+    key_x = (x + px(20));
+    key_y = (iy + px(42));
+    key_w = (w - px(40));
+    key_h = (__nexa_ui_text_height(UI) + px(16));
+    fld_draw(FLD_KEY, key_x, key_y, key_w, key_h, (focus == F_KEY), (((int)((ag_key()).size()) > 0) ? ((std::string("(using ") + env + ")")) : (std::string("sk-..."))));
+    iy = iy + px(90);
+    txt((x + px(20)), iy, "Base URL", C_TEXT, UI);
+    std::string nu = __nexa_ui_textbox((x + px(20)), (iy + px(24)), half, std::string(set_url), std::string(provider_url(ag_provider)));
+    if (nu != set_url) {
+        set_url = nu;
+        ag_urls[ag_provider] = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(nu);
+        save_settings();
+    }
+    txt((x + px(40) + half), iy, "Custom model id", C_TEXT, UI);
+    std::string nc = __nexa_ui_textbox((x + px(40) + half), (iy + px(24)), half, std::string(set_custom), std::string("overrides the model list"));
+    if (nc != set_custom) {
+        set_custom = nc;
+        ag_custom[ag_provider] = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(nc);
+        save_settings();
+    }
+    iy = iy + px(80);
+    txt((x + px(20)), iy, "Nexa-Lang folder", C_TEXT, UI);
+    txt((x + px(20)), (iy + px(20)), "The agent reads its SYNTAX notes so it writes real Nexa.", C_MUTED, UI_SMALL);
+    std::string nl = __nexa_ui_textbox((x + px(20)), (iy + px(42)), (w - px(40)), std::string(set_nexa_lang), std::string("D:\\Projects\\Nexa-Lang"));
+    if (nl != set_nexa_lang) {
+        set_nexa_lang = nl;
+        nexa_lang = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(nl);
+        save_settings();
+    }
+    std::vector<std::string> plabels;
+    {
+        const std::vector<std::string>& __nexa_forin_3 = providers;
+        for (const std::string& p : __nexa_forin_3) {
+            plabels.push_back(provider_label(p));
+        }
+    }
+    int pi = ([&](){ const auto& __nexa_v = providers; const auto& __nexa_x = ag_provider; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
+    int np = __nexa_ui_dropdown((x + px(20)), (y + px(56) + px(26)), half, plabels, pi);
+    if (np != pi && np >= 0) {
+        ag_provider = providers[np];
+        save_settings();
+    }
+}
+
+static void key_field_changed() {
+    std::string k = fld_text[FLD_KEY];
+    ag_keys[ag_provider] = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(k);
+    save_settings();
 }
 
 static std::string settings_file() {
@@ -10899,6 +13091,57 @@ static void load_settings() {
             recent.push_back(r.get_at(i).as_string());
         }
     }
+    if (j.has("font_family") && (int)((j.get("font_family").as_string()).size()) > 0) {
+        font_family = j.get("font_family").as_string();
+    }
+    if (j.has("minimap")) {
+        show_minimap = j.get("minimap").as_bool();
+    }
+    if (j.has("show_agent")) {
+        show_agent = j.get("show_agent").as_bool();
+    }
+    if (j.has("agent_w")) {
+        agent_w = j.get("agent_w").as_int();
+    }
+    if (j.has("nexa_lang")) {
+        nexa_lang = j.get("nexa_lang").as_string();
+    }
+    if (j.has("provider")) {
+        ag_provider = j.get("provider").as_string();
+    }
+    if (!(([&](){ const auto& __nexa_v = provider_ids(); const auto& __nexa_x = ag_provider; for (const auto& __nexa_e : __nexa_v) { if (__nexa_e == __nexa_x) return true; } return false; })())) {
+        ag_provider = "openai";
+    }
+    if (j.has("mode")) {
+        ag_mode = ((j.get("mode").as_string() == "chat") ? (std::string("chat")) : (std::string("agent")));
+    }
+    if (j.has("temperature")) {
+        ag_temp = j.get("temperature").as_float();
+    }
+    if (j.has("providers") && j.get("providers").is_object()) {
+        __nexa_json ps = j.get("providers");
+        {
+            const std::vector<std::string>& __nexa_forin_0 = provider_ids();
+            for (const std::string& id : __nexa_forin_0) {
+                if (!(ps.has(id))) {
+                    continue;
+                }
+                __nexa_json slot = ps.get(id);
+                if (slot.has("api_key")) {
+                    ag_keys[id] = slot.get("api_key").as_string();
+                }
+                if (slot.has("base_url")) {
+                    ag_urls[id] = slot.get("base_url").as_string();
+                }
+                if (slot.has("model")) {
+                    ag_models[id] = slot.get("model").as_string();
+                }
+                if (slot.has("custom_model")) {
+                    ag_custom[id] = slot.get("custom_model").as_string();
+                }
+            }
+        }
+    }
     if (j.has("open_files")) {
         __nexa_json r = j.get("open_files");
         for (int i = 0; i < r.len(); i++) {
@@ -10929,14 +13172,35 @@ static void save_settings() {
     j.set("render_whitespace", __nexa_json::boolean(show_ws));
     j.set("auto_save", __nexa_json::boolean(auto_save));
     j.set("maximized", __nexa_json::boolean((nx_maximized() == 1)));
+    j.set("font_family", __nexa_json::str(font_family));
+    j.set("minimap", __nexa_json::boolean(show_minimap));
+    j.set("show_agent", __nexa_json::boolean(show_agent));
+    j.set("agent_w", __nexa_json::number(static_cast<double>(static_cast<int>((agent_w / SCALE)))));
+    j.set("nexa_lang", __nexa_json::str(nexa_lang));
+    j.set("provider", __nexa_json::str(ag_provider));
+    j.set("mode", __nexa_json::str(ag_mode));
+    j.set("temperature", __nexa_json::number(ag_temp));
+    __nexa_json ps = __nexa_json::obj();
+    {
+        const std::vector<std::string>& __nexa_forin_0 = provider_ids();
+        for (const std::string& id : __nexa_forin_0) {
+            __nexa_json slot = __nexa_json::obj();
+            slot.set("api_key", __nexa_json::str(((((ag_keys).find(id) != (ag_keys).end())) ? (ag_keys[id]) : (std::string("")))));
+            slot.set("base_url", __nexa_json::str(((((ag_urls).find(id) != (ag_urls).end())) ? (ag_urls[id]) : (std::string("")))));
+            slot.set("model", __nexa_json::str(((((ag_models).find(id) != (ag_models).end())) ? (ag_models[id]) : (std::string("")))));
+            slot.set("custom_model", __nexa_json::str(((((ag_custom).find(id) != (ag_custom).end())) ? (ag_custom[id]) : (std::string("")))));
+            ps.set(id, slot);
+        }
+    }
+    j.set("providers", ps);
     if (nx_maximized() == 0 && nx_minimized() == 0) {
         j.set("window_w", __nexa_json::number(static_cast<double>(static_cast<int>((win_w / SCALE)))));
         j.set("window_h", __nexa_json::number(static_cast<double>(static_cast<int>((win_h / SCALE)))));
     }
     __nexa_json r = __nexa_json::arr();
     {
-        const std::vector<std::string>& __nexa_forin_0 = recent;
-        for (const std::string& p : __nexa_forin_0) {
+        const std::vector<std::string>& __nexa_forin_1 = recent;
+        for (const std::string& p : __nexa_forin_1) {
             r.push(__nexa_json::str(p));
         }
     }
@@ -11065,6 +13329,10 @@ static bool global_key(int vk, int m) {
         run_cmd("view.sidebar");
         return true;
     }
+    if (ctrl && shift && vk == 76) {
+        run_cmd("view.agent");
+        return true;
+    }
     if (ctrl && !(shift) && vk == 74) {
         run_cmd("view.panel");
         return true;
@@ -11182,6 +13450,20 @@ static void on_key(int vk, int m) {
         term_key(vk, m);
         return;
     }
+    if (focus == F_AGENT && show_agent) {
+        agent_key(vk, m);
+        return;
+    }
+    if (focus == F_KEY) {
+        if (vk == K_ESC || vk == K_ENTER || vk == K_TAB) {
+            focus = F_NONE;
+            return;
+        }
+        if (fld_key(FLD_KEY, vk, m) == 2) {
+            key_field_changed();
+        }
+        return;
+    }
     if (focus == F_SEARCH) {
         search_key(vk, m);
         return;
@@ -11224,6 +13506,15 @@ static void on_char(int cp) {
     if (focus == F_TERM) {
         fld_char(FLD_TERM, cp);
         term_follow = true;
+        return;
+    }
+    if (focus == F_AGENT && show_agent) {
+        fld_char(FLD_AGENT, cp);
+        return;
+    }
+    if (focus == F_KEY) {
+        fld_char(FLD_KEY, cp);
+        key_field_changed();
         return;
     }
     if (focus == F_SEARCH) {
@@ -11280,6 +13571,15 @@ static void on_mouse_down(int btn, int x, int y, int clicks, int m) {
         }
         return;
     }
+    if (show_agent && x >= (agent_x() - px(2))) {
+        if (x < (agent_x() + px(3))) {
+            drag = 7;
+            drag_off = (x - agent_x());
+        } else if (btn == 0) {
+            agent_mouse(x, y, btn);
+        }
+        return;
+    }
     if (show_sidebar && x >= (side_x + sidebar_w - px(2)) && x < (side_x + sidebar_w + px(3))) {
         drag = 1;
         drag_off = (x - (side_x + sidebar_w));
@@ -11297,8 +13597,10 @@ static void on_mouse_down(int btn, int x, int y, int clicks, int m) {
         }
         if (view == 0) {
             explorer_mouse(x, y, btn, clicks);
-        } else {
+        } else if (view == 1) {
             search_mouse(x, y, m);
+        } else {
+            outline_mouse(x, y);
         }
         return;
     }
@@ -11316,7 +13618,13 @@ static void on_mouse_down(int btn, int x, int y, int clicks, int m) {
         return;
     }
     if (!(is_file_tab())) {
-        focus = F_NONE;
+        if (active_kind() == 1 && inside(x, y, key_x, key_y, key_w, key_h)) {
+            focus = F_KEY;
+            fld_caret[FLD_KEY] = (int)((fld_text[FLD_KEY]).size());
+            fld_anchor[FLD_KEY] = fld_caret[FLD_KEY];
+        } else {
+            focus = F_NONE;
+        }
         return;
     }
     if (y < ed_y) {
@@ -11346,7 +13654,7 @@ static void on_mouse_up(int btn, int x, int y) {
         up_this_frame = true;
         up_x = x;
         up_y = y;
-        if (drag == 1 || drag == 2) {
+        if (drag == 1 || drag == 2 || drag == 7) {
             save_settings();
         }
         drag = 0;
@@ -11366,9 +13674,15 @@ static void on_wheel(int delta, int x, int y, bool horizontal) {
         }
         return;
     }
+    if (show_agent && x >= agent_x() && y > TOOLBAR_H) {
+        agent_wheel(delta);
+        return;
+    }
     if (show_sidebar && x >= side_x && x < (side_x + sidebar_w) && y > TOOLBAR_H) {
         if (view == 0) {
             tree_scroll = imax(0, (tree_scroll - (delta * ROW_H * 3 / 120)));
+        } else if (view == 2) {
+            outline_scroll = imax(0, (outline_scroll - (delta * ROW_H * 3 / 120)));
         } else {
             search_scroll = imax(0, (search_scroll - (delta * ROW_H * 3 / 120)));
         }
@@ -11427,12 +13741,19 @@ static void handle_input() {
         if (is_file_tab()) {
             ed_drag();
         }
+    } else if (drag == 6) {
+        if (is_file_tab()) {
+            minimap_drag();
+        }
+    } else if (drag == 7) {
+        agent_w = clamp((win_w - mx + drag_off), px(280), (win_w / 2));
+        frame_dirty = true;
     }
 }
 
 static void update_cursor_shape() {
     int c = 0;
-    if (drag == 1) {
+    if (drag == 1 || drag == 7) {
         c = 2;
     } else if (drag == 2) {
         c = 3;
@@ -11441,9 +13762,13 @@ static void update_cursor_shape() {
     } else if (menu_open < 0 && !(quick_open)) {
         if (show_sidebar && mx >= (side_x + sidebar_w - px(2)) && mx < (side_x + sidebar_w + px(3)) && my > TOOLBAR_H && my < (win_h - STATUS_H)) {
             c = 2;
+        } else if (show_agent && mx >= (agent_x() - px(2)) && mx < (agent_x() + px(3)) && my > TOOLBAR_H && my < (win_h - STATUS_H)) {
+            c = 2;
+        } else if (show_agent && mx >= agent_x() && inside(mx, my, ag_in_x, ag_in_y, (ag_in_w - px(64)), ag_in_h)) {
+            c = 1;
         } else if (show_panel && my >= (panel_y - px(2)) && my < (panel_y + px(3)) && mx >= main_x) {
             c = 3;
-        } else if (is_file_tab() && mx >= text_x && mx < (ed_x + ed_w - SCROLL_W) && my >= ed_y && my < (ed_y + ed_h)) {
+        } else if (is_file_tab() && mx >= text_x && mx < (ed_x + ed_w - SCROLL_W - mm_w()) && my >= ed_y && my < (ed_y + ed_h)) {
             c = 1;
             if (find_open) {
                 find_layout();
@@ -11478,6 +13803,7 @@ static void draw_frame() {
         draw_tabs();
     }
     draw_sidebar();
+    draw_agent();
     draw_activity();
     draw_status();
     draw_toolbar();
@@ -11533,6 +13859,7 @@ int main(int argc, char** argv) {
     load_settings();
     sidebar_w = px(sidebar_w);
     panel_h = px(panel_h);
+    agent_w = px(agent_w);
     int w0 = px(win_w);
     int h0 = px(win_h);
     __nexa_ui_open(std::string("Nexium"), w0, h0);
@@ -11621,6 +13948,7 @@ int main(int argc, char** argv) {
         layout();
         handle_input();
         poll_processes();
+        agent_poll();
         maybe_check();
         std::string dropped = __nexa_gfx_drop();
         while ((int)((dropped).size()) > 0) {
@@ -11638,7 +13966,7 @@ int main(int argc, char** argv) {
             last_title = t;
             update_title();
         }
-        bool busy = (drag != 0 || task_proc >= 0 || check_proc >= 0 || (int)((ev_t).size()) > 0);
+        bool busy = (drag != 0 || task_proc >= 0 || check_proc >= 0 || (int)((ev_t).size()) > 0 || agent_busy());
         if (!(busy)) {
             nx_wait(((term_proc >= 0) ? (50) : (250)));
         } else {
@@ -11649,6 +13977,7 @@ int main(int argc, char** argv) {
         }
     }
     save_settings();
+    agent_stop();
     if (term_proc >= 0) {
         nx_proc_free(term_proc);
     }
