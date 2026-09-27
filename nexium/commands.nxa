@@ -215,7 +215,7 @@ fn run_cmd(id: string) {
             break;
         case "help.welcome": open_special(2); break;
         case "help.docs": os.open("https://github.com/Bobism-2009/Nexa-Lang/tree/main/SYNTAX"); break;
-        case "help.repo": os.open("https://github.com/Roms-lab/Nexium"); break;
+        case "help.repo": os.open("https://github.com/Bobism-2009/Nexium"); break;
         case "help.about":
             nx_message("Nexium " + VERSION + "\n\nA code editor for the Nexa language, written in Nexa and drawn with std/ui.\n\nCompiler: " + (len(nexac_version) > 0 ? nexac_version : "not found"));
             break;

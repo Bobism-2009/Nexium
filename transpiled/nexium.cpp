@@ -9002,7 +9002,7 @@ static void run_cmd(std::string id) {
         __nexa_os_open(std::string("https://github.com/Bobism-2009/Nexa-Lang/tree/main/SYNTAX"));
     }
     else if (id == "help.repo") {
-        __nexa_os_open(std::string("https://github.com/Roms-lab/Nexium"));
+        __nexa_os_open(std::string("https://github.com/Bobism-2009/Nexium"));
     }
     else if (id == "help.about") {
         nx_message((std::string("Nexium ") + VERSION + "\n\nA code editor for the Nexa language, written in Nexa and drawn with std/ui.\n\nCompiler: " + (((int)((nexac_version).size()) > 0) ? (nexac_version) : (std::string("not found")))).c_str());
