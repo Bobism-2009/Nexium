@@ -735,11 +735,7 @@ fn quick_refresh() {
             let nm: string = sym_names[i];
             if (fuzzy(nm, pat) >= 0) {
                 let kind: int = sym_kinds[i];
-                let kn = "variable";
-                if (kind == 1) { kn = "function"; }
-                if (kind == 2) { kn = "struct"; }
-                if (kind == 3) { kn = "enum"; }
-                quick_add(nm, f"{kn} · line {sym_lines[i] + 1}", 3, (string)sym_lines[i]);
+                quick_add(nm, f"{sym_kind_name(kind)} · line {sym_lines[i] + 1}", 3, (string)sym_lines[i]);
             }
         }
         if (len(quick_items) == 0) { quick_add("No symbols found", "", 5, ""); }
@@ -926,7 +922,7 @@ fn quick_mouse(x: int, y: int): bool {
 
 fn sym_color(kind: int): int {
     if (kind == 1) { return 0xB180D7; }
-    if (kind == 2 || kind == 3) { return 0xEE9D28; }
+    if (kind == 2 || kind == 3 || kind == 5 || kind == 6) { return 0xEE9D28; }
     return 0x75BEFF;
 }
 
@@ -934,6 +930,8 @@ fn sym_kind_name(kind: int): string {
     if (kind == 1) { return "function"; }
     if (kind == 2) { return "struct"; }
     if (kind == 3) { return "enum"; }
+    if (kind == 5) { return "type"; }
+    if (kind == 6) { return "shape"; }
     return "variable";
 }
 

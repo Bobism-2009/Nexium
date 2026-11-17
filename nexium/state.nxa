@@ -1,7 +1,7 @@
 // Every global the IDE shares, in one place: NexaC emits globals in file order,
 // so they have to be declared before the functions that use them.
 
-let const VERSION: string = "2.1.0";
+let const VERSION: string = "2.2.0";
 
 // ---- colours (VS Code Dark Modern) ------------------------------------------------
 
@@ -391,7 +391,7 @@ let const HM_NORMAL = 0;
 let const HM_BLOCK = 1;
 let const HM_RAW = 2;
 let const HM_FENCE = 3;
-let const STD_MODULES = " io os file dll random math crypto network json gfx gfx3d time thread inline ui ";
+let const STD_MODULES = " io os file dll random math crypto network json gfx gfx3d time thread term inline ui ";
 let hit_y = 0;
 let hit_x = 0;
 let word_a = 0;

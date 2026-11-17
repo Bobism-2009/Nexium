@@ -110,13 +110,6 @@ static std::vector<std::string> __nexa_os_environ() {
   return out;
 }
 #include <shellapi.h>
-static std::string __nexa_ps_quote(const std::string& s) {
-  std::string r; for (char c : s) { if (c == '\'') r += "''"; else r += c; } return r;
-}
-static void __nexa_os_notify(const std::string& title, const std::string& msg) {
-  std::string cmd = "powershell -NoProfile -Command \"Add-Type -AssemblyName System.Windows.Forms; $n=New-Object System.Windows.Forms.NotifyIcon; $n.Icon=[System.Drawing.SystemIcons]::Information; $n.Visible=$true; $n.ShowBalloonTip(5000,'" + __nexa_ps_quote(title) + "','" + __nexa_ps_quote(msg) + "',[System.Windows.Forms.ToolTipIcon]::Info); Start-Sleep -Milliseconds 6000; $n.Dispose()\" >nul 2>&1";
-  (void)system(cmd.c_str());
-}
 static void __nexa_os_open(const std::string& target) {
   ShellExecuteA(NULL, "open", target.c_str(), NULL, NULL, SW_SHOWNORMAL);
 }
@@ -152,6 +145,20 @@ static int __nexa_file_isdir(const char* __path) {
   if (!__path || !__path[0]) return 0;
   DWORD __a = GetFileAttributesA(__path);
   return (__a != INVALID_FILE_ATTRIBUTES && (__a & FILE_ATTRIBUTE_DIRECTORY)) ? 1 : 0;
+}
+// A symbolic link or a junction -- not every reparse point: a OneDrive folder
+// is one too, and is a real directory. The path names the link itself, so it
+// must not end in a separator.
+static int __nexa_file_islink(const char* __path) {
+  if (!__path || !__path[0]) return 0;
+  // FindFirstFile would match a pattern; a name with one is no file at all.
+  for (const char* __c = __path; *__c; ++__c) if (*__c == '*' || *__c == '?') return 0;
+  WIN32_FIND_DATAA __fd;
+  HANDLE __h = FindFirstFileA(__path, &__fd);
+  if (__h == INVALID_HANDLE_VALUE) return 0;
+  FindClose(__h);
+  return ((__fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+          (__fd.dwReserved0 == IO_REPARSE_TAG_SYMLINK || __fd.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT)) ? 1 : 0;
 }
 static int __nexa_file_isfile(const char* __path) {
   if (!__path || !__path[0]) return 0;
@@ -288,17 +295,29 @@ static int __nexa_file_remove(const char* __path) {
   if (__nexa_file_isdir(__path)) return RemoveDirectoryA(__path) ? 1 : 0;
   return DeleteFileA(__path) ? 1 : 0;
 }
-static int __nexa_file_remove_all(const char* __path) {
-  if (!__path || !__path[0]) return 0;
+// A link is removed, never walked: what it points at is not under this path,
+// and deleting through it would empty a directory somewhere else.
+static int __nexa_file_remove_all_at(const char* __path) {
+  if (__nexa_file_islink(__path)) return __nexa_file_remove(__path);
   if (!__nexa_file_exists(__path)) return 1;
   if (__nexa_file_isdir(__path)) {
     std::vector<std::string> __names = __nexa_file_list(__path);
     for (size_t __i = 0; __i < __names.size(); ++__i) {
       std::string __c = __nexa_file_join(__path, __names[__i].c_str());
-      if (!__nexa_file_remove_all(__c.c_str())) return 0;
+      if (!__nexa_file_remove_all_at(__c.c_str())) return 0;
     }
   }
   return __nexa_file_remove(__path);
+}
+static int __nexa_file_remove_all(const char* __path) {
+  if (!__path || !__path[0]) return 0;
+  // "link/" names what the link points at; without the separator it is the link.
+  size_t __n = 0;
+  while (__path[__n]) __n++;
+  size_t __e = __n;
+  while (__e > 1 && __nexa_file_is_sep(__path[__e - 1]) && __path[__e - 2] != ':') __e--;
+  if (__e == __n) return __nexa_file_remove_all_at(__path);
+  return __nexa_file_remove_all_at(std::string(__path, __e).c_str());
 }
 static int __nexa_file_copy_file(const char* __from, const char* __to) {
   return CopyFileA(__from, __to, FALSE) ? 1 : 0;
@@ -321,6 +340,14 @@ static int __nexa_file_rename(const char* __from, const char* __to) {
   if (!__from || !__to) return 0;
   return MoveFileA(__from, __to) ? 1 : 0;
 }
+
+static long long __nexa_file_size64(const char* __path) {
+  if (!__path || !__path[0]) return -1;
+  WIN32_FILE_ATTRIBUTE_DATA __d;
+  if (!GetFileAttributesExA(__path, GetFileExInfoStandard, &__d)) return -1;
+  if (__d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return -1;
+  return (long long)(((unsigned long long)__d.nFileSizeHigh << 32) | (unsigned long long)__d.nFileSizeLow);
+}
 #include <cmath>
 #include <algorithm>
 
@@ -333,6 +360,7 @@ static void __nexa_gfx_sound_reset() {}
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+
 
 struct __nexa_Gfx {
     int w;
@@ -386,10 +414,23 @@ struct __nexa_Gfx {
     unsigned char* fb;
     std::string title;
     std::string drop_path;
+    double wheel_acc_y;
+    double wheel_acc_x;
+    int wheel_y;
+    int wheel_x;
     std::string type_acc;
     std::string type_buf;
     // A DBCS lead byte held over from one WM_CHAR to the next (Win32 only).
     int type_lead;
+
+    // gfx.maxfps: the frame period in nanoseconds -- 0 until a program sets
+    // one, which means the default 60, and -1 once gfx.maxfps(0) uncaps it --
+    // and the monotonic timestamp the next frame is due at. A deadline rather than a
+    // duration, because a frame that took 3 ms of a 20 ms budget has to be
+    // followed by a 17 ms wait, not another 20 -- sleeping a fixed amount every
+    // frame drifts by however long the drawing took.
+    long long fps_period;
+    long long fps_due;
 
     HWND hwnd;
     BITMAPINFO bmi;
@@ -480,6 +521,30 @@ static void __nexa_gfx_type_push_utf8(const char* s, int n) {
 }
 
 
+// --- wheel accumulator ------------------------------------------------------
+// Backends report scrolling in wildly different units (whole notches on X11,
+// 1/120ths on Win32, pixels from a trackpad). Each converts to fractional
+// notches and adds them here; gfx.poll() publishes the whole part and keeps the
+// remainder, so a slow trackpad scroll still eventually reports a notch instead
+// of rounding to nothing every frame.
+//
+// Sign, on every backend: +y is up / away from the user, +x is to the right.
+static void __nexa_gfx_wheel_add(double dx, double dy) {
+    double ax = __nexa_g.wheel_acc_x + dx;
+    double ay = __nexa_g.wheel_acc_y + dy;
+    // Keep a runaway, absurd or non-finite delta away from the int conversion
+    // in __nexa_gfx_input_publish, where it would be undefined behaviour.
+    // x != x is true only for NaN, and needs no <cmath>.
+    if (ax != ax) ax = 0.0;
+    if (ay != ay) ay = 0.0;
+    if (ax > 1e6) ax = 1e6;
+    if (ax < -1e6) ax = -1e6;
+    if (ay > 1e6) ay = 1e6;
+    if (ay < -1e6) ay = -1e6;
+    __nexa_g.wheel_acc_x = ax;
+    __nexa_g.wheel_acc_y = ay;
+}
+
 static int __nexa_gfx_map_mouse(int px, int py, int cw, int ch, int* ox, int* oy) {
     if (cw < 1 || ch < 1 || __nexa_g.w < 1 || __nexa_g.h < 1) return 0;
     if (px < 0 || py < 0 || px >= cw || py >= ch) return 0;
@@ -539,6 +604,10 @@ static void __nexa_gfx_free() {
     __nexa_g.mlb = 0;
     __nexa_g.mmb = 0;
     __nexa_g.mrb = 0;
+    __nexa_g.wheel_acc_x = 0.0;
+    __nexa_g.wheel_acc_y = 0.0;
+    __nexa_g.wheel_x = 0;
+    __nexa_g.wheel_y = 0;
     __nexa_g.type_acc.clear();
     __nexa_g.type_buf.clear();
     __nexa_g.type_lead = 0;
@@ -662,6 +731,8 @@ static LRESULT CALLBACK __nexa_gfx_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             case VK_TAB: k = 6; break;
             case VK_HOME: k = 7; break;
             case VK_END: k = 8; break;
+            case VK_UP: k = 9; break;
+            case VK_DOWN: k = 10; break;
             default: break;
         }
         if (k >= 0) __nexa_ui_key_ev(k);
@@ -707,6 +778,16 @@ static LRESULT CALLBACK __nexa_gfx_wndproc(HWND hwnd, UINT msg, WPARAM wParam, L
             int un = WideCharToMultiByte(CP_UTF8, 0, wide, wn, utf8, (int)sizeof(utf8), nullptr, nullptr);
             if (un > 0) __nexa_gfx_type_push_utf8(utf8, un);
         }
+        return 0;
+    }
+    if (msg == WM_MOUSEWHEEL) {
+        __nexa_gfx_wheel_add(0.0, (double)GET_WHEEL_DELTA_WPARAM(wParam) / (double)WHEEL_DELTA);
+        return 0;
+    }
+    // Windows reports a positive WM_MOUSEHWHEEL delta for a rightward tilt,
+    // which is the sign gfx.wheel_x() promises.
+    if (msg == WM_MOUSEHWHEEL) {
+        __nexa_gfx_wheel_add((double)GET_WHEEL_DELTA_WPARAM(wParam) / (double)WHEEL_DELTA, 0.0);
         return 0;
     }
     if (msg == WM_DROPFILES) {
@@ -793,6 +874,10 @@ static int __nexa_gfx_open(const std::string& title, int w, int h, int scale) {
     if (__nexa_g.text_scale < 1) __nexa_g.text_scale = 1;
     __nexa_g.title = title;
     __nexa_g.drop_path.clear();
+    __nexa_g.wheel_acc_x = 0.0;
+    __nexa_g.wheel_acc_y = 0.0;
+    __nexa_g.wheel_x = 0;
+    __nexa_g.wheel_y = 0;
     __nexa_g.type_acc.clear();
     __nexa_g.type_buf.clear();
     __nexa_g.type_lead = 0;
@@ -950,10 +1035,20 @@ static void __nexa_gfx_close() {
 
 static void __nexa_gfx_input_publish() {
     if (!__nexa_gfx_has_focus()) {
+        __nexa_g.wheel_acc_x = 0.0;
+        __nexa_g.wheel_acc_y = 0.0;
+        __nexa_g.wheel_x = 0;
+        __nexa_g.wheel_y = 0;
         __nexa_g.type_acc.clear();
         __nexa_g.type_buf.clear();
         return;
     }
+    int nx = (int)__nexa_g.wheel_acc_x;   // truncates toward zero
+    int ny = (int)__nexa_g.wheel_acc_y;
+    __nexa_g.wheel_acc_x -= (double)nx;
+    __nexa_g.wheel_acc_y -= (double)ny;
+    __nexa_g.wheel_x = nx;
+    __nexa_g.wheel_y = ny;
     __nexa_g.type_buf.swap(__nexa_g.type_acc);
     __nexa_g.type_acc.clear();
 }
@@ -1650,6 +1745,96 @@ static void __nexa_gfx_line_thick(int x0, int y0, int x1, int y1, int r, int g, 
 
 
 
+// --- frame limiter ----------------------------------------------------------
+// An uncapped loop that draws a few shapes runs at thousands of frames a
+// second: it spends the whole machine on redraws, and because a key that goes
+// down and up between two of those frames was never seen down, input starts
+// going missing. So every window is capped: each frame gets 1/n of a second,
+// 60 unless gfx.maxfps(n) says otherwise, and present() waits out whatever the
+// drawing did not use. gfx.maxfps(0) is the way to ask for no cap at all.
+static long long __nexa_gfx_now_ns() {
+    LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    if (freq.QuadPart <= 0) return 0;
+    // Whole seconds first, then the remainder: the counter ticks fast enough
+    // that scaling it to nanoseconds in one multiply overflows 64 bits within a
+    // day of uptime, and a frame limiter built on a clock that wraps is worse
+    // than no limiter at all.
+    long long secs = (long long)(now.QuadPart / freq.QuadPart);
+    long long rest = (long long)(now.QuadPart % freq.QuadPart);
+    return secs * 1000000000LL + rest * 1000000000LL / (long long)freq.QuadPart;
+}
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+#define NEXA_GFX_DEFAULT_FPS 60
+
+static void __nexa_gfx_maxfps(int fps) {
+    // Not a rejected argument: "no cap" is a thing to ask for. -1 rather than
+    // 0, because 0 is the default cap every program starts with.
+    __nexa_g.fps_period = (fps > 0) ? 1000000000LL / fps : -1;
+    // 0 is "nothing is due yet", so the next present() starts the schedule from
+    // itself rather than from whenever some earlier cap was set.
+    __nexa_g.fps_due = 0;
+}
+
+// Waits until the deadline without burning the CPU. Windows 10 1803 and later
+// have a timer good to well under a millisecond; there it is the whole wait.
+// Before that, Sleep() rounds up to the scheduler tick -- 15.6 ms by default,
+// which would turn a 60 fps cap into 64 ms frames -- so the tick is asked down
+// to 1 ms (process-wide, once) and the last millisecond is spun out, since a
+// limiter that overshoots its frame is worse than one that burns a little.
+static void __nexa_gfx_wait_until(long long due, long long left) {
+    static HANDLE timer = nullptr;
+    static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                       TIMER_ALL_ACCESS);
+        if (!timer) {
+            // winmm's timeBeginPeriod, found at run time: its header is the
+            // audio backend's, which only a program with sound needs.
+            typedef unsigned int (WINAPI *tbp_fn)(unsigned int);
+            HMODULE mm = LoadLibraryA("winmm.dll");
+            tbp_fn tbp = mm ? (tbp_fn)(void*)GetProcAddress(mm, "timeBeginPeriod") : nullptr;
+            if (tbp) tbp(1);
+        }
+    }
+    if (timer) {
+        LARGE_INTEGER rel;
+        rel.QuadPart = -(left / 100);  // relative, in 100 ns units
+        if (SetWaitableTimer(timer, &rel, 0, nullptr, nullptr, FALSE)) {
+            WaitForSingleObject(timer, INFINITE);
+            return;
+        }
+    }
+    long long ms = (left - 1000000LL) / 1000000LL;
+    if (ms > 0) Sleep((DWORD)ms);
+    while (__nexa_gfx_now_ns() < due) {}
+}
+
+static void __nexa_gfx_pace() {
+    long long period = __nexa_g.fps_period;
+    if (period == 0) period = 1000000000LL / NEXA_GFX_DEFAULT_FPS;
+    if (period < 0) return;
+    long long now = __nexa_gfx_now_ns();
+    long long due = __nexa_g.fps_due;
+    // The first frame under a cap, and any frame that overran its budget by a
+    // whole period, start the count again from now. Catching up instead would
+    // fire a burst of frames with no wait at all, which is the stutter the cap
+    // was there to stop.
+    if (due == 0 || now > due + period) due = now;
+    long long left = due - now;
+    if (left > 0) {
+        __nexa_gfx_wait_until(due, left);
+    }
+    __nexa_g.fps_due = due + period;
+}
+
 static void __nexa_gfx_present() {
     if (!__nexa_g.ready || !__nexa_g.fb) return;
     __nexa_ui_before_present();
@@ -1668,10 +1853,21 @@ static void __nexa_gfx_present() {
         }
     }
     __nexa_gfx_poll();
+    __nexa_gfx_pace();
 }
 
 static int __nexa_gfx_has_focus() {
     return (__nexa_g.hwnd && GetForegroundWindow() == __nexa_g.hwnd) ? 1 : 0;
+}
+
+static int __nexa_gfx_wheel() {
+    if (!__nexa_g.ready) return 0;
+    return __nexa_g.wheel_y;
+}
+
+static int __nexa_gfx_wheel_x() {
+    if (!__nexa_g.ready) return 0;
+    return __nexa_g.wheel_x;
 }
 
 // Consuming, like gfx.drop(): the text belongs to whoever asks for it first.
@@ -1782,9 +1978,19 @@ static std::string __nexa_ui_textbox(int x, int y, int w, std::string text, cons
 static int __nexa_ui_dropdown(int x, int y, int w, const std::vector<std::string>& items, int selected);
 static void __nexa_ui_theme_set(const std::string& name);
 static std::string __nexa_ui_theme_get();
+static void __nexa_ui_style_set(const std::string& name);
+static std::string __nexa_ui_style_get();
 static void __nexa_ui_accent_set(int r, int g, int b);
 static void __nexa_ui_rounding_set(int px);
 static void __nexa_ui_font_size_set(int px);
+static int __nexa_ui_tabs(int x, int y, int w, const std::vector<std::string>& labels, int selected);
+static int __nexa_ui_list(int x, int y, int w, int h, const std::vector<std::string>& items, int selected);
+static int __nexa_ui_table(int x, int y, int w, int h, const std::vector<std::string>& headers,
+                           const std::vector<std::vector<std::string>>& rows, int selected);
+static void __nexa_ui_menubar(int x, int y, int w);
+static int __nexa_ui_menu(int x, int y, const std::string& label, const std::vector<std::string>& items);
+static int __nexa_ui_dialog(const std::string& title, const std::string& message, const std::vector<std::string>& buttons);
+static void __nexa_ui_tooltip(const std::string& text);
 
 #include <map>
 #include <cctype>
@@ -2229,6 +2435,7 @@ inline __nexa_json __nexa_json_from(const std::map<std::string, T>& v) {
     return o;
 }
 
+
 [[maybe_unused]] static std::string __nexa_f2s(double __v) { char __b[32]; std::snprintf(__b, sizeof(__b), "%g", __v); return std::string(__b); }
 
 [[maybe_unused]] static std::string __nexa_fmt_pad(const std::string& __sign, const std::string& __body, const char* __fill, char __align, int __width) {
@@ -2276,6 +2483,15 @@ inline __nexa_json __nexa_json_from(const std::map<std::string, T>& v) {
     char __b[512];
     if (__type == 'e') std::snprintf(__b, sizeof(__b), "%.*e", __prec < 0 ? 6 : __prec, __a);
     else if (__prec >= 0 || __type == 'f' || __type == '%') std::snprintf(__b, sizeof(__b), "%.*f", __prec < 0 ? 6 : __prec, __a);
+    else if (__comma) {
+        // {x:,} with no .digits: %g would say 1.23457e+06, leaving nothing to group, so
+        // write it out in full and drop the zeros after the point.
+        std::snprintf(__b, sizeof(__b), "%.6f", __a);
+        std::string __t = __b;
+        while (!__t.empty() && __t.back() == '0') __t.pop_back();
+        if (!__t.empty() && __t.back() == '.') __t.pop_back();
+        std::snprintf(__b, sizeof(__b), "%s", __t.c_str());
+    }
     else std::snprintf(__b, sizeof(__b), "%g", __a);
     std::string __d = __b;
     if (__comma) {
@@ -2303,20 +2519,41 @@ inline __nexa_json __nexa_json_from(const std::map<std::string, T>& v) {
 
 #include "../nexium/native.hpp"
 
-struct Snap {
+#include <type_traits>
+[[maybe_unused]] static std::string __nexa_text(const std::string& __s) { return __s; }
+[[maybe_unused]] static std::string __nexa_text(const char* __s) { return __s ? std::string(__s) : std::string(); }
+[[maybe_unused]] static std::string __nexa_text(char* __s) { return __s ? std::string(__s) : std::string(); }
+[[maybe_unused]] static std::string __nexa_text(char __c) { return std::string(1, __c); }
+[[maybe_unused]] static std::string __nexa_text(bool __b) { return __b ? "true" : "false"; }
+template <class __T>
+static typename std::enable_if<std::is_floating_point<__T>::value, std::string>::type __nexa_text(const __T& __v) {
+    char __b[32];
+    std::snprintf(__b, sizeof(__b), "%g", (double)__v);
+    return __b;
+}
+template <class __T>
+static typename std::enable_if<std::is_enum<__T>::value, std::string>::type __nexa_text(const __T& __v) {
+    return std::to_string((long long)__v);
+}
+template <class __T>
+static typename std::enable_if<std::is_integral<__T>::value, std::string>::type __nexa_text(const __T& __v) {
+    return std::to_string(__v);
+}
+
+struct state__Snap {
     std::vector<std::string> lines;
     int cy;
     int cx;
     int ay;
     int ax;
     int ver;
-    bool operator==(const Snap& __o) const {
+    bool operator==(const state__Snap& __o) const {
         return lines == __o.lines && cy == __o.cy && cx == __o.cx && ay == __o.ay && ax == __o.ax && ver == __o.ver;
     }
-    bool operator!=(const Snap& __o) const { return !(*this == __o); }
+    bool operator!=(const state__Snap& __o) const { return !(*this == __o); }
 };
 
-struct Buf {
+struct state__Buf {
     std::string path;
     std::string name;
     int kind;
@@ -2332,413 +2569,415 @@ struct Buf {
     int ver;
     int saved;
     bool crlf;
-    std::vector<Snap> undo;
-    std::vector<Snap> redo;
+    std::vector<state__Snap> undo;
+    std::vector<state__Snap> redo;
     std::vector<int> hl_st;
     std::vector<std::string> hl_dl;
     int hl_valid;
     long long mtime;
     bool preview;
-    bool operator==(const Buf& __o) const {
+    bool operator==(const state__Buf& __o) const {
         return path == __o.path && name == __o.name && kind == __o.kind && lines == __o.lines && lang == __o.lang && cy == __o.cy && cx == __o.cx && ay == __o.ay && ax == __o.ax && want == __o.want && sy == __o.sy && sx == __o.sx && ver == __o.ver && saved == __o.saved && crlf == __o.crlf && undo == __o.undo && redo == __o.redo && hl_st == __o.hl_st && hl_dl == __o.hl_dl && hl_valid == __o.hl_valid && mtime == __o.mtime && preview == __o.preview;
     }
-    bool operator!=(const Buf& __o) const { return !(*this == __o); }
+    bool operator!=(const state__Buf& __o) const { return !(*this == __o); }
 };
 
-static int px(int);
-static void fill(int, int, int, int, int);
-static void fill_a(int, int, int, int, int, int);
-static void rrect(int, int, int, int, int, int);
-static void rrect_line(int, int, int, int, int, int);
-static void outline(int, int, int, int, int);
-static void hline(int, int, int, int);
-static void vline(int, int, int, int);
-static void line(int, int, int, int, int, int);
-static void circle(int, int, int, int);
-static void disc(int, int, int, int);
-static int txt(int, int, const std::string&, int, int);
-static int txt_v(int, int, int, const std::string&, int, int);
-static int txt_bold(int, int, int, const std::string&, int);
-static int tw(const std::string&, int);
-static std::string fit(const std::string&, int, int);
-static std::string fit_left(const std::string&, int, int);
-static bool inside(int, int, int, int, int, int);
-static bool hovered(int, int, int, int);
-static int clamp(int, int, int);
-static int imin(int, int);
-static int imax(int, int);
-static int keycap(int, int, const std::string&);
-static void metrics_init();
-static void shadow_h(int, int, int, bool);
-static void shadow_v(int, int, int, bool);
-static void draw_glyph(const std::string&, int, int, int, int);
-static int ubyte(const std::string&, int);
-static std::string utf8(int);
-static int cp_len(const std::string&, int);
-static int next_i(const std::string&, int);
-static int prev_i(const std::string&, int);
-static bool is_word_b(int);
-static bool is_word_at(const std::string&, int);
-static bool is_space_b(int);
-static int word_left(const std::string&, int);
-static int word_right(const std::string&, int);
-static int vcol(const std::string&, int);
-static int at_vcol(const std::string&, int);
-static int vlen(const std::string&);
-static std::string leading_ws(const std::string&);
-static bool is_blank(const std::string&);
-static std::vector<std::string> split_lines(const std::string&);
-static std::string strip_ansi(const std::string&);
-static bool lower_eq(const std::string&, const std::string&);
-static int fuzzy(const std::string&, const std::string&);
-static void fld_init();
-static void fld_set(int, std::string);
-static void fld_select_all(int);
-static bool fld_has_sel(int);
-static void fld_del_sel(int);
-static void fld_insert(int, std::string);
-static int fld_key(int, int, int);
-static void fld_char(int, int);
-static int fld_hit(int, int);
-static void fld_click(int, int, bool);
-static void fld_draw(int, int, int, int, int, bool, std::string);
-static bool caret_on();
-static std::string upper_s(const std::string&);
-static void add_words(int, std::string, int);
-static int word_kind(int, const std::string&);
-static void add_members(std::string, std::string);
-static void hl_init();
-static int lang_for(const std::string&);
-static std::string lang_name(int);
-static std::string lang_comment(int);
-static int lang_color(const std::string&);
-static std::string lang_badge(const std::string&);
-static int bracket_color(int);
-static void paint(int, int, int);
-static void paint_comment(std::string, int, int);
-static int word_end(const std::string&, int);
-static int skip_ws(const std::string&, int);
-static int prev_non_ws(const std::string&, int);
-static bool is_digit_b(int);
-static bool is_upper_b(int);
-static std::vector<int> hl_line(int, std::string, int, std::string);
-static int hl_string(int, std::string, int, bool);
-static bool is_hex(char);
-static int hl_number(std::string, int);
-static std::vector<int> hl_code(int, std::string, int, std::string);
-static std::vector<int> hl_json(std::string, int);
-static int fence_lang(const std::string&);
-static std::vector<int> hl_md(std::string, int);
-static void hl_value(std::string, int);
-static std::vector<int> hl_ini(std::string);
-static std::vector<int> hl_shell(std::string);
-static void draw_badge(int, int, int, const std::string&);
-static void doc_store();
-static void doc_load(int);
-static void switch_to(int);
-static int active_kind();
-static bool is_file_tab();
-static bool buf_dirty(int);
-static bool any_dirty();
-static bool same_path(const std::string&, const std::string&);
-static int find_buf(const std::string&);
-static Buf new_buf(std::string, std::string, int);
-static bool open_file(std::string, bool);
-static void after_switch();
-static void new_untitled();
-static int find_name(const std::string&);
-static void open_special(int);
-static std::string text_of_doc();
-static bool save_doc();
-static bool save_doc_as();
-static void save_all();
-static bool close_tab(int);
-static bool close_all();
-static void close_others(int);
-static void check_disk_changes();
-static bool has_sel();
-static void sel_bounds();
-static std::string get_text(int, int, int, int);
-static std::string sel_text();
-static void clamp_cursor();
-static void set_cursor(int, int, bool);
-static void begin_edit(std::string);
-static void end_edit(int);
-static void undo();
-static void redo();
-static void restore_snap(Snap);
-static void delete_range(int, int, int, int);
-static void delete_sel();
-static void insert_text(std::string);
-static void edit_insert(std::string, std::string);
-static void replace_line(int, std::string);
-static Snap snap_now();
-static int code_h();
-static int visible_lines();
-static int max_sy();
-static void clamp_scroll();
-static void reveal(bool);
-static void hit_test(int, int);
-static void hl_ensure(int);
-static std::vector<int> line_colors(int);
-static std::string word_at(int, int);
-static void select_word();
-static void block_lines();
-static void indent_lines(bool);
-static void toggle_comment();
-static void move_lines(int);
-static void copy_lines(int);
-static void delete_lines();
-static void insert_line(bool);
-static void select_line();
-static void trim_trailing();
-static void change_case(bool);
-static char bracket_pair(char);
-static bool is_open_br(char);
-static bool is_close_br(char);
-static void match_brackets();
-static void jump_bracket();
-static std::string next_char();
-static std::string prev_char();
-static std::string closer_for(const std::string&);
-static bool code_lang();
-static void type_char(int);
-static void press_enter();
-static void backspace(bool);
-static void delete_forward(bool);
-static void copy_sel(bool);
-static void paste();
-static void move_v(int, bool);
-static void home(bool, bool);
-static bool ed_key(int, int);
-static void ed_char(int);
-static void ed_mouse_down(int, int, int, int);
-static void ed_drag();
-static void ed_wheel(int, bool);
-static int find_def(const std::vector<std::string>&, const std::string&);
-static void goto_definition(std::string);
-static void collect_symbols();
-static std::string enclosing_symbol();
-static void comp_add(std::string, int);
-static void update_completion(bool);
-static void update_completion_any();
-static void comp_accept();
-static bool comp_key(int, int);
-static int comp_color(int);
-static std::string comp_icon(int);
-static void draw_completion();
-static bool comp_click(int, int);
-static std::string find_key();
-static void find_update();
-static int find_pick(int, int, int);
-static void find_next(int);
-static void select_hit(int);
-static int current_hit();
-static void replace_one();
-static void replace_all();
-static void open_find(bool);
-static void find_layout();
-static void draw_find();
-static bool toggle_box(int, int, const std::string&, bool);
-static bool find_mouse(int, int, int);
-static void find_field_key(int, int);
-static void find_as_you_type();
-static int digits(int);
-static void collect_doc_diags();
-static void draw_squiggle(int, int, int, int);
-static int mm_w();
-static int mm_first();
-static void draw_minimap();
-static void minimap_drag();
-static void draw_editor();
-static void draw_gutter(int, int, int);
-static void draw_scrollbar();
-static void draw_hover_diag();
-static std::string path_join(const std::string&, const std::string&);
-static std::string rel_path(const std::string&);
-static bool skip_dir(const std::string&);
-static std::vector<std::string> list_dir(std::string);
-static void refresh_tree();
-static void tree_walk(std::string, int);
-static void push_rename_row(int);
-static void build_tree();
-static void set_folder(std::string);
-static void open_folder_dialog();
-static void open_file_dialog();
-static void read_git_branch();
-static void index_walk(std::string, int);
-static void ensure_files_index();
-static bool is_text_file(const std::string&);
-static void chevron(int, int, bool, int);
-static int tree_row_y(int);
-static void draw_explorer();
-static bool icon_button(int, int, std::string, std::string);
-static void start_new(std::string, int);
-static void start_rename(std::string);
-static void finish_rename(bool);
-static void delete_path(std::string);
-static void explorer_mouse(int, int, int, int);
-static void tree_key(int, int);
-static void rename_key(int, int);
-static void run_search();
-static void draw_search_view();
-static void search_mouse(int, int, int);
-static void search_key(int, int);
-static void open_quick(std::string);
-static void close_quick();
-static void quick_add(std::string, std::string, int, std::string);
-static void quick_refresh();
-static void quick_accept();
-static void quick_key_press(int, int);
-static void draw_quick();
-static bool quick_mouse(int, int);
-static int sym_color(int);
-static std::string sym_kind_name(int);
-static void draw_outline();
-static void outline_mouse(int, int);
-static void cmd(std::string, std::string, std::string);
-static void cmd_init();
-static int cmd_index(const std::string&);
-static std::string cmd_short_label(const std::string&);
-static std::string cmd_shortcut(const std::string&);
-static void run_cmd(std::string);
-static void show_search();
-static void show_panel_tab(int);
-static void set_font_size(int);
-static std::vector<std::string> menu_items(int);
-static std::string ctx_label(const std::string&);
-static std::string ctx_keys(const std::string&);
-static void run_ctx(std::string);
-static void open_ctx_menu(int, int);
-static int menu_label_x(int);
-static int menu_width(const std::vector<std::string>&);
-static int menu_height(const std::vector<std::string>&);
-static int menu_origin_x();
-static int menu_origin_y();
-static void draw_menu();
-static bool menu_mouse(int, int);
-static std::string find_compiler();
-static void detect_compiler_version();
-static std::string project_dir();
-static std::string entry_file(std::string);
-static void run_task(bool);
-static void stop_task();
-static bool task_running();
-static void log_out(std::string);
-static void flash(std::string);
-static void feed_lines(int, std::string);
-static void poll_processes();
-static void clear_problems_for(std::string);
-static void clear_problems_from(std::string);
-static void add_problem(std::string, int, std::string, bool, std::string);
-static void parse_problems(std::string, std::string);
-static void maybe_check();
-static int problem_counts_err();
-static void ensure_terminal();
-static void term_key(int, int);
-static int mono(int, int, std::string, int, int);
-static int out_color(const std::string&);
-static void panel_tabs_draw(int, int, int);
-static void draw_panel();
-static void draw_problems(int, int, int, int);
-static void draw_lines(int, int, int, int, int);
-static void panel_mouse(int, int, int, int);
-static void panel_wheel(int);
-static std::vector<std::string> provider_ids();
-static std::string provider_label(const std::string&);
-static std::string provider_url(const std::string&);
-static std::string provider_env(const std::string&);
-static std::vector<std::string> provider_models(const std::string&);
-static std::string ag_key();
-static std::string ag_url();
-static std::string ag_model();
-static std::string ag_model_label();
-static std::string join_url(const std::string&, const std::string&);
-static void ag_push(std::string, std::string, std::string, std::string, std::string);
-static void agent_new_chat();
-static bool agent_busy();
-static void agent_stop();
-static void agent_send();
-static std::string agent_system();
-static __nexa_json anthropic_tools();
-static void ag_request();
-static void ag_fail(std::string);
-static void ag_response();
-static void agent_poll();
-static void ag_tool_result(std::string);
-static std::string jstr(const __nexa_json&, const std::string&);
-static int jint(const __nexa_json&, const std::string&, int);
-static std::string resolve_path(const std::string&);
-static std::string file_text(const std::string&);
-static void apply_to_buffer(std::string, std::string);
-static bool write_text(std::string, std::string);
-static std::string tool_read(const __nexa_json&);
-static std::string tool_write(__nexa_json);
-static std::string tool_edit(__nexa_json);
-static std::string tool_list(const __nexa_json&);
-static bool glob_at(const std::string&, int, const std::string&, int);
-static bool glob_match(const std::string&, const std::string&);
-static std::string tool_search(__nexa_json);
-static std::string tool_glob(__nexa_json);
-static std::string tool_delete(__nexa_json);
-static std::string tool_rename(__nexa_json);
-static std::string tool_info();
-static std::string run_tool(std::string, __nexa_json);
-static bool tool_start_command(std::string, __nexa_json);
-static std::vector<std::string> ag_wrap(const std::string&, int, int);
-static std::string md_plain(const std::string&);
-static void ag_layout(int, int);
-static int line_h(int);
-static std::string tool_summary(int);
-static std::string tool_verb(const std::string&);
-static int agent_x();
-static void draw_agent();
-static void draw_agent_messages(int, int, int, int);
-static std::vector<std::string> ag_input_lines(int);
-static int ag_input_h(int);
-static void draw_agent_input(int, int, int, int);
-static void agent_key(int, int);
-static void agent_mouse(int, int, int);
-static void agent_wheel(int);
-static void mono_colored(int, int, std::string, std::vector<int>, int);
-static void txt_inline(int, int, const std::string&);
-static void layout();
-static int para(int, int, int, const std::string&, int, int);
-static void section_title(int, int, int, const std::string&);
-static void tooltip(std::string);
-static void draw_tooltip();
-static void draw_logo(int, int, int, bool);
-static void draw_logo_c(int, int, int, bool, int, int);
-static void draw_toolbar();
-static void toolbar_mouse(int, int);
-static void icon_files(int, int, int);
-static void icon_search(int, int, int);
-static void icon_gear(int, int, int);
-static void gear(int, int, int, int);
-static void draw_activity();
-static void activity_mouse(int, int);
-static void draw_sidebar();
-static int tab_width(int);
-static void draw_tabs();
-static void tabs_mouse(int, int, int, int);
-static void draw_crumbs();
-static int status_item(int, std::string, std::string, bool);
-static void draw_status();
-static void status_mouse(int, int);
-static void shortcut_row(int, int, const std::string&, const std::string&);
-static void draw_watermark();
-static bool link_button(int, int, const std::string&);
-static void clamp_page(int);
-static void draw_welcome();
-static void draw_settings_page();
-static void draw_agent_settings(int, int, int);
-static void key_field_changed();
-static std::string settings_file();
-static void load_settings();
-static void save_settings();
-static void remember_files();
-static void update_title();
-static bool clicked_in(int, int, int, int);
+static int draw__px(int);
+static void draw__fill(int, int, int, int, int);
+static void draw__fill_a(int, int, int, int, int, int);
+static void draw__rrect(int, int, int, int, int, int);
+static void draw__rrect_line(int, int, int, int, int, int);
+static void draw__outline(int, int, int, int, int);
+static void draw__hline(int, int, int, int);
+static void draw__vline(int, int, int, int);
+static void draw__line(int, int, int, int, int, int);
+static void draw__circle(int, int, int, int);
+static void draw__disc(int, int, int, int);
+static int draw__txt(int, int, const std::string&, int, int);
+static int draw__txt_v(int, int, int, const std::string&, int, int);
+static int draw__txt_bold(int, int, int, const std::string&, int);
+static int draw__tw(const std::string&, int);
+static std::string draw__fit(const std::string&, int, int);
+static std::string draw__fit_left(const std::string&, int, int);
+static bool draw__inside(int, int, int, int, int, int);
+static bool draw__hovered(int, int, int, int);
+static int draw__clamp(int, int, int);
+static int draw__imin(int, int);
+static int draw__imax(int, int);
+static int draw__keycap(int, int, const std::string&);
+static void draw__metrics_init();
+static void draw__shadow_h(int, int, int, bool);
+static void draw__shadow_v(int, int, int, bool);
+static void draw__draw_glyph(const std::string&, int, int, int, int);
+static int nxtext__ubyte(const std::string&, int);
+static std::string nxtext__utf8(int);
+static int nxtext__cp_len(const std::string&, int);
+static int nxtext__next_i(const std::string&, int);
+static int nxtext__prev_i(const std::string&, int);
+static bool nxtext__is_word_b(int);
+static bool nxtext__is_word_at(const std::string&, int);
+static bool nxtext__is_space_b(int);
+static int nxtext__word_left(const std::string&, int);
+static int nxtext__word_right(const std::string&, int);
+static int nxtext__vcol(const std::string&, int);
+static int nxtext__at_vcol(const std::string&, int);
+static int nxtext__vlen(const std::string&);
+static std::string nxtext__leading_ws(const std::string&);
+static bool nxtext__is_blank(const std::string&);
+static std::vector<std::string> nxtext__split_lines(const std::string&);
+static std::string nxtext__strip_ansi(const std::string&);
+static bool nxtext__lower_eq(const std::string&, const std::string&);
+static int nxtext__fuzzy(const std::string&, const std::string&);
+static void nxtext__fld_init();
+static void nxtext__fld_set(int, std::string);
+static void nxtext__fld_select_all(int);
+static bool nxtext__fld_has_sel(int);
+static void nxtext__fld_del_sel(int);
+static void nxtext__fld_insert(int, std::string);
+static int nxtext__fld_key(int, int, int);
+static void nxtext__fld_char(int, int);
+static int nxtext__fld_hit(int, int);
+static void nxtext__fld_click(int, int, bool);
+static void nxtext__fld_draw(int, int, int, int, int, bool, std::string);
+static bool nxtext__caret_on();
+static std::string nxtext__upper_s(const std::string&);
+static void highlight__add_words(int, std::string, int);
+static int highlight__word_kind(int, const std::string&);
+static void highlight__add_members(std::string, std::string);
+static void highlight__hl_init();
+static int highlight__lang_for(const std::string&);
+static std::string highlight__lang_name(int);
+static std::string highlight__lang_comment(int);
+static int highlight__lang_color(const std::string&);
+static std::string highlight__lang_badge(const std::string&);
+static int highlight__bracket_color(int);
+static void highlight__paint(int, int, int);
+static void highlight__paint_comment(std::string, int, int);
+static int highlight__word_end(const std::string&, int);
+static int highlight__skip_ws(const std::string&, int);
+static int highlight__prev_non_ws(const std::string&, int);
+static bool highlight__is_digit_b(int);
+static bool highlight__is_upper_b(int);
+static std::vector<int> highlight__hl_line(int, std::string, int, std::string);
+static int highlight__hl_string(int, std::string, int, bool);
+static bool highlight__is_hex(char);
+static int highlight__hl_number(std::string, int);
+static bool highlight__nexa_type_word(const std::string&);
+static std::vector<int> highlight__hl_code(int, std::string, int, std::string);
+static std::vector<int> highlight__hl_json(std::string, int);
+static int highlight__fence_lang(const std::string&);
+static std::vector<int> highlight__hl_md(std::string, int);
+static void highlight__hl_value(std::string, int);
+static std::vector<int> highlight__hl_ini(std::string);
+static std::vector<int> highlight__hl_shell(std::string);
+static void highlight__draw_badge(int, int, int, const std::string&);
+static void buffer__doc_store();
+static void buffer__doc_load(int);
+static void buffer__switch_to(int);
+static int buffer__active_kind();
+static bool buffer__is_file_tab();
+static bool buffer__buf_dirty(int);
+static bool buffer__any_dirty();
+static bool buffer__same_path(const std::string&, const std::string&);
+static int buffer__find_buf(const std::string&);
+static state__Buf buffer__new_buf(std::string, std::string, int);
+static bool buffer__open_file(std::string, bool);
+static void buffer__after_switch();
+static void buffer__new_untitled();
+static int buffer__find_name(const std::string&);
+static void buffer__open_special(int);
+static std::string buffer__text_of_doc();
+static bool buffer__save_doc();
+static bool buffer__save_doc_as();
+static void buffer__save_all();
+static bool buffer__close_tab(int);
+static bool buffer__close_all();
+static void buffer__close_others(int);
+static void buffer__check_disk_changes();
+static bool buffer__has_sel();
+static void buffer__sel_bounds();
+static std::string buffer__get_text(int, int, int, int);
+static std::string buffer__sel_text();
+static void buffer__clamp_cursor();
+static void buffer__set_cursor(int, int, bool);
+static void buffer__begin_edit(std::string);
+static void buffer__end_edit(int);
+static void buffer__undo();
+static void buffer__redo();
+static void buffer__restore_snap(state__Snap);
+static void buffer__delete_range(int, int, int, int);
+static void buffer__delete_sel();
+static void buffer__insert_text(std::string);
+static void buffer__edit_insert(std::string, std::string);
+static void buffer__replace_line(int, std::string);
+static state__Snap buffer__snap_now();
+static int editor__code_h();
+static int editor__visible_lines();
+static int editor__max_sy();
+static void editor__clamp_scroll();
+static void editor__reveal(bool);
+static void editor__hit_test(int, int);
+static void editor__hl_ensure(int);
+static std::vector<int> editor__line_colors(int);
+static std::string editor__word_at(int, int);
+static void editor__select_word();
+static void editor__block_lines();
+static void editor__indent_lines(bool);
+static void editor__toggle_comment();
+static void editor__move_lines(int);
+static void editor__copy_lines(int);
+static void editor__delete_lines();
+static void editor__insert_line(bool);
+static void editor__select_line();
+static void editor__trim_trailing();
+static void editor__change_case(bool);
+static char editor__bracket_pair(char);
+static bool editor__is_open_br(char);
+static bool editor__is_close_br(char);
+static void editor__match_brackets();
+static void editor__jump_bracket();
+static std::string editor__next_char();
+static std::string editor__prev_char();
+static std::string editor__closer_for(const std::string&);
+static bool editor__code_lang();
+static void editor__type_char(int);
+static void editor__press_enter();
+static void editor__backspace(bool);
+static void editor__delete_forward(bool);
+static void editor__copy_sel(bool);
+static void editor__paste();
+static void editor__move_v(int, bool);
+static void editor__home(bool, bool);
+static bool editor__ed_key(int, int);
+static void editor__ed_char(int);
+static void editor__ed_mouse_down(int, int, int, int);
+static void editor__ed_drag();
+static void editor__ed_wheel(int, bool);
+static std::string editor__strip_priv(const std::string&);
+static int editor__find_def(const std::vector<std::string>&, const std::string&);
+static void editor__goto_definition(std::string);
+static void editor__collect_symbols();
+static std::string editor__enclosing_symbol();
+static void editor__comp_add(std::string, int);
+static void editor__update_completion(bool);
+static void editor__update_completion_any();
+static void editor__comp_accept();
+static bool editor__comp_key(int, int);
+static int editor__comp_color(int);
+static std::string editor__comp_icon(int);
+static void editor__draw_completion();
+static bool editor__comp_click(int, int);
+static std::string editor__find_key();
+static void editor__find_update();
+static int editor__find_pick(int, int, int);
+static void editor__find_next(int);
+static void editor__select_hit(int);
+static int editor__current_hit();
+static void editor__replace_one();
+static void editor__replace_all();
+static void editor__open_find(bool);
+static void editor__find_layout();
+static void editor__draw_find();
+static bool editor__toggle_box(int, int, const std::string&, bool);
+static bool editor__find_mouse(int, int, int);
+static void editor__find_field_key(int, int);
+static void editor__find_as_you_type();
+static int editor__digits(int);
+static void editor__collect_doc_diags();
+static void editor__draw_squiggle(int, int, int, int);
+static int editor__mm_w();
+static int editor__mm_first();
+static void editor__draw_minimap();
+static void editor__minimap_drag();
+static void editor__draw_editor();
+static void editor__draw_gutter(int, int, int);
+static void editor__draw_scrollbar();
+static void editor__draw_hover_diag();
+static std::string workspace__path_join(const std::string&, const std::string&);
+static std::string workspace__rel_path(const std::string&);
+static bool workspace__skip_dir(const std::string&);
+static std::vector<std::string> workspace__list_dir(std::string);
+static void workspace__refresh_tree();
+static void workspace__tree_walk(std::string, int);
+static void workspace__push_rename_row(int);
+static void workspace__build_tree();
+static void workspace__set_folder(std::string);
+static void workspace__open_folder_dialog();
+static void workspace__open_file_dialog();
+static void workspace__read_git_branch();
+static void workspace__index_walk(std::string, int);
+static void workspace__ensure_files_index();
+static bool workspace__is_text_file(const std::string&);
+static void workspace__chevron(int, int, bool, int);
+static int workspace__tree_row_y(int);
+static void workspace__draw_explorer();
+static bool workspace__icon_button(int, int, std::string, std::string);
+static void workspace__start_new(std::string, int);
+static void workspace__start_rename(std::string);
+static void workspace__finish_rename(bool);
+static void workspace__delete_path(std::string);
+static void workspace__explorer_mouse(int, int, int, int);
+static void workspace__tree_key(int, int);
+static void workspace__rename_key(int, int);
+static void workspace__run_search();
+static void workspace__draw_search_view();
+static void workspace__search_mouse(int, int, int);
+static void workspace__search_key(int, int);
+static void workspace__open_quick(std::string);
+static void workspace__close_quick();
+static void workspace__quick_add(std::string, std::string, int, std::string);
+static void workspace__quick_refresh();
+static void workspace__quick_accept();
+static void workspace__quick_key_press(int, int);
+static void workspace__draw_quick();
+static bool workspace__quick_mouse(int, int);
+static int workspace__sym_color(int);
+static std::string workspace__sym_kind_name(int);
+static void workspace__draw_outline();
+static void workspace__outline_mouse(int, int);
+static void commands__cmd(std::string, std::string, std::string);
+static void commands__cmd_init();
+static int commands__cmd_index(const std::string&);
+static std::string commands__cmd_short_label(const std::string&);
+static std::string commands__cmd_shortcut(const std::string&);
+static void commands__run_cmd(std::string);
+static void commands__show_search();
+static void commands__show_panel_tab(int);
+static void commands__set_font_size(int);
+static std::vector<std::string> commands__menu_items(int);
+static std::string commands__ctx_label(const std::string&);
+static std::string commands__ctx_keys(const std::string&);
+static void commands__run_ctx(std::string);
+static void commands__open_ctx_menu(int, int);
+static int commands__menu_label_x(int);
+static int commands__menu_width(const std::vector<std::string>&);
+static int commands__menu_height(const std::vector<std::string>&);
+static int commands__menu_origin_x();
+static int commands__menu_origin_y();
+static void commands__draw_menu();
+static bool commands__menu_mouse(int, int);
+static std::string commands__find_compiler();
+static void commands__detect_compiler_version();
+static std::string commands__project_dir();
+static std::string commands__entry_file(std::string);
+static void commands__run_task(bool);
+static void commands__stop_task();
+static bool commands__task_running();
+static void panel__log_out(std::string);
+static void panel__flash(std::string);
+static void panel__feed_lines(int, std::string);
+static void panel__poll_processes();
+static void panel__clear_problems_for(std::string);
+static void panel__clear_problems_from(std::string);
+static void panel__add_problem(std::string, int, std::string, bool, std::string);
+static void panel__parse_problems(std::string, std::string);
+static void panel__maybe_check();
+static int panel__problem_counts_err();
+static void panel__ensure_terminal();
+static void panel__term_key(int, int);
+static int panel__mono(int, int, std::string, int, int);
+static int panel__out_color(const std::string&);
+static void panel__panel_tabs_draw(int, int, int);
+static void panel__draw_panel();
+static void panel__draw_problems(int, int, int, int);
+static void panel__draw_lines(int, int, int, int, int);
+static void panel__panel_mouse(int, int, int, int);
+static void panel__panel_wheel(int);
+static std::vector<std::string> agent__provider_ids();
+static std::string agent__provider_label(const std::string&);
+static std::string agent__provider_url(const std::string&);
+static std::string agent__provider_env(const std::string&);
+static std::vector<std::string> agent__provider_models(const std::string&);
+static std::string agent__ag_key();
+static std::string agent__ag_url();
+static std::string agent__ag_model();
+static std::string agent__ag_model_label();
+static std::string agent__join_url(const std::string&, const std::string&);
+static void agent__ag_push(std::string, std::string, std::string, std::string, std::string);
+static void agent__agent_new_chat();
+static bool agent__agent_busy();
+static void agent__agent_stop();
+static void agent__agent_send();
+static std::string agent__agent_system();
+static __nexa_json agent__anthropic_tools();
+static void agent__ag_request();
+static void agent__ag_fail(std::string);
+static void agent__ag_response();
+static void agent__agent_poll();
+static void agent__ag_tool_result(std::string);
+static std::string agent__jstr(const __nexa_json&, const std::string&);
+static int agent__jint(const __nexa_json&, const std::string&, int);
+static std::string agent__resolve_path(const std::string&);
+static std::string agent__file_text(const std::string&);
+static void agent__apply_to_buffer(std::string, std::string);
+static bool agent__write_text(std::string, std::string);
+static std::string agent__tool_read(const __nexa_json&);
+static std::string agent__tool_write(__nexa_json);
+static std::string agent__tool_edit(__nexa_json);
+static std::string agent__tool_list(const __nexa_json&);
+static bool agent__glob_at(const std::string&, int, const std::string&, int);
+static bool agent__glob_match(const std::string&, const std::string&);
+static std::string agent__tool_search(__nexa_json);
+static std::string agent__tool_glob(__nexa_json);
+static std::string agent__tool_delete(__nexa_json);
+static std::string agent__tool_rename(__nexa_json);
+static std::string agent__tool_info();
+static std::string agent__run_tool(std::string, __nexa_json);
+static bool agent__tool_start_command(std::string, __nexa_json);
+static std::vector<std::string> agent__ag_wrap(const std::string&, int, int);
+static std::string agent__md_plain(const std::string&);
+static void agent__ag_layout(int, int);
+static int agent__line_h(int);
+static std::string agent__tool_summary(int);
+static std::string agent__tool_verb(const std::string&);
+static int agent__agent_x();
+static void agent__draw_agent();
+static void agent__draw_agent_messages(int, int, int, int);
+static std::vector<std::string> agent__ag_input_lines(int);
+static int agent__ag_input_h(int);
+static void agent__draw_agent_input(int, int, int, int);
+static void agent__agent_key(int, int);
+static void agent__agent_mouse(int, int, int);
+static void agent__agent_wheel(int);
+static void agent__mono_colored(int, int, std::string, std::vector<int>, int);
+static void agent__txt_inline(int, int, const std::string&);
+static void chrome__layout();
+static int chrome__para(int, int, int, const std::string&, int, int);
+static void chrome__section_title(int, int, int, const std::string&);
+static void chrome__tooltip(std::string);
+static void chrome__draw_tooltip();
+static void chrome__draw_logo(int, int, int, bool);
+static void chrome__draw_logo_c(int, int, int, bool, int, int);
+static void chrome__draw_toolbar();
+static void chrome__toolbar_mouse(int, int);
+static void chrome__icon_files(int, int, int);
+static void chrome__icon_search(int, int, int);
+static void chrome__icon_gear(int, int, int);
+static void chrome__gear(int, int, int, int);
+static void chrome__draw_activity();
+static void chrome__activity_mouse(int, int);
+static void chrome__draw_sidebar();
+static int chrome__tab_width(int);
+static void chrome__draw_tabs();
+static void chrome__tabs_mouse(int, int, int, int);
+static void chrome__draw_crumbs();
+static int chrome__status_item(int, std::string, std::string, bool);
+static void chrome__draw_status();
+static void chrome__status_mouse(int, int);
+static void chrome__shortcut_row(int, int, const std::string&, const std::string&);
+static void chrome__draw_watermark();
+static bool chrome__link_button(int, int, const std::string&);
+static void chrome__clamp_page(int);
+static void chrome__draw_welcome();
+static void chrome__draw_settings_page();
+static void chrome__draw_agent_settings(int, int, int);
+static void chrome__key_field_changed();
+static std::string app__settings_file();
+static void app__load_settings();
+static void app__save_settings();
+static void app__remember_files();
+static void app__update_title();
+static bool app__clicked_in(int, int, int, int);
 static void collect_events();
 static bool is_ctrl(int);
 static bool global_key(int, int);
@@ -2755,440 +2994,440 @@ static void open_arg(std::string);
 static void test_hook();
 static std::string buf_title_key();
 
-const std::string VERSION = "2.1.0";
-const int C_EDITOR = 0x1F1F1F;
-const int C_CHROME = 0x181818;
-const int C_BORDER = 0x2B2B2B;
-const int C_ACCENT = 0x0078D4;
-const int C_TEXT = 0xCCCCCC;
-const int C_BRIGHT = 0xFFFFFF;
-const int C_MUTED = 0x9D9D9D;
-const int C_DIM = 0x6E7681;
-const int C_HOVER = 0x2A2D2E;
-const int C_ACTIVE = 0x37373D;
-const int C_INPUT = 0x313131;
-const int C_INPUT_BORDER = 0x3C3C3C;
-const int C_WIDGET = 0x202020;
-const int C_SELECTION = 0x264F78;
-const int C_SEL_INACTIVE = 0x3A3D41;
-const int C_LINE = 0x282828;
-const int C_ERROR = 0xF14C4C;
-const int C_WARNING = 0xCCA700;
-const int C_OK = 0x89D185;
-const int C_FIND = 0x623315;
-const int C_FIND_CUR = 0x9E6A03;
-const int S_TEXT = 0xCCCCCC;
-const int S_PLAIN = 0xD4D4D4;
-const int S_KEYWORD = 0x569CD6;
-const int S_CONTROL = 0xC586C0;
-const int S_TYPE = 0x4EC9B0;
-const int S_FUNC = 0xDCDCAA;
-const int S_VAR = 0x9CDCFE;
-const int S_PROP = 0x9CDCFE;
-const int S_ENUM = 0x4FC1FF;
-const int S_STRING = 0xCE9178;
-const int S_ESCAPE = 0xD7BA7D;
-const int S_NUMBER = 0xB5CEA8;
-const int S_COMMENT = 0x6A9955;
-const int S_INVALID = 0xF44747;
-const int S_TODO = 0xFFD700;
-const int S_HEADING = 0x569CD6;
-const int S_LINK = 0x3794FF;
-const int S_BR1 = 0xFFD700;
-const int S_BR2 = 0xDA70D6;
-const int S_BR3 = 0x179FFF;
-const int K_BACK = 8;
-const int K_TAB = 9;
-const int K_ENTER = 13;
-const int K_ESC = 27;
-const int K_SPACE = 32;
-const int K_PGUP = 33;
-const int K_PGDN = 34;
-const int K_END = 35;
-const int K_HOME = 36;
-const int K_LEFT = 37;
-const int K_UP = 38;
-const int K_RIGHT = 39;
-const int K_DOWN = 40;
-const int K_DELETE = 46;
-const int K_F1 = 112;
-const int K_F2 = 113;
-const int K_F3 = 114;
-const int K_F5 = 116;
-const int K_F12 = 123;
-const int K_PLUS = 187;
-const int K_COMMA = 188;
-const int K_MINUS = 189;
-const int K_SLASH = 191;
-const int K_BACKTICK = 192;
-const int K_LBRACKET = 219;
-const int K_BACKSLASH = 220;
-const int K_RBRACKET = 221;
-const int M_CTRL = 1;
-const int M_SHIFT = 2;
-const int M_ALT = 4;
-const int L_PLAIN = 0;
-const int L_NEXA = 1;
-const int L_CPP = 2;
-const int L_JSON = 3;
-const int L_MD = 4;
-const int L_INI = 5;
-const int L_SHELL = 6;
-double SCALE = 1.0;
-int UI = 13;
-int UI_SMALL = 11;
-int FS = 14;
-int CW = 8;
-int LH = 19;
-int TOOLBAR_H = 35;
-int ACT_W = 48;
-int TABS_H = 35;
-int CRUMB_H = 22;
-int STATUS_H = 22;
-int ROW_H = 22;
-int HEADER_H = 35;
-int SCROLL_W = 14;
-std::vector<std::string> glyph_s;
-int glyph_off[128];
-int glyph_w[128];
-int win_w = 1280;
-int win_h = 800;
-int now_ms = 0;
-bool frame_dirty = true;
-int blink_ms = 0;
-bool quit = false;
-std::vector<int> ev_t;
-std::vector<int> ev_a;
-std::vector<int> ev_x;
-std::vector<int> ev_y;
-std::vector<int> ev_m;
-std::vector<int> ev_c;
-int mx = 0;
-int my = 0;
-bool mouse_l = false;
-int hover_cursor = 0;
-bool show_sidebar = true;
-bool show_panel = true;
-int sidebar_w = 260;
-int panel_h = 240;
-int view = 0;
-int drag = 0;
-int drag_off = 0;
-int side_x = 0;
-int side_y = 0;
-int side_h = 0;
-int ed_x = 0;
-int ed_y = 0;
-int ed_w = 0;
-int ed_h = 0;
-int text_x = 0;
-int text_w = 0;
-int gutter_w = 0;
-int panel_y = 0;
-int main_x = 0;
-int main_w = 0;
-const int F_EDITOR = 0;
-const int F_FIND = 1;
-const int F_REPLACE = 2;
-const int F_QUICK = 3;
-const int F_TERM = 4;
-const int F_SEARCH = 5;
-const int F_RENAME = 6;
-const int F_TREE = 7;
-const int F_NONE = 8;
-int focus = 0;
-const int FLD_FIND = 0;
-const int FLD_REPLACE = 1;
-const int FLD_QUICK = 2;
-const int FLD_TERM = 3;
-const int FLD_SEARCH = 4;
-const int FLD_RENAME = 5;
-std::vector<std::string> fld_text;
-std::vector<int> fld_caret;
-std::vector<int> fld_anchor;
-std::vector<int> fld_scroll;
+const std::string state__VERSION = "2.2.0";
+const int state__C_EDITOR = 0x1F1F1F;
+const int state__C_CHROME = 0x181818;
+const int state__C_BORDER = 0x2B2B2B;
+const int state__C_ACCENT = 0x0078D4;
+const int state__C_TEXT = 0xCCCCCC;
+const int state__C_BRIGHT = 0xFFFFFF;
+const int state__C_MUTED = 0x9D9D9D;
+const int state__C_DIM = 0x6E7681;
+const int state__C_HOVER = 0x2A2D2E;
+const int state__C_ACTIVE = 0x37373D;
+const int state__C_INPUT = 0x313131;
+const int state__C_INPUT_BORDER = 0x3C3C3C;
+const int state__C_WIDGET = 0x202020;
+const int state__C_SELECTION = 0x264F78;
+const int state__C_SEL_INACTIVE = 0x3A3D41;
+const int state__C_LINE = 0x282828;
+const int state__C_ERROR = 0xF14C4C;
+const int state__C_WARNING = 0xCCA700;
+const int state__C_OK = 0x89D185;
+const int state__C_FIND = 0x623315;
+const int state__C_FIND_CUR = 0x9E6A03;
+const int state__S_TEXT = 0xCCCCCC;
+const int state__S_PLAIN = 0xD4D4D4;
+const int state__S_KEYWORD = 0x569CD6;
+const int state__S_CONTROL = 0xC586C0;
+const int state__S_TYPE = 0x4EC9B0;
+const int state__S_FUNC = 0xDCDCAA;
+const int state__S_VAR = 0x9CDCFE;
+const int state__S_PROP = 0x9CDCFE;
+const int state__S_ENUM = 0x4FC1FF;
+const int state__S_STRING = 0xCE9178;
+const int state__S_ESCAPE = 0xD7BA7D;
+const int state__S_NUMBER = 0xB5CEA8;
+const int state__S_COMMENT = 0x6A9955;
+const int state__S_INVALID = 0xF44747;
+const int state__S_TODO = 0xFFD700;
+const int state__S_HEADING = 0x569CD6;
+const int state__S_LINK = 0x3794FF;
+const int state__S_BR1 = 0xFFD700;
+const int state__S_BR2 = 0xDA70D6;
+const int state__S_BR3 = 0x179FFF;
+const int state__K_BACK = 8;
+const int state__K_TAB = 9;
+const int state__K_ENTER = 13;
+const int state__K_ESC = 27;
+const int state__K_SPACE = 32;
+const int state__K_PGUP = 33;
+const int state__K_PGDN = 34;
+const int state__K_END = 35;
+const int state__K_HOME = 36;
+const int state__K_LEFT = 37;
+const int state__K_UP = 38;
+const int state__K_RIGHT = 39;
+const int state__K_DOWN = 40;
+const int state__K_DELETE = 46;
+const int state__K_F1 = 112;
+const int state__K_F2 = 113;
+const int state__K_F3 = 114;
+const int state__K_F5 = 116;
+const int state__K_F12 = 123;
+const int state__K_PLUS = 187;
+const int state__K_COMMA = 188;
+const int state__K_MINUS = 189;
+const int state__K_SLASH = 191;
+const int state__K_BACKTICK = 192;
+const int state__K_LBRACKET = 219;
+const int state__K_BACKSLASH = 220;
+const int state__K_RBRACKET = 221;
+const int state__M_CTRL = 1;
+const int state__M_SHIFT = 2;
+const int state__M_ALT = 4;
+const int state__L_PLAIN = 0;
+const int state__L_NEXA = 1;
+const int state__L_CPP = 2;
+const int state__L_JSON = 3;
+const int state__L_MD = 4;
+const int state__L_INI = 5;
+const int state__L_SHELL = 6;
+double state__SCALE = 1.0;
+int state__UI = 13;
+int state__UI_SMALL = 11;
+int state__FS = 14;
+int state__CW = 8;
+int state__LH = 19;
+int state__TOOLBAR_H = 35;
+int state__ACT_W = 48;
+int state__TABS_H = 35;
+int state__CRUMB_H = 22;
+int state__STATUS_H = 22;
+int state__ROW_H = 22;
+int state__HEADER_H = 35;
+int state__SCROLL_W = 14;
+std::vector<std::string> state__glyph_s;
+int state__glyph_off[128];
+int state__glyph_w[128];
+int state__win_w = 1280;
+int state__win_h = 800;
+int state__now_ms = 0;
+bool state__frame_dirty = true;
+int state__blink_ms = 0;
+bool state__quit = false;
+std::vector<int> state__ev_t;
+std::vector<int> state__ev_a;
+std::vector<int> state__ev_x;
+std::vector<int> state__ev_y;
+std::vector<int> state__ev_m;
+std::vector<int> state__ev_c;
+int state__mx = 0;
+int state__my = 0;
+bool state__mouse_l = false;
+int state__hover_cursor = 0;
+bool state__show_sidebar = true;
+bool state__show_panel = true;
+int state__sidebar_w = 260;
+int state__panel_h = 240;
+int state__view = 0;
+int state__drag = 0;
+int state__drag_off = 0;
+int state__side_x = 0;
+int state__side_y = 0;
+int state__side_h = 0;
+int state__ed_x = 0;
+int state__ed_y = 0;
+int state__ed_w = 0;
+int state__ed_h = 0;
+int state__text_x = 0;
+int state__text_w = 0;
+int state__gutter_w = 0;
+int state__panel_y = 0;
+int state__main_x = 0;
+int state__main_w = 0;
+const int state__F_EDITOR = 0;
+const int state__F_FIND = 1;
+const int state__F_REPLACE = 2;
+const int state__F_QUICK = 3;
+const int state__F_TERM = 4;
+const int state__F_SEARCH = 5;
+const int state__F_RENAME = 6;
+const int state__F_TREE = 7;
+const int state__F_NONE = 8;
+int state__focus = 0;
+const int state__FLD_FIND = 0;
+const int state__FLD_REPLACE = 1;
+const int state__FLD_QUICK = 2;
+const int state__FLD_TERM = 3;
+const int state__FLD_SEARCH = 4;
+const int state__FLD_RENAME = 5;
+std::vector<std::string> state__fld_text;
+std::vector<int> state__fld_caret;
+std::vector<int> state__fld_anchor;
+std::vector<int> state__fld_scroll;
 
-std::vector<Buf> bufs;
-int active = -1;
-int ver_seq = 1;
-std::vector<std::string> L;
-int cy = 0;
-int cx = 0;
-int ay = 0;
-int ax = 0;
-int want = -1;
-int sy = 0;
-int sx = 0;
-int doc_ver = 0;
-int doc_saved = 0;
-int doc_lang = 0;
-std::string doc_path = "";
-bool doc_crlf = false;
-std::vector<Snap> U;
-std::vector<Snap> R;
-std::vector<int> hl_st;
-std::vector<std::string> hl_dl;
-int hl_valid = 0;
-int sel_y1 = 0;
-int sel_x1 = 0;
-int sel_y2 = 0;
-int sel_x2 = 0;
-std::string last_edit_kind = "";
-int last_edit_ms = 0;
-int last_edit_y = -1;
-int tab_scroll = 0;
-int tab_drag = -1;
-bool comp_open = false;
-std::vector<std::string> comp_items;
-std::vector<int> comp_kinds;
-int comp_sel = 0;
-std::string comp_prefix = "";
-int comp_top = 0;
-bool find_open = false;
-bool find_replace = false;
-bool find_case = false;
-bool find_word = false;
-std::vector<int> find_hits_y;
-std::vector<int> find_hits_x;
-int find_hits_ver = -1;
-std::string find_hits_key = "";
-int find_cur = -1;
-bool quick_open = false;
-int quick_sel = 0;
-int quick_top = 0;
-std::vector<std::string> quick_items;
-std::vector<std::string> quick_detail;
-std::vector<int> quick_kind;
-std::vector<std::string> quick_key;
-std::string quick_last = "~";
-int menu_open = -1;
-int menu_x = 0;
-int menu_y = 0;
-std::vector<std::string> menu_ids;
-int menu_hover = -1;
-bool ctx_open = false;
-std::string ctx_path = "";
-bool ctx_isdir = false;
-std::string folder = "";
-std::map<std::string, std::vector<std::string>> dir_cache;
-std::map<std::string, bool> expanded;
-std::vector<std::string> tree_rows;
-std::vector<int> tree_depth;
-std::vector<bool> tree_dir;
-int tree_scroll = 0;
-std::string tree_sel = "";
-bool tree_collapsed = false;
-bool open_editors_collapsed = true;
-std::string rename_path = "";
-int rename_mode = 0;
-std::string rename_parent = "";
-std::vector<std::string> files_index;
-int files_index_ms = 0;
-std::string git_branch = "";
-std::vector<std::string> search_files;
-std::vector<int> search_lines;
-std::vector<int> search_cols;
-std::vector<std::string> search_text;
-int search_scroll = 0;
-std::string search_summary = "";
-bool search_case = false;
-std::vector<std::string> recent;
-int panel_tab = 1;
-std::vector<std::string> out_lines;
-std::string out_partial = "";
-int out_scroll = 0;
-bool out_follow = true;
-int task_proc = -1;
-std::string task_label = "";
-int task_start_ms = 0;
-int task_exit = -2;
-std::vector<std::string> term_lines;
-std::string term_partial = "";
-int term_proc = -1;
-int term_scroll = 0;
-bool term_follow = true;
-std::vector<std::string> term_history;
-int term_hist_i = 0;
-std::vector<std::string> prob_file;
-std::vector<int> prob_line;
-std::vector<std::string> prob_msg;
-std::vector<bool> prob_err;
-int prob_scroll = 0;
-int check_proc = -1;
-std::string check_file = "";
-std::string check_out = "";
-int check_due = 0;
-std::string settings_path = "";
-std::string nexac = "";
-std::string run_args = "";
-bool auto_save = false;
-bool show_minimap = true;
-bool show_ws = false;
-int font_size = 14;
-bool win_max = false;
-std::vector<std::string> last_files;
-std::string settings_extra = "";
-std::string nexac_version = "";
-std::map<std::string, int> nx_words;
-std::map<std::string, int> cpp_words;
-std::map<std::string, int> sh_words;
-std::map<std::string, std::vector<std::string>> nx_members;
-std::vector<std::string> nx_methods;
-int hl_out_state = 0;
-std::string hl_out_delim = "";
-std::vector<std::string> cmd_ids;
-std::vector<std::string> cmd_labels;
-std::vector<std::string> cmd_keys;
-bool quit_requested = false;
-int tab_ctx = -1;
-const int HM_NORMAL = 0;
-const int HM_BLOCK = 1;
-const int HM_RAW = 2;
-const int HM_FENCE = 3;
-const std::string STD_MODULES = " io os file dll random math crypto network json gfx gfx3d time thread inline ui ";
-int hit_y = 0;
-int hit_x = 0;
-int word_a = 0;
-int word_b = 0;
-int blk_a = 0;
-int blk_b = 0;
-int br_y = -1;
-int br_x = -1;
-int br_my = -1;
-int br_mx = -1;
-std::string line_clip = "";
-bool drag_line_mode = false;
-bool drag_word = false;
-int drag_anchor_y = 0;
-int drag_anchor_a = 0;
-int drag_anchor_b = 0;
-std::vector<std::string> sym_names;
-std::vector<int> sym_lines;
-std::vector<int> sym_kinds;
-int comp_box_x = 0;
-int comp_box_y = 0;
-int comp_box_w = 0;
-int comp_box_h = 0;
-int fw_x = 0;
-int fw_y = 0;
-int fw_w = 0;
-int fw_h = 0;
-std::vector<int> doc_diag_lines;
-std::vector<bool> doc_diag_err;
-std::vector<std::string> doc_diag_msg;
-int search_top = 0;
-int qk_x = 0;
-int qk_y = 0;
-int qk_w = 0;
-int qk_h = 0;
-int qk_row = 0;
-int qk_list_y = 0;
-const std::string MENU_NAMES = "File Edit Selection View Go Run Terminal Help";
-int menu_x_draw = 0;
-int menu_y_draw = 0;
-std::string flash_msg = "";
-int flash_until = 0;
-std::vector<std::string> prob_src;
-int panel_body_y = 0;
-int panel_body_h = 0;
-std::string tip_text = "";
-int cmd_center_x = 0;
-int cmd_center_w = 0;
-std::vector<int> tab_xs;
-std::vector<int> tab_ws;
-bool tab_follow = true;
-std::vector<int> status_items_x;
-std::vector<int> status_items_w;
-std::vector<std::string> status_items_id;
-std::string set_compiler = "";
-std::string set_args = "";
-bool set_loaded = false;
-int down_x = -1000;
-int down_y = -1000;
-bool up_this_frame = false;
-int up_x = 0;
-int up_y = 0;
-std::string last_title = "";
-bool chord_k = false;
-std::vector<int> HC;
-bool test_mode = false;
-int page_scroll = 0;
-int CODE_FONT = -1;
-int PANEL_FONT = -1;
-int LH_MONO = 18;
-std::string font_family = "Cascadia Mono;Consolas";
-const int C_TITLE = 0x141414;
-const int C_ACTBAR = 0x141414;
-const int C_SIDEBAR = 0x191919;
-const int C_PANEL = 0x191919;
-const int C_STATUS = 0x0E639C;
-const int F_AGENT = 9;
-const int F_KEY = 10;
-const int FLD_AGENT = 6;
-const int FLD_KEY = 7;
-bool show_agent = true;
-int agent_w = 380;
-std::string nexa_lang = "D:/Projects/Nexa-Lang";
-std::string ag_provider = "openai";
-std::string ag_mode = "agent";
-double ag_temp = 0.2;
-std::map<std::string, std::string> ag_keys;
-std::map<std::string, std::string> ag_urls;
-std::map<std::string, std::string> ag_models;
-std::map<std::string, std::string> ag_custom;
-std::vector<std::string> ag_role;
-std::vector<std::string> ag_content;
-std::vector<std::string> ag_tool_id;
-std::vector<std::string> ag_tool_name;
-std::vector<std::string> ag_tool_args;
-std::vector<bool> ag_open;
-std::vector<int> ag_pending;
-int ag_tool_idx = 0;
-int ag_state = 0;
-int ag_http = -1;
-int ag_hops = 0;
-std::string ag_error = "";
-std::string ag_status = "";
-int ag_proc = -1;
-std::string ag_proc_out = "";
-std::string ag_proc_cwd = "";
-int ag_proc_start = 0;
-int ag_proc_timeout = 60000;
-int ag_scroll = 0;
-bool ag_follow = true;
-std::vector<std::string> ag_lines;
-std::vector<int> ag_styles;
-std::vector<std::string> ag_layout_key;
-std::vector<int> ag_layout_h;
-int ag_msg_y = 0;
-int ag_msg_h = 0;
-int ag_in_x = 0;
-int ag_in_y = 0;
-int ag_in_w = 0;
-int ag_in_h = 0;
-std::string set_url = "";
-std::string set_custom = "";
-std::string set_nexa_lang = "";
-std::string set_font = "";
-std::string set_provider = "";
-int outline_scroll = 0;
-int key_x = 0;
-int key_y = 0;
-int key_w = 0;
-int key_h = 0;
+std::vector<state__Buf> state__bufs;
+int state__active = -1;
+int state__ver_seq = 1;
+std::vector<std::string> state__L;
+int state__cy = 0;
+int state__cx = 0;
+int state__ay = 0;
+int state__ax = 0;
+int state__want = -1;
+int state__sy = 0;
+int state__sx = 0;
+int state__doc_ver = 0;
+int state__doc_saved = 0;
+int state__doc_lang = 0;
+std::string state__doc_path = "";
+bool state__doc_crlf = false;
+std::vector<state__Snap> state__U;
+std::vector<state__Snap> state__R;
+std::vector<int> state__hl_st;
+std::vector<std::string> state__hl_dl;
+int state__hl_valid = 0;
+int state__sel_y1 = 0;
+int state__sel_x1 = 0;
+int state__sel_y2 = 0;
+int state__sel_x2 = 0;
+std::string state__last_edit_kind = "";
+int state__last_edit_ms = 0;
+int state__last_edit_y = -1;
+int state__tab_scroll = 0;
+int state__tab_drag = -1;
+bool state__comp_open = false;
+std::vector<std::string> state__comp_items;
+std::vector<int> state__comp_kinds;
+int state__comp_sel = 0;
+std::string state__comp_prefix = "";
+int state__comp_top = 0;
+bool state__find_open = false;
+bool state__find_replace = false;
+bool state__find_case = false;
+bool state__find_word = false;
+std::vector<int> state__find_hits_y;
+std::vector<int> state__find_hits_x;
+int state__find_hits_ver = -1;
+std::string state__find_hits_key = "";
+int state__find_cur = -1;
+bool state__quick_open = false;
+int state__quick_sel = 0;
+int state__quick_top = 0;
+std::vector<std::string> state__quick_items;
+std::vector<std::string> state__quick_detail;
+std::vector<int> state__quick_kind;
+std::vector<std::string> state__quick_key;
+std::string state__quick_last = "~";
+int state__menu_open = -1;
+int state__menu_x = 0;
+int state__menu_y = 0;
+std::vector<std::string> state__menu_ids;
+int state__menu_hover = -1;
+bool state__ctx_open = false;
+std::string state__ctx_path = "";
+bool state__ctx_isdir = false;
+std::string state__folder = "";
+std::map<std::string, std::vector<std::string>> state__dir_cache;
+std::map<std::string, bool> state__expanded;
+std::vector<std::string> state__tree_rows;
+std::vector<int> state__tree_depth;
+std::vector<bool> state__tree_dir;
+int state__tree_scroll = 0;
+std::string state__tree_sel = "";
+bool state__tree_collapsed = false;
+bool state__open_editors_collapsed = true;
+std::string state__rename_path = "";
+int state__rename_mode = 0;
+std::string state__rename_parent = "";
+std::vector<std::string> state__files_index;
+int state__files_index_ms = 0;
+std::string state__git_branch = "";
+std::vector<std::string> state__search_files;
+std::vector<int> state__search_lines;
+std::vector<int> state__search_cols;
+std::vector<std::string> state__search_text;
+int state__search_scroll = 0;
+std::string state__search_summary = "";
+bool state__search_case = false;
+std::vector<std::string> state__recent;
+int state__panel_tab = 1;
+std::vector<std::string> state__out_lines;
+std::string state__out_partial = "";
+int state__out_scroll = 0;
+bool state__out_follow = true;
+int state__task_proc = -1;
+std::string state__task_label = "";
+int state__task_start_ms = 0;
+int state__task_exit = -2;
+std::vector<std::string> state__term_lines;
+std::string state__term_partial = "";
+int state__term_proc = -1;
+int state__term_scroll = 0;
+bool state__term_follow = true;
+std::vector<std::string> state__term_history;
+int state__term_hist_i = 0;
+std::vector<std::string> state__prob_file;
+std::vector<int> state__prob_line;
+std::vector<std::string> state__prob_msg;
+std::vector<bool> state__prob_err;
+int state__prob_scroll = 0;
+int state__check_proc = -1;
+std::string state__check_file = "";
+std::string state__check_out = "";
+int state__check_due = 0;
+std::string state__settings_path = "";
+std::string state__nexac = "";
+std::string state__run_args = "";
+bool state__auto_save = false;
+bool state__show_minimap = true;
+bool state__show_ws = false;
+int state__font_size = 14;
+bool state__win_max = false;
+std::vector<std::string> state__last_files;
+std::string state__settings_extra = "";
+std::string state__nexac_version = "";
+std::map<std::string, int> state__nx_words;
+std::map<std::string, int> state__cpp_words;
+std::map<std::string, int> state__sh_words;
+std::map<std::string, std::vector<std::string>> state__nx_members;
+std::vector<std::string> state__nx_methods;
+int state__hl_out_state = 0;
+std::string state__hl_out_delim = "";
+std::vector<std::string> state__cmd_ids;
+std::vector<std::string> state__cmd_labels;
+std::vector<std::string> state__cmd_keys;
+bool state__quit_requested = false;
+int state__tab_ctx = -1;
+const int state__HM_NORMAL = 0;
+const int state__HM_BLOCK = 1;
+const int state__HM_RAW = 2;
+const int state__HM_FENCE = 3;
+const std::string state__STD_MODULES = " io os file dll random math crypto network json gfx gfx3d time thread term inline ui ";
+int state__hit_y = 0;
+int state__hit_x = 0;
+int state__word_a = 0;
+int state__word_b = 0;
+int state__blk_a = 0;
+int state__blk_b = 0;
+int state__br_y = -1;
+int state__br_x = -1;
+int state__br_my = -1;
+int state__br_mx = -1;
+std::string state__line_clip = "";
+bool state__drag_line_mode = false;
+bool state__drag_word = false;
+int state__drag_anchor_y = 0;
+int state__drag_anchor_a = 0;
+int state__drag_anchor_b = 0;
+std::vector<std::string> state__sym_names;
+std::vector<int> state__sym_lines;
+std::vector<int> state__sym_kinds;
+int state__comp_box_x = 0;
+int state__comp_box_y = 0;
+int state__comp_box_w = 0;
+int state__comp_box_h = 0;
+int state__fw_x = 0;
+int state__fw_y = 0;
+int state__fw_w = 0;
+int state__fw_h = 0;
+std::vector<int> state__doc_diag_lines;
+std::vector<bool> state__doc_diag_err;
+std::vector<std::string> state__doc_diag_msg;
+int state__search_top = 0;
+int state__qk_x = 0;
+int state__qk_y = 0;
+int state__qk_w = 0;
+int state__qk_h = 0;
+int state__qk_row = 0;
+int state__qk_list_y = 0;
+const std::string state__MENU_NAMES = "File Edit Selection View Go Run Terminal Help";
+int state__menu_x_draw = 0;
+int state__menu_y_draw = 0;
+std::string state__flash_msg = "";
+int state__flash_until = 0;
+std::vector<std::string> state__prob_src;
+int state__panel_body_y = 0;
+int state__panel_body_h = 0;
+std::string state__tip_text = "";
+int state__cmd_center_x = 0;
+int state__cmd_center_w = 0;
+std::vector<int> state__tab_xs;
+std::vector<int> state__tab_ws;
+bool state__tab_follow = true;
+std::vector<int> state__status_items_x;
+std::vector<int> state__status_items_w;
+std::vector<std::string> state__status_items_id;
+std::string state__set_compiler = "";
+std::string state__set_args = "";
+bool state__set_loaded = false;
+int state__down_x = -1000;
+int state__down_y = -1000;
+bool state__up_this_frame = false;
+int state__up_x = 0;
+int state__up_y = 0;
+std::string state__last_title = "";
+bool state__chord_k = false;
+std::vector<int> state__HC;
+bool state__test_mode = false;
+int state__page_scroll = 0;
+int state__CODE_FONT = -1;
+int state__PANEL_FONT = -1;
+int state__LH_MONO = 18;
+std::string state__font_family = "Cascadia Mono;Consolas";
+const int state__C_TITLE = 0x141414;
+const int state__C_ACTBAR = 0x141414;
+const int state__C_SIDEBAR = 0x191919;
+const int state__C_PANEL = 0x191919;
+const int state__C_STATUS = 0x0E639C;
+const int state__F_AGENT = 9;
+const int state__F_KEY = 10;
+const int state__FLD_AGENT = 6;
+const int state__FLD_KEY = 7;
+bool state__show_agent = true;
+int state__agent_w = 380;
+std::string state__nexa_lang = "D:/Projects/Nexa-Lang";
+std::string state__ag_provider = "openai";
+std::string state__ag_mode = "agent";
+double state__ag_temp = 0.2;
+std::map<std::string, std::string> state__ag_keys;
+std::map<std::string, std::string> state__ag_urls;
+std::map<std::string, std::string> state__ag_models;
+std::map<std::string, std::string> state__ag_custom;
+std::vector<std::string> state__ag_role;
+std::vector<std::string> state__ag_content;
+std::vector<std::string> state__ag_tool_id;
+std::vector<std::string> state__ag_tool_name;
+std::vector<std::string> state__ag_tool_args;
+std::vector<bool> state__ag_open;
+std::vector<int> state__ag_pending;
+int state__ag_tool_idx = 0;
+int state__ag_state = 0;
+int state__ag_http = -1;
+int state__ag_hops = 0;
+std::string state__ag_error = "";
+std::string state__ag_status = "";
+int state__ag_proc = -1;
+std::string state__ag_proc_out = "";
+std::string state__ag_proc_cwd = "";
+int state__ag_proc_start = 0;
+int state__ag_proc_timeout = 60000;
+int state__ag_scroll = 0;
+bool state__ag_follow = true;
+std::vector<std::string> state__ag_lines;
+std::vector<int> state__ag_styles;
+std::vector<std::string> state__ag_layout_key;
+std::vector<int> state__ag_layout_h;
+int state__ag_msg_y = 0;
+int state__ag_msg_h = 0;
+int state__ag_in_x = 0;
+int state__ag_in_y = 0;
+int state__ag_in_w = 0;
+int state__ag_in_h = 0;
+std::string state__set_url = "";
+std::string state__set_custom = "";
+std::string state__set_nexa_lang = "";
+std::string state__set_font = "";
+std::string state__set_provider = "";
+int state__outline_scroll = 0;
+int state__key_x = 0;
+int state__key_y = 0;
+int state__key_w = 0;
+int state__key_h = 0;
 
-static int px(int v) {
-    return static_cast<int>(((v * SCALE) + 0.5));
+static int draw__px(int v) {
+    return static_cast<int>(((v * ::state__SCALE) + 0.5));
 }
 
-static void fill(int x, int y, int w, int h, int c) {
+static void draw__fill(int x, int y, int w, int h, int c) {
     if (w <= 0 || h <= 0) {
         return;
     }
     __nexa_gfx_fill(x, y, w, h, ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
 }
 
-static void fill_a(int x, int y, int w, int h, int c, int a) {
+static void draw__fill_a(int x, int y, int w, int h, int c, int a) {
     if (w <= 0 || h <= 0) {
         return;
     }
@@ -3197,68 +3436,68 @@ static void fill_a(int x, int y, int w, int h, int c, int a) {
     __nexa_gfx_alpha_set(255);
 }
 
-static void rrect(int x, int y, int w, int h, int r, int c) {
+static void draw__rrect(int x, int y, int w, int h, int r, int c) {
     if (w <= 0 || h <= 0) {
         return;
     }
     __nexa_gfx_fill_round_rect(x, y, w, h, r, ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
 }
 
-static void rrect_line(int x, int y, int w, int h, int r, int c) {
+static void draw__rrect_line(int x, int y, int w, int h, int r, int c) {
     if (w <= 0 || h <= 0) {
         return;
     }
     __nexa_gfx_round_rect(x, y, w, h, r, ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
 }
 
-static void outline(int x, int y, int w, int h, int c) {
+static void draw__outline(int x, int y, int w, int h, int c) {
     __nexa_gfx_rect(x, y, w, h, ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
 }
 
-static void hline(int x, int y, int w, int c) {
-    fill(x, y, w, 1, c);
+static void draw__hline(int x, int y, int w, int c) {
+    ::draw__fill(x, y, w, 1, c);
 }
 
-static void vline(int x, int y, int h, int c) {
-    fill(x, y, 1, h, c);
+static void draw__vline(int x, int y, int h, int c) {
+    ::draw__fill(x, y, 1, h, c);
 }
 
-static void line(int x1, int y1, int x2, int y2, int c, int t) {
-    __nexa_gfx_line_thick(x1, y1, x2, y2, ((c >> 16) & 255), ((c >> 8) & 255), (c & 255), t);
+static void draw__line(int x1, int y1_, int x2, int y2, int c, int t) {
+    __nexa_gfx_line_thick(x1, y1_, x2, y2, ((c >> 16) & 255), ((c >> 8) & 255), (c & 255), t);
 }
 
-static void circle(int x, int y, int r, int c) {
+static void draw__circle(int x, int y, int r, int c) {
     __nexa_gfx_circle(x, y, r, ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
 }
 
-static void disc(int x, int y, int r, int c) {
+static void draw__disc(int x, int y, int r, int c) {
     __nexa_gfx_fill_circle(x, y, r, ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
 }
 
-static int txt(int x, int y, const std::string& s, int c, int size) {
+static int draw__txt(int x, int y, const std::string& s, int c, int size) {
     if ((int)((s).size()) == 0) {
         return 0;
     }
     return __nexa_ui_text(x, y, std::string(s), size, ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
 }
 
-static int txt_v(int x, int y, int h, const std::string& s, int c, int size) {
-    return txt(x, (y + ((h - __nexa_ui_text_height(size)) / 2)), s, c, size);
+static int draw__txt_v(int x, int y, int h, const std::string& s, int c, int size) {
+    return ::draw__txt(x, (y + ((h - __nexa_ui_text_height(size)) / 2)), s, c, size);
 }
 
-static int txt_bold(int x, int y, int h, const std::string& s, int size) {
+static int draw__txt_bold(int x, int y, int h, const std::string& s, int size) {
     return __nexa_ui_heading(x, (y + ((h - __nexa_ui_text_height(size)) / 2)), std::string(s), size);
 }
 
-static int tw(const std::string& s, int size) {
+static int draw__tw(const std::string& s, int size) {
     if ((int)((s).size()) == 0) {
         return 0;
     }
     return __nexa_ui_text_width(std::string(s), size);
 }
 
-static std::string fit(const std::string& s, int w, int size) {
-    if (tw(s, size) <= w) {
+static std::string draw__fit(const std::string& s, int w, int size) {
+    if (::draw__tw(s, size) <= w) {
         return s;
     }
     int n = (int)((s).size());
@@ -3268,15 +3507,15 @@ static std::string fit(const std::string& s, int w, int size) {
             n = n - 1;
         }
         std::string t = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, n) + "\xE2\x80\xA6");
-        if (tw(t, size) <= w) {
+        if (::draw__tw(t, size) <= w) {
             return t;
         }
     }
     return "";
 }
 
-static std::string fit_left(const std::string& s, int w, int size) {
-    if (tw(s, size) <= w) {
+static std::string draw__fit_left(const std::string& s, int w, int size) {
+    if (::draw__tw(s, size) <= w) {
         return s;
     }
     int n = 0;
@@ -3286,22 +3525,22 @@ static std::string fit_left(const std::string& s, int w, int size) {
             n = n + 1;
         }
         std::string t = (std::string("\xE2\x80\xA6") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, n, -1));
-        if (tw(t, size) <= w) {
+        if (::draw__tw(t, size) <= w) {
             return t;
         }
     }
     return "";
 }
 
-static bool inside(int x, int y, int rx, int ry, int rw, int rh) {
+static bool draw__inside(int x, int y, int rx, int ry, int rw, int rh) {
     return (x >= rx && y >= ry && x < (rx + rw) && y < (ry + rh));
 }
 
-static bool hovered(int rx, int ry, int rw, int rh) {
-    return inside(mx, my, rx, ry, rw, rh);
+static bool draw__hovered(int rx, int ry, int rw, int rh) {
+    return ::draw__inside(::state__mx, ::state__my, rx, ry, rw, rh);
 }
 
-static int clamp(int v, int lo, int hi) {
+static int draw__clamp(int v, int lo, int hi) {
     if (v < lo) {
         return lo;
     }
@@ -3311,168 +3550,168 @@ static int clamp(int v, int lo, int hi) {
     return v;
 }
 
-static int imin(int a, int b) {
+static int draw__imin(int a, int b) {
     if (a < b) {
         return a;
     }
     return b;
 }
 
-static int imax(int a, int b) {
+static int draw__imax(int a, int b) {
     if (a > b) {
         return a;
     }
     return b;
 }
 
-static int keycap(int x, int y, const std::string& s) {
-    int w = (tw(s, UI_SMALL) + px(10));
-    int h = px(20);
-    rrect(x, y, w, h, px(3), 0x2F2F2F);
-    hline((x + px(2)), (y + h - 1), (w - px(4)), 0x444444);
-    txt_v((x + px(5)), y, h, s, C_TEXT, UI_SMALL);
+static int draw__keycap(int x, int y, const std::string& s) {
+    int w = (::draw__tw(s, ::state__UI_SMALL) + ::draw__px(10));
+    int h = ::draw__px(20);
+    ::draw__rrect(x, y, w, h, ::draw__px(3), 0x2F2F2F);
+    ::draw__hline((x + ::draw__px(2)), (y + h - 1), (w - ::draw__px(4)), 0x444444);
+    ::draw__txt_v((x + ::draw__px(5)), y, h, s, ::state__C_TEXT, ::state__UI_SMALL);
     return w;
 }
 
-static void metrics_init() {
-    UI = px(13);
-    UI_SMALL = px(11);
-    FS = px(font_size);
-    TOOLBAR_H = px(35);
-    ACT_W = px(48);
-    TABS_H = px(35);
-    CRUMB_H = px(22);
-    STATUS_H = px(22);
-    ROW_H = px(22);
-    HEADER_H = px(35);
-    SCROLL_W = px(14);
+static void draw__metrics_init() {
+    ::state__UI = ::draw__px(13);
+    ::state__UI_SMALL = ::draw__px(11);
+    ::state__FS = ::draw__px(::state__font_size);
+    ::state__TOOLBAR_H = ::draw__px(35);
+    ::state__ACT_W = ::draw__px(48);
+    ::state__TABS_H = ::draw__px(35);
+    ::state__CRUMB_H = ::draw__px(22);
+    ::state__STATUS_H = ::draw__px(22);
+    ::state__ROW_H = ::draw__px(22);
+    ::state__HEADER_H = ::draw__px(35);
+    ::state__SCROLL_W = ::draw__px(14);
     nx_font_free_all();
-    CODE_FONT = nx_font(font_family.c_str(), FS, 0);
-    PANEL_FONT = nx_font(font_family.c_str(), px(13), 0);
-    CW = nx_font_cw(CODE_FONT);
-    if (CW < 4) {
-        CW = 4;
+    ::state__CODE_FONT = nx_font(::state__font_family.c_str(), ::state__FS, 0);
+    ::state__PANEL_FONT = nx_font(::state__font_family.c_str(), ::draw__px(13), 0);
+    ::state__CW = nx_font_cw(::state__CODE_FONT);
+    if (::state__CW < 4) {
+        ::state__CW = 4;
     }
-    LH = imax((nx_font_h(CODE_FONT) + px(3)), (FS * 140 / 100));
-    LH_MONO = (nx_font_h(PANEL_FONT) + px(4));
-    glyph_s.clear();
+    ::state__LH = ::draw__imax((nx_font_h(::state__CODE_FONT) + ::draw__px(3)), (::state__FS * 140 / 100));
+    ::state__LH_MONO = (nx_font_h(::state__PANEL_FONT) + ::draw__px(4));
+    ::state__glyph_s.clear();
     for (int i = 0; i < 128; i++) {
         if (i < 33 || i == 127) {
-            glyph_s.push_back("");
-            glyph_w[i] = 0;
-            glyph_off[i] = 0;
+            ::state__glyph_s.push_back("");
+            ::state__glyph_w[i] = 0;
+            ::state__glyph_off[i] = 0;
         } else {
             std::string ch = " ";
             ch[0] = static_cast<char>(static_cast<char>(i));
-            glyph_s.push_back(ch);
-            int w = __nexa_ui_text_width(std::string(ch), FS);
-            glyph_w[i] = w;
-            glyph_off[i] = ((CW - w) / 2);
+            ::state__glyph_s.push_back(ch);
+            int w = __nexa_ui_text_width(std::string(ch), ::state__FS);
+            ::state__glyph_w[i] = w;
+            ::state__glyph_off[i] = ((::state__CW - w) / 2);
         }
     }
 }
 
-static void shadow_h(int x, int y, int w, bool down) {
+static void draw__shadow_h(int x, int y, int w, bool down) {
     std::vector<int> alphas = std::vector<int>{60, 38, 22, 11, 4};
     for (int k = 0; k < 5; k++) {
         int yy = ((down) ? ((y + k)) : ((y - 1 - k)));
-        fill_a(x, yy, w, 1, 0x000000, alphas[k]);
+        ::draw__fill_a(x, yy, w, 1, 0x000000, alphas[k]);
     }
 }
 
-static void shadow_v(int x, int y, int h, bool right) {
+static void draw__shadow_v(int x, int y, int h, bool right) {
     std::vector<int> alphas = std::vector<int>{4, 11, 22, 38, 60};
     for (int k = 0; k < 5; k++) {
         int xx = ((right) ? ((x + 5 - k)) : ((x + k + 1)));
-        fill_a(xx, y, 1, h, 0x000000, alphas[k]);
+        ::draw__fill_a(xx, y, 1, h, 0x000000, alphas[k]);
     }
 }
 
-static void draw_glyph(const std::string& kind, int x, int y, int s, int c) {
+static void draw__draw_glyph(const std::string& kind, int x, int y, int s, int c) {
     int m = (x + (s / 2));
     int n = (y + (s / 2));
-    int u = imax(1, (s / 20));
+    int u = ::draw__imax(1, (s / 20));
     if (kind == "close") {
-        line((m - px(4)), (n - px(4)), (m + px(4)), (n + px(4)), c, 1);
-        line((m + px(4)), (n - px(4)), (m - px(4)), (n + px(4)), c, 1);
+        ::draw__line((m - ::draw__px(4)), (n - ::draw__px(4)), (m + ::draw__px(4)), (n + ::draw__px(4)), c, 1);
+        ::draw__line((m + ::draw__px(4)), (n - ::draw__px(4)), (m - ::draw__px(4)), (n + ::draw__px(4)), c, 1);
     } else if (kind == "stop") {
-        fill((m - px(4)), (n - px(4)), px(8), px(8), c);
+        ::draw__fill((m - ::draw__px(4)), (n - ::draw__px(4)), ::draw__px(8), ::draw__px(8), c);
     } else if (kind == "plus") {
-        fill((m - px(5)), n, px(11), 1, c);
-        fill(m, (n - px(5)), 1, px(11), c);
+        ::draw__fill((m - ::draw__px(5)), n, ::draw__px(11), 1, c);
+        ::draw__fill(m, (n - ::draw__px(5)), 1, ::draw__px(11), c);
     } else if (kind == "copy") {
-        outline((m - px(5)), (n - px(2)), px(8), px(8), c);
-        outline((m - px(2)), (n - px(5)), px(8), px(8), c);
+        ::draw__outline((m - ::draw__px(5)), (n - ::draw__px(2)), ::draw__px(8), ::draw__px(8), c);
+        ::draw__outline((m - ::draw__px(2)), (n - ::draw__px(5)), ::draw__px(8), ::draw__px(8), c);
     } else if (kind == "clear") {
-        fill((m - px(6)), (n - px(4)), px(8), 1, c);
-        fill((m - px(6)), n, px(8), 1, c);
-        fill((m - px(6)), (n + px(4)), px(5), 1, c);
-        line((m + px(2)), (n + px(1)), (m + px(6)), (n + px(5)), c, 1);
-        line((m + px(6)), (n + px(1)), (m + px(2)), (n + px(5)), c, 1);
+        ::draw__fill((m - ::draw__px(6)), (n - ::draw__px(4)), ::draw__px(8), 1, c);
+        ::draw__fill((m - ::draw__px(6)), n, ::draw__px(8), 1, c);
+        ::draw__fill((m - ::draw__px(6)), (n + ::draw__px(4)), ::draw__px(5), 1, c);
+        ::draw__line((m + ::draw__px(2)), (n + ::draw__px(1)), (m + ::draw__px(6)), (n + ::draw__px(5)), c, 1);
+        ::draw__line((m + ::draw__px(6)), (n + ::draw__px(1)), (m + ::draw__px(2)), (n + ::draw__px(5)), c, 1);
     } else if (kind == "newfile") {
-        outline((m - px(5)), (n - px(6)), px(9), px(12), c);
-        fill((m + px(1)), (n + px(1)), px(7), 1, c);
-        fill((m + px(4)), (n - px(2)), 1, px(7), c);
+        ::draw__outline((m - ::draw__px(5)), (n - ::draw__px(6)), ::draw__px(9), ::draw__px(12), c);
+        ::draw__fill((m + ::draw__px(1)), (n + ::draw__px(1)), ::draw__px(7), 1, c);
+        ::draw__fill((m + ::draw__px(4)), (n - ::draw__px(2)), 1, ::draw__px(7), c);
     } else if (kind == "newfolder") {
-        outline((m - px(7)), (n - px(4)), px(12), px(9), c);
-        fill((m - px(7)), (n - px(6)), px(5), px(2), c);
-        fill((m + px(1)), (n + px(3)), px(7), 1, c);
-        fill((m + px(4)), n, 1, px(7), c);
+        ::draw__outline((m - ::draw__px(7)), (n - ::draw__px(4)), ::draw__px(12), ::draw__px(9), c);
+        ::draw__fill((m - ::draw__px(7)), (n - ::draw__px(6)), ::draw__px(5), ::draw__px(2), c);
+        ::draw__fill((m + ::draw__px(1)), (n + ::draw__px(3)), ::draw__px(7), 1, c);
+        ::draw__fill((m + ::draw__px(4)), n, 1, ::draw__px(7), c);
     } else if (kind == "refresh") {
-        circle(m, n, px(5), c);
-        fill((m + px(2)), (n - px(6)), px(4), px(4), C_SIDEBAR);
-        __nexa_gfx_fill_tri((m + px(1)), (n - px(7)), (m + px(6)), (n - px(5)), (m + px(2)), (n - px(1)), ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
+        ::draw__circle(m, n, ::draw__px(5), c);
+        ::draw__fill((m + ::draw__px(2)), (n - ::draw__px(6)), ::draw__px(4), ::draw__px(4), ::state__C_SIDEBAR);
+        __nexa_gfx_fill_tri((m + ::draw__px(1)), (n - ::draw__px(7)), (m + ::draw__px(6)), (n - ::draw__px(5)), (m + ::draw__px(2)), (n - ::draw__px(1)), ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
     } else if (kind == "collapse") {
-        outline((m - px(6)), (n - px(6)), px(10), px(10), c);
-        fill((m - px(4)), (n - px(1)), px(6), 1, c);
-        fill((m - px(3)), (n + px(6)), px(10), 1, c);
-        fill((m + px(6)), (n - px(3)), 1, px(10), c);
+        ::draw__outline((m - ::draw__px(6)), (n - ::draw__px(6)), ::draw__px(10), ::draw__px(10), c);
+        ::draw__fill((m - ::draw__px(4)), (n - ::draw__px(1)), ::draw__px(6), 1, c);
+        ::draw__fill((m - ::draw__px(3)), (n + ::draw__px(6)), ::draw__px(10), 1, c);
+        ::draw__fill((m + ::draw__px(6)), (n - ::draw__px(3)), 1, ::draw__px(10), c);
     } else if (kind == "up") {
-        fill(m, (n - px(5)), 1, px(11), c);
-        line((m - px(4)), (n - px(1)), m, (n - px(5)), c, 1);
-        line((m + px(4)), (n - px(1)), m, (n - px(5)), c, 1);
+        ::draw__fill(m, (n - ::draw__px(5)), 1, ::draw__px(11), c);
+        ::draw__line((m - ::draw__px(4)), (n - ::draw__px(1)), m, (n - ::draw__px(5)), c, 1);
+        ::draw__line((m + ::draw__px(4)), (n - ::draw__px(1)), m, (n - ::draw__px(5)), c, 1);
     } else if (kind == "down") {
-        fill(m, (n - px(5)), 1, px(11), c);
-        line((m - px(4)), (n + px(1)), m, (n + px(5)), c, 1);
-        line((m + px(4)), (n + px(1)), m, (n + px(5)), c, 1);
+        ::draw__fill(m, (n - ::draw__px(5)), 1, ::draw__px(11), c);
+        ::draw__line((m - ::draw__px(4)), (n + ::draw__px(1)), m, (n + ::draw__px(5)), c, 1);
+        ::draw__line((m + ::draw__px(4)), (n + ::draw__px(1)), m, (n + ::draw__px(5)), c, 1);
     } else if (kind == "chevdown") {
-        line((m - px(4)), (n - px(2)), m, (n + px(2)), c, 1);
-        line(m, (n + px(2)), (m + px(4)), (n - px(2)), c, 1);
+        ::draw__line((m - ::draw__px(4)), (n - ::draw__px(2)), m, (n + ::draw__px(2)), c, 1);
+        ::draw__line(m, (n + ::draw__px(2)), (m + ::draw__px(4)), (n - ::draw__px(2)), c, 1);
     } else if (kind == "chevright") {
-        line((m - px(2)), (n - px(4)), (m + px(2)), n, c, 1);
-        line((m + px(2)), n, (m - px(2)), (n + px(4)), c, 1);
+        ::draw__line((m - ::draw__px(2)), (n - ::draw__px(4)), (m + ::draw__px(2)), n, c, 1);
+        ::draw__line((m + ::draw__px(2)), n, (m - ::draw__px(2)), (n + ::draw__px(4)), c, 1);
     } else if (kind == "symbol") {
-        __nexa_gfx_fill_tri((m - px(5)), (n - px(2)), m, (n - px(5)), (m + px(5)), (n - px(2)), ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
-        __nexa_gfx_fill_tri((m - px(5)), (n - px(2)), (m + px(5)), (n - px(2)), m, (n + px(1)), ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
-        outline((m - px(5)), (n - px(2)), px(11), px(8), c);
-        fill(m, (n + px(1)), 1, px(5), c);
+        __nexa_gfx_fill_tri((m - ::draw__px(5)), (n - ::draw__px(2)), m, (n - ::draw__px(5)), (m + ::draw__px(5)), (n - ::draw__px(2)), ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
+        __nexa_gfx_fill_tri((m - ::draw__px(5)), (n - ::draw__px(2)), (m + ::draw__px(5)), (n - ::draw__px(2)), m, (n + ::draw__px(1)), ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
+        ::draw__outline((m - ::draw__px(5)), (n - ::draw__px(2)), ::draw__px(11), ::draw__px(8), c);
+        ::draw__fill(m, (n + ::draw__px(1)), 1, ::draw__px(5), c);
     } else if (kind == "gear") {
-        gear(m, n, px(7), c);
+        ::chrome__gear(m, n, ::draw__px(7), c);
     } else if (kind == "outline") {
         for (int k = 0; k < 3; k++) {
-            fill((m - px(6)), (n - px(5) + (k * px(5))), px(2), px(2), c);
-            fill((m - px(2)), (n - px(5) + (k * px(5))), px(8), 1, c);
+            ::draw__fill((m - ::draw__px(6)), (n - ::draw__px(5) + (k * ::draw__px(5))), ::draw__px(2), ::draw__px(2), c);
+            ::draw__fill((m - ::draw__px(2)), (n - ::draw__px(5) + (k * ::draw__px(5))), ::draw__px(8), 1, c);
         }
     } else if (kind == "agent") {
-        rrect_line((m - px(7)), (n - px(6)), px(14), px(10), px(3), c);
-        __nexa_gfx_fill_tri((m - px(3)), (n + px(4)), (m + px(1)), (n + px(4)), (m - px(4)), (n + px(8)), ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
-        fill((m - px(3)), (n - px(2)), px(2), px(2), c);
-        fill((m + px(2)), (n - px(2)), px(2), px(2), c);
+        ::draw__rrect_line((m - ::draw__px(7)), (n - ::draw__px(6)), ::draw__px(14), ::draw__px(10), ::draw__px(3), c);
+        __nexa_gfx_fill_tri((m - ::draw__px(3)), (n + ::draw__px(4)), (m + ::draw__px(1)), (n + ::draw__px(4)), (m - ::draw__px(4)), (n + ::draw__px(8)), ((c >> 16) & 255), ((c >> 8) & 255), (c & 255));
+        ::draw__fill((m - ::draw__px(3)), (n - ::draw__px(2)), ::draw__px(2), ::draw__px(2), c);
+        ::draw__fill((m + ::draw__px(2)), (n - ::draw__px(2)), ::draw__px(2), ::draw__px(2), c);
     } else if (kind == "file") {
-        outline((m - px(4)), (n - px(6)), px(9), px(12), c);
-        fill((m - px(2)), (n - px(2)), px(5), 1, c);
-        fill((m - px(2)), (n + px(1)), px(5), 1, c);
+        ::draw__outline((m - ::draw__px(4)), (n - ::draw__px(6)), ::draw__px(9), ::draw__px(12), c);
+        ::draw__fill((m - ::draw__px(2)), (n - ::draw__px(2)), ::draw__px(5), 1, c);
+        ::draw__fill((m - ::draw__px(2)), (n + ::draw__px(1)), ::draw__px(5), 1, c);
     }
     if (u > 99) {
-        fill(x, y, u, u, c);
+        ::draw__fill(x, y, u, u, c);
     }
 }
 
-static int ubyte(const std::string& s, int i) {
+static int nxtext__ubyte(const std::string& s, int i) {
     return static_cast<int>(static_cast<unsigned char>(s[i]));
 }
 
-static std::string utf8(int cp) {
+static std::string nxtext__utf8(int cp) {
     if (cp < 0x80) {
         std::string s = " ";
         s[0] = static_cast<char>(static_cast<char>(cp));
@@ -3499,8 +3738,8 @@ static std::string utf8(int cp) {
     return s;
 }
 
-static int cp_len(const std::string& s, int i) {
-    int b = ubyte(s, i);
+static int nxtext__cp_len(const std::string& s, int i) {
+    int b = ::nxtext__ubyte(s, i);
     if (b < 0x80) {
         return 1;
     }
@@ -3516,95 +3755,95 @@ static int cp_len(const std::string& s, int i) {
     return 1;
 }
 
-static int next_i(const std::string& s, int i) {
+static int nxtext__next_i(const std::string& s, int i) {
     if (i >= (int)((s).size())) {
         return (int)((s).size());
     }
-    int n = (i + cp_len(s, i));
+    int n = (i + ::nxtext__cp_len(s, i));
     if (n > (int)((s).size())) {
         return (int)((s).size());
     }
     return n;
 }
 
-static int prev_i(const std::string& s, int i) {
+static int nxtext__prev_i(const std::string& s, int i) {
     if (i <= 0) {
         return 0;
     }
     int j = (i - 1);
-    while (j > 0 && (ubyte(s, j) & 0xC0) == 0x80) {
+    while (j > 0 && (::nxtext__ubyte(s, j) & 0xC0) == 0x80) {
         j = j - 1;
     }
     return j;
 }
 
-static bool is_word_b(int b) {
+static bool nxtext__is_word_b(int b) {
     return ((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b >= 0x80);
 }
 
-static bool is_word_at(const std::string& s, int i) {
+static bool nxtext__is_word_at(const std::string& s, int i) {
     if (i < 0 || i >= (int)((s).size())) {
         return false;
     }
-    return is_word_b(ubyte(s, i));
+    return ::nxtext__is_word_b(::nxtext__ubyte(s, i));
 }
 
-static bool is_space_b(int b) {
+static bool nxtext__is_space_b(int b) {
     return (b == 32 || b == 9);
 }
 
-static int word_left(const std::string& s, int i) {
+static int nxtext__word_left(const std::string& s, int i) {
     int j = i;
-    while (j > 0 && is_space_b(ubyte(s, (j - 1)))) {
+    while (j > 0 && ::nxtext__is_space_b(::nxtext__ubyte(s, (j - 1)))) {
         j = j - 1;
     }
-    if (j > 0 && is_word_b(ubyte(s, (j - 1)))) {
-        while (j > 0 && is_word_b(ubyte(s, (j - 1)))) {
+    if (j > 0 && ::nxtext__is_word_b(::nxtext__ubyte(s, (j - 1)))) {
+        while (j > 0 && ::nxtext__is_word_b(::nxtext__ubyte(s, (j - 1)))) {
             j = j - 1;
         }
     } else {
-        while (j > 0 && !(is_word_b(ubyte(s, (j - 1)))) && !(is_space_b(ubyte(s, (j - 1))))) {
+        while (j > 0 && !(::nxtext__is_word_b(::nxtext__ubyte(s, (j - 1)))) && !(::nxtext__is_space_b(::nxtext__ubyte(s, (j - 1))))) {
             j = j - 1;
         }
     }
     return j;
 }
 
-static int word_right(const std::string& s, int i) {
+static int nxtext__word_right(const std::string& s, int i) {
     int n = (int)((s).size());
     int j = i;
-    while (j < n && is_space_b(ubyte(s, j))) {
+    while (j < n && ::nxtext__is_space_b(::nxtext__ubyte(s, j))) {
         j = j + 1;
     }
-    if (j < n && is_word_b(ubyte(s, j))) {
-        while (j < n && is_word_b(ubyte(s, j))) {
+    if (j < n && ::nxtext__is_word_b(::nxtext__ubyte(s, j))) {
+        while (j < n && ::nxtext__is_word_b(::nxtext__ubyte(s, j))) {
             j = j + 1;
         }
     } else {
-        while (j < n && !(is_word_b(ubyte(s, j))) && !(is_space_b(ubyte(s, j)))) {
+        while (j < n && !(::nxtext__is_word_b(::nxtext__ubyte(s, j))) && !(::nxtext__is_space_b(::nxtext__ubyte(s, j)))) {
             j = j + 1;
         }
     }
     return j;
 }
 
-static int vcol(const std::string& s, int i) {
+static int nxtext__vcol(const std::string& s, int i) {
     int v = 0;
     int j = 0;
-    int n = imin(i, (int)((s).size()));
+    int n = ::draw__imin(i, (int)((s).size()));
     while (j < n) {
         if (s[j] == '\t') {
             v = (((v / 4) + 1) * 4);
             j = j + 1;
         } else {
             v = v + 1;
-            j = next_i(s, j);
+            j = ::nxtext__next_i(s, j);
         }
     }
     return v;
 }
 
-static int at_vcol(const std::string& s, int v) {
+static int nxtext__at_vcol(const std::string& s, int v) {
     int c = 0;
     int j = 0;
     int n = (int)((s).size());
@@ -3615,38 +3854,38 @@ static int at_vcol(const std::string& s, int v) {
         }
         if (nc > v) {
             if ((v - c) > (nc - v)) {
-                return next_i(s, j);
+                return ::nxtext__next_i(s, j);
             }
             return j;
         }
         c = nc;
-        j = next_i(s, j);
+        j = ::nxtext__next_i(s, j);
     }
     return n;
 }
 
-static int vlen(const std::string& s) {
-    return vcol(s, (int)((s).size()));
+static int nxtext__vlen(const std::string& s) {
+    return ::nxtext__vcol(s, (int)((s).size()));
 }
 
-static std::string leading_ws(const std::string& s) {
+static std::string nxtext__leading_ws(const std::string& s) {
     int j = 0;
-    while (j < (int)((s).size()) && is_space_b(ubyte(s, j))) {
+    while (j < (int)((s).size()) && ::nxtext__is_space_b(::nxtext__ubyte(s, j))) {
         j = j + 1;
     }
     return ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, j);
 }
 
-static bool is_blank(const std::string& s) {
+static bool nxtext__is_blank(const std::string& s) {
     return ((int)((([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(s)).size()) == 0);
 }
 
-static std::vector<std::string> split_lines(const std::string& t) {
+static std::vector<std::string> nxtext__split_lines(const std::string& t) {
     std::string s = ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(t, "\r\n", "\n"), "\r", "\n");
     return ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(s, "\n");
 }
 
-static std::string strip_ansi(const std::string& s) {
+static std::string nxtext__strip_ansi(const std::string& s) {
     if (!(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(s, "\x1B"))) {
         return s;
     }
@@ -3678,11 +3917,11 @@ static std::string strip_ansi(const std::string& s) {
     return out;
 }
 
-static bool lower_eq(const std::string& a, const std::string& b) {
+static bool nxtext__lower_eq(const std::string& a, const std::string& b) {
     return (([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(a) == ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(b));
 }
 
-static int fuzzy(const std::string& s, const std::string& pat) {
+static int nxtext__fuzzy(const std::string& s, const std::string& pat) {
     if ((int)((pat).size()) == 0) {
         return 1;
     }
@@ -3697,11 +3936,11 @@ static int fuzzy(const std::string& s, const std::string& pat) {
             if (prev == (i - 1)) {
                 score = score + 15;
             }
-            if (i == 0 || !(is_word_b(ubyte(s, (i - 1)))) || (s[i] >= 'A' && s[i] <= 'Z')) {
+            if (i == 0 || !(::nxtext__is_word_b(::nxtext__ubyte(s, (i - 1)))) || (s[i] >= 'A' && s[i] <= 'Z')) {
                 score = score + 12;
             }
             if (j == 0) {
-                score = score - imin(i, 20);
+                score = score - ::draw__imin(i, 20);
             }
             prev = i;
             j = j + 1;
@@ -3713,147 +3952,147 @@ static int fuzzy(const std::string& s, const std::string& pat) {
     return (score - ((int)((s).size()) / 4));
 }
 
-static void fld_init() {
+static void nxtext__fld_init() {
     for (int i = 0; i < 8; i++) {
-        fld_text.push_back("");
-        fld_caret.push_back(0);
-        fld_anchor.push_back(0);
-        fld_scroll.push_back(0);
+        ::state__fld_text.push_back("");
+        ::state__fld_caret.push_back(0);
+        ::state__fld_anchor.push_back(0);
+        ::state__fld_scroll.push_back(0);
     }
 }
 
-static void fld_set(int id, std::string s) {
-    fld_text[id] = s;
-    fld_caret[id] = (int)((s).size());
-    fld_anchor[id] = (int)((s).size());
-    fld_scroll[id] = 0;
+static void nxtext__fld_set(int id, std::string s) {
+    ::state__fld_text[id] = s;
+    ::state__fld_caret[id] = (int)((s).size());
+    ::state__fld_anchor[id] = (int)((s).size());
+    ::state__fld_scroll[id] = 0;
 }
 
-static void fld_select_all(int id) {
-    fld_anchor[id] = 0;
-    fld_caret[id] = (int)((fld_text[id]).size());
+static void nxtext__fld_select_all(int id) {
+    ::state__fld_anchor[id] = 0;
+    ::state__fld_caret[id] = (int)((::state__fld_text[id]).size());
 }
 
-static bool fld_has_sel(int id) {
-    return (fld_anchor[id] != fld_caret[id]);
+static bool nxtext__fld_has_sel(int id) {
+    return (::state__fld_anchor[id] != ::state__fld_caret[id]);
 }
 
-static void fld_del_sel(int id) {
-    int a = imin(fld_anchor[id], fld_caret[id]);
-    int b = imax(fld_anchor[id], fld_caret[id]);
-    std::string t = fld_text[id];
-    fld_text[id] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, a) + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, b, -1));
-    fld_caret[id] = a;
-    fld_anchor[id] = a;
+static void nxtext__fld_del_sel(int id) {
+    int a = ::draw__imin(::state__fld_anchor[id], ::state__fld_caret[id]);
+    int b = ::draw__imax(::state__fld_anchor[id], ::state__fld_caret[id]);
+    std::string t = ::state__fld_text[id];
+    ::state__fld_text[id] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, a) + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, b, -1));
+    ::state__fld_caret[id] = a;
+    ::state__fld_anchor[id] = a;
 }
 
-static void fld_insert(int id, std::string s) {
+static void nxtext__fld_insert(int id, std::string s) {
     std::string clean = ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(s, "\r", ""), "\n", " "), "\t", " ");
-    if (fld_has_sel(id)) {
-        fld_del_sel(id);
+    if (::nxtext__fld_has_sel(id)) {
+        ::nxtext__fld_del_sel(id);
     }
-    std::string t = fld_text[id];
-    int c = fld_caret[id];
-    fld_text[id] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, c) + clean + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, c, -1));
-    fld_caret[id] = (c + (int)((clean).size()));
-    fld_anchor[id] = fld_caret[id];
+    std::string t = ::state__fld_text[id];
+    int c = ::state__fld_caret[id];
+    ::state__fld_text[id] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, c) + clean + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, c, -1));
+    ::state__fld_caret[id] = (c + (int)((clean).size()));
+    ::state__fld_anchor[id] = ::state__fld_caret[id];
 }
 
-static int fld_key(int id, int vk, int mods) {
-    std::string t = fld_text[id];
-    int c = fld_caret[id];
-    bool shift = ((mods & M_SHIFT) != 0);
-    bool ctrl = ((mods & M_CTRL) != 0);
+static int nxtext__fld_key(int id, int vk, int mods) {
+    std::string t = ::state__fld_text[id];
+    int c = ::state__fld_caret[id];
+    bool shift = ((mods & ::state__M_SHIFT) != 0);
+    bool ctrl = ((mods & ::state__M_CTRL) != 0);
     int nc = c;
-    if (vk == K_LEFT) {
-        if (!(shift) && fld_has_sel(id)) {
-            nc = imin(c, fld_anchor[id]);
+    if (vk == ::state__K_LEFT) {
+        if (!(shift) && ::nxtext__fld_has_sel(id)) {
+            nc = ::draw__imin(c, ::state__fld_anchor[id]);
         } else if (ctrl) {
-            nc = word_left(t, c);
+            nc = ::nxtext__word_left(t, c);
         } else {
-            nc = prev_i(t, c);
+            nc = ::nxtext__prev_i(t, c);
         }
-    } else if (vk == K_RIGHT) {
-        if (!(shift) && fld_has_sel(id)) {
-            nc = imax(c, fld_anchor[id]);
+    } else if (vk == ::state__K_RIGHT) {
+        if (!(shift) && ::nxtext__fld_has_sel(id)) {
+            nc = ::draw__imax(c, ::state__fld_anchor[id]);
         } else if (ctrl) {
-            nc = word_right(t, c);
+            nc = ::nxtext__word_right(t, c);
         } else {
-            nc = next_i(t, c);
+            nc = ::nxtext__next_i(t, c);
         }
-    } else if (vk == K_HOME) {
+    } else if (vk == ::state__K_HOME) {
         nc = 0;
-    } else if (vk == K_END) {
+    } else if (vk == ::state__K_END) {
         nc = (int)((t).size());
-    } else if (vk == K_BACK) {
-        if (fld_has_sel(id)) {
-            fld_del_sel(id);
+    } else if (vk == ::state__K_BACK) {
+        if (::nxtext__fld_has_sel(id)) {
+            ::nxtext__fld_del_sel(id);
         } else if (c > 0) {
-            int p = prev_i(t, c);
+            int p = ::nxtext__prev_i(t, c);
             if (ctrl) {
-                p = word_left(t, c);
+                p = ::nxtext__word_left(t, c);
             }
-            fld_text[id] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, p) + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, c, -1));
-            fld_caret[id] = p;
-            fld_anchor[id] = p;
+            ::state__fld_text[id] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, p) + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, c, -1));
+            ::state__fld_caret[id] = p;
+            ::state__fld_anchor[id] = p;
         } else {
             return 1;
         }
         return 2;
-    } else if (vk == K_DELETE) {
-        if (fld_has_sel(id)) {
-            fld_del_sel(id);
+    } else if (vk == ::state__K_DELETE) {
+        if (::nxtext__fld_has_sel(id)) {
+            ::nxtext__fld_del_sel(id);
         } else if (c < (int)((t).size())) {
-            int q = next_i(t, c);
+            int q = ::nxtext__next_i(t, c);
             if (ctrl) {
-                q = word_right(t, c);
+                q = ::nxtext__word_right(t, c);
             }
-            fld_text[id] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, c) + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, q, -1));
+            ::state__fld_text[id] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, c) + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, q, -1));
         } else {
             return 1;
         }
         return 2;
     } else if (ctrl && vk == 65) {
-        fld_select_all(id);
+        ::nxtext__fld_select_all(id);
         return 1;
     } else if (ctrl && (vk == 67 || vk == 88)) {
-        if (fld_has_sel(id)) {
-            int a = imin(fld_anchor[id], c);
-            int b = imax(fld_anchor[id], c);
+        if (::nxtext__fld_has_sel(id)) {
+            int a = ::draw__imin(::state__fld_anchor[id], c);
+            int b = ::draw__imax(::state__fld_anchor[id], c);
             nx_clip_set(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, a, (b - a)).c_str());
             if (vk == 88) {
-                fld_del_sel(id);
+                ::nxtext__fld_del_sel(id);
                 return 2;
             }
         }
         return 1;
     } else if (ctrl && vk == 86) {
-        std::string clip = nx_clip_get();
-        fld_insert(id, clip);
+        std::string clip = __nexa_text(nx_clip_get());
+        ::nxtext__fld_insert(id, clip);
         return 2;
     } else {
         return 0;
     }
-    fld_caret[id] = nc;
+    ::state__fld_caret[id] = nc;
     if (!(shift)) {
-        fld_anchor[id] = nc;
+        ::state__fld_anchor[id] = nc;
     }
     return 1;
 }
 
-static void fld_char(int id, int cp) {
-    fld_insert(id, utf8(cp));
+static void nxtext__fld_char(int id, int cp) {
+    ::nxtext__fld_insert(id, ::nxtext__utf8(cp));
 }
 
-static int fld_hit(int id, int rx) {
-    std::string t = fld_text[id];
+static int nxtext__fld_hit(int id, int rx) {
+    std::string t = ::state__fld_text[id];
     int i = 0;
     int best = 0;
     while (i <= (int)((t).size())) {
-        int w = tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, i), UI);
-        if ((w - fld_scroll[id]) > rx) {
-            int pw = (tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, best), UI) - fld_scroll[id]);
-            if ((rx - pw) < (w - fld_scroll[id] - rx)) {
+        int w = ::draw__tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, i), ::state__UI);
+        if ((w - ::state__fld_scroll[id]) > rx) {
+            int pw = (::draw__tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, best), ::state__UI) - ::state__fld_scroll[id]);
+            if ((rx - pw) < (w - ::state__fld_scroll[id] - rx)) {
                 return best;
             }
             return i;
@@ -3862,38 +4101,38 @@ static int fld_hit(int id, int rx) {
         if (i == (int)((t).size())) {
             break;
         }
-        i = next_i(t, i);
+        i = ::nxtext__next_i(t, i);
     }
     return (int)((t).size());
 }
 
-static void fld_click(int id, int rx, bool shift) {
-    fld_caret[id] = fld_hit(id, rx);
+static void nxtext__fld_click(int id, int rx, bool shift) {
+    ::state__fld_caret[id] = ::nxtext__fld_hit(id, rx);
     if (!(shift)) {
-        fld_anchor[id] = fld_caret[id];
+        ::state__fld_anchor[id] = ::state__fld_caret[id];
     }
 }
 
-static void fld_draw(int id, int x, int y, int w, int h, bool focused, std::string placeholder) {
-    fill(x, y, w, h, C_INPUT);
-    outline(x, y, w, h, ((focused) ? (C_ACCENT) : (C_INPUT_BORDER)));
-    std::string t = fld_text[id];
-    if (id == FLD_KEY) {
-        std::string dots = ([](const std::string& __s, int __n){ std::string __o; for (int __i = 0; __i < __n; __i++) __o += __s; return __o; })("\xE2\x80\xA2", imin((int)((t).size()), 60));
+static void nxtext__fld_draw(int id, int x, int y, int w, int h, bool focused, std::string placeholder) {
+    ::draw__fill(x, y, w, h, ::state__C_INPUT);
+    ::draw__outline(x, y, w, h, ((focused) ? (::state__C_ACCENT) : (::state__C_INPUT_BORDER)));
+    std::string t = ::state__fld_text[id];
+    if (id == ::state__FLD_KEY) {
+        std::string dots = ([](const std::string& __s, int __n){ std::string __o; for (int __i = 0; __i < __n; __i++) __o += __s; return __o; })("\xE2\x80\xA2", ::draw__imin((int)((t).size()), 60));
         if ((int)((t).size()) == 0) {
-            txt((x + px(6)), (y + ((h - __nexa_ui_text_height(UI)) / 2)), placeholder, C_DIM, UI);
+            ::draw__txt((x + ::draw__px(6)), (y + ((h - __nexa_ui_text_height(::state__UI)) / 2)), placeholder, ::state__C_DIM, ::state__UI);
         } else {
-            txt((x + px(6)), (y + ((h - __nexa_ui_text_height(UI)) / 2)), dots, C_TEXT, UI);
+            ::draw__txt((x + ::draw__px(6)), (y + ((h - __nexa_ui_text_height(::state__UI)) / 2)), dots, ::state__C_TEXT, ::state__UI);
         }
-        if (focused && caret_on()) {
-            fill((x + px(6) + tw(dots, UI)), (y + px(4)), 1, (h - px(8)), C_TEXT);
+        if (focused && ::nxtext__caret_on()) {
+            ::draw__fill((x + ::draw__px(6) + ::draw__tw(dots, ::state__UI)), (y + ::draw__px(4)), 1, (h - ::draw__px(8)), ::state__C_TEXT);
         }
         return;
     }
-    int pad = px(6);
+    int pad = ::draw__px(6);
     int inner = (w - (pad * 2));
-    int cxp = tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, fld_caret[id]), UI);
-    int sc = fld_scroll[id];
+    int cxp = ::draw__tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, ::state__fld_caret[id]), ::state__UI);
+    int sc = ::state__fld_scroll[id];
     if ((cxp - sc) > (inner - 2)) {
         sc = (cxp - inner + 2);
     }
@@ -3903,40 +4142,40 @@ static void fld_draw(int id, int x, int y, int w, int h, bool focused, std::stri
     if (sc < 0) {
         sc = 0;
     }
-    fld_scroll[id] = sc;
-    int ty = (y + ((h - __nexa_ui_text_height(UI)) / 2));
+    ::state__fld_scroll[id] = sc;
+    int ty = (y + ((h - __nexa_ui_text_height(::state__UI)) / 2));
     if ((int)((t).size()) == 0) {
-        txt((x + pad), ty, placeholder, C_DIM, UI);
+        ::draw__txt((x + pad), ty, placeholder, ::state__C_DIM, ::state__UI);
     } else {
-        if (focused && fld_has_sel(id)) {
-            int a = imin(fld_anchor[id], fld_caret[id]);
-            int b = imax(fld_anchor[id], fld_caret[id]);
-            int xa = clamp((tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, a), UI) - sc), 0, inner);
-            int xb = clamp((tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, b), UI) - sc), 0, inner);
-            fill((x + pad + xa), (y + px(3)), (xb - xa), (h - px(6)), C_SELECTION);
+        if (focused && ::nxtext__fld_has_sel(id)) {
+            int a = ::draw__imin(::state__fld_anchor[id], ::state__fld_caret[id]);
+            int b = ::draw__imax(::state__fld_anchor[id], ::state__fld_caret[id]);
+            int xa = ::draw__clamp((::draw__tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, a), ::state__UI) - sc), 0, inner);
+            int xb = ::draw__clamp((::draw__tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, b), ::state__UI) - sc), 0, inner);
+            ::draw__fill((x + pad + xa), (y + ::draw__px(3)), (xb - xa), (h - ::draw__px(6)), ::state__C_SELECTION);
         }
         int start = 0;
-        while (start < (int)((t).size()) && tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, next_i(t, start)), UI) <= sc) {
-            start = next_i(t, start);
+        while (start < (int)((t).size()) && ::draw__tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, ::nxtext__next_i(t, start)), ::state__UI) <= sc) {
+            start = ::nxtext__next_i(t, start);
         }
         std::string vis = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, start, -1);
-        int off = (tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, start), UI) - sc);
-        txt((x + pad + off), ty, ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(fit(vis, (inner - off), UI), "\xE2\x80\xA6", ""), C_TEXT, UI);
+        int off = (::draw__tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, start), ::state__UI) - sc);
+        ::draw__txt((x + pad + off), ty, ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(::draw__fit(vis, (inner - off), ::state__UI), "\xE2\x80\xA6", ""), ::state__C_TEXT, ::state__UI);
     }
-    if (focused && caret_on()) {
-        fill((x + pad + cxp - sc), (y + px(4)), 1, (h - px(8)), C_TEXT);
+    if (focused && ::nxtext__caret_on()) {
+        ::draw__fill((x + pad + cxp - sc), (y + ::draw__px(4)), 1, (h - ::draw__px(8)), ::state__C_TEXT);
     }
 }
 
-static bool caret_on() {
-    return (((now_ms - blink_ms) / 530 % 2) == 0);
+static bool nxtext__caret_on() {
+    return (((::state__now_ms - ::state__blink_ms) / 530 % 2) == 0);
 }
 
-static std::string upper_s(const std::string& s) {
+static std::string nxtext__upper_s(const std::string& s) {
     return ([](std::string __s){ for (char& __c : __s) __c = (char)std::toupper((unsigned char)__c); return __s; })(s);
 }
 
-static void add_words(int which, std::string words, int kind) {
+static void highlight__add_words(int which, std::string words, int kind) {
     {
         const std::vector<std::string>& __nexa_forin_3 = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(words, " ");
         for (const std::string& w : __nexa_forin_3) {
@@ -3944,92 +4183,94 @@ static void add_words(int which, std::string words, int kind) {
                 continue;
             }
             if (which == 0) {
-                nx_words[w] = kind;
+                ::state__nx_words[w] = kind;
             }
             if (which == 1) {
-                cpp_words[w] = kind;
+                ::state__cpp_words[w] = kind;
             }
             if (which == 2) {
-                sh_words[w] = kind;
+                ::state__sh_words[w] = kind;
             }
         }
     }
 }
 
-static int word_kind(int lang, const std::string& w) {
-    if (lang == L_CPP) {
-        if (((cpp_words).find(w) != (cpp_words).end())) {
-            return cpp_words[w];
+static int highlight__word_kind(int lang, const std::string& w) {
+    if (lang == ::state__L_CPP) {
+        if (((::state__cpp_words).find(w) != (::state__cpp_words).end())) {
+            return ::state__cpp_words[w];
         }
         return 0;
     }
-    if (((nx_words).find(w) != (nx_words).end())) {
-        return nx_words[w];
+    if (((::state__nx_words).find(w) != (::state__nx_words).end())) {
+        return ::state__nx_words[w];
     }
     return 0;
 }
 
-static void add_members(std::string mod, std::string names) {
-    nx_members[mod] = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(names, " ");
+static void highlight__add_members(std::string mod, std::string names) {
+    ::state__nx_members[mod] = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(names, " ");
 }
 
-static void hl_init() {
-    add_words(0, "fn extern if else while for switch case default return break continue goto try catch throw", 1);
-    add_words(0, "let const struct enum new delete sizeof in self and or not", 2);
-    add_words(0, "int short long size_t string bool float char void unsigned map Result result Json json HttpResponse HttpServer HttpRequest", 3);
-    add_words(0, "true false null", 4);
-    add_words(0, "io os dll file random math crypto http tcp udp json time thread gfx gfx3d ui", 5);
-    add_words(1, "if else for while do switch case default break continue return goto try catch throw co_await co_return co_yield", 1);
-    add_words(1, "alignas alignof asm auto class concept const consteval constexpr constinit const_cast decltype delete dynamic_cast enum explicit export extern final friend inline mutable namespace new noexcept operator override private protected public register reinterpret_cast requires sizeof static static_assert static_cast struct template this thread_local typedef typeid typename union using virtual volatile and or not xor", 2);
-    add_words(1, "void bool char char8_t char16_t char32_t wchar_t short int long float double signed unsigned size_t ssize_t ptrdiff_t intptr_t uintptr_t int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t std string vector map", 3);
-    add_words(1, "true false nullptr NULL", 4);
-    add_words(2, "if then else elif fi for in do done while until case esac function return exit goto call break continue foreach switch default param try catch finally", 1);
-    add_words(2, "echo set setlocal endlocal export local declare readonly unset shift source alias cd pushd popd not exist defined errorlevel equ neq lss leq gtr geq ifeq ifneq ifdef ifndef endif define endef include PHONY", 2);
-    add_words(2, "true false null $true $false $null", 4);
-    add_members("io", "print println flush readln read_int to_int getline trim");
-    add_members("os", "system spawn spawn_wait spawn_at wait kill platform arch cpu_count getenv setenv unsetenv hostname username user home tempdir cwd chdir executable which total_mem avail_mem page_size uptime shell newline path_sep lang isatty environ env config_dir cache_dir desktop endian exit getpid exe_dir clip_get clip_set notify open load save play lock shutdown reboot suspend logout set_volume get_volume mute unmute toggle_mute set_brightness get_brightness type messagebox getkey keypressed");
-    add_members("file", "read write append exists mkdir remove delete remove_all rename move copy list listdir isdir isfile size cwd chdir abspath join dirname parent basename name extension");
-    add_members("random", "int seed");
-    add_members("math", "abs min max pow sqrt floor ceil round sin cos tan log log10 exp pi e");
-    add_members("crypto", "xor sha256 sha1 hmac_sha256 hex_encode hex_decode base64_encode base64_decode random_bytes");
-    add_members("http", "get post put patch delete request localhost accept reply raw close");
-    add_members("tcp", "connect listen accept send recv port close");
-    add_members("udp", "open port send recv sender sender_port close");
-    add_members("json", "parse stringify of null bool int float string array object");
-    add_members("time", "sleep seconds milliseconds now_ms");
-    add_members("thread", "spawn join worker run worker_join");
-    add_members("dll", "load call");
-    add_members("gfx", "open resize width height scale title close poll closed clear plot get fill rect round_rect fill_round_rect line circle fill_circle ellipse fill_ellipse arc pie tri fill_tri poly fill_poly alpha save text text_size text_width text_height present maxfps fullscreen borderless ontop transparent audio sample audio_queued audio_flush sound play loop stop volume image decode image_w image_h blit blit_rot icon cursor key pressed released wheel wheel_x typed mouse_x mouse_y mouse drop opendialog openfile");
-    add_members("gfx3d", "open close closed poll present clear width height maxfps backend renderer camera perspective ambient light reset translate rotate scale draw cube box sphere cylinder cone capsule teapot grid tri line3 model model_tris get save key pressed released typed mouse mouse_x mouse_y wheel wheel_x audio sample audio_queued audio_flush sound sound_at play loop stop volume");
-    add_members("ui", "open background theme accent rounding font_size text heading caption text_width text_height panel separator button checkbox toggle radio slider progress textbox dropdown");
-    nx_methods = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })("upper lower trim len contains starts_with ends_with index_of last_index_of count replace substring repeat split push pop insert remove clear has sort sort_desc reverse min max sum join keys values ok value error kind is_null is_bool is_number is_string is_array is_object is_error as_bool as_int as_float as_string get set", " ");
+static void highlight__hl_init() {
+    ::highlight__add_words(0, "fn extern if else while for switch case default return break continue defer goto try catch throw", 1);
+    ::highlight__add_words(0, "let const struct enum type shape priv new delete sizeof in self and or not", 2);
+    ::highlight__add_words(0, "int short long size_t string bool float float32 float64 char void unsigned map Result result Json json HttpResponse HttpServer HttpRequest", 3);
+    ::highlight__add_words(0, "true false null", 4);
+    ::highlight__add_words(0, "io os dll file random math crypto http tcp udp json time thread term gfx gfx3d ui", 5);
+    ::highlight__add_words(1, "if else for while do switch case default break continue return goto try catch throw co_await co_return co_yield", 1);
+    ::highlight__add_words(1, "alignas alignof asm auto class concept const consteval constexpr constinit const_cast decltype delete dynamic_cast enum explicit export extern final friend inline mutable namespace new noexcept operator override private protected public register reinterpret_cast requires sizeof static static_assert static_cast struct template this thread_local typedef typeid typename union using virtual volatile and or not xor", 2);
+    ::highlight__add_words(1, "void bool char char8_t char16_t char32_t wchar_t short int long float double signed unsigned size_t ssize_t ptrdiff_t intptr_t uintptr_t int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t std string vector map", 3);
+    ::highlight__add_words(1, "true false nullptr NULL", 4);
+    ::highlight__add_words(2, "if then else elif fi for in do done while until case esac function return exit goto call break continue foreach switch default param try catch finally", 1);
+    ::highlight__add_words(2, "echo set setlocal endlocal export local declare readonly unset shift source alias cd pushd popd not exist defined errorlevel equ neq lss leq gtr geq ifeq ifneq ifdef ifndef endif define endef include PHONY", 2);
+    ::highlight__add_words(2, "true false null $true $false $null", 4);
+    ::highlight__add_members("io", "print println eprint eprintln flush readln eof read_int to_int to_float parse_int parse_float getline trim");
+    ::highlight__add_members("os", "system spawn spawn_wait spawn_at wait kill inject inject_dll alloc_console platform arch cpu_count getenv setenv unsetenv hostname username user home tempdir cwd chdir executable which total_mem avail_mem page_size uptime shell newline path_sep lang isatty environ env config_dir cache_dir desktop endian exit getpid getprocessid exe_dir clip_get clip_set notify open load save play lock shutdown reboot suspend logout set_volume get_volume mute unmute toggle_mute set_brightness get_brightness type messagebox getkey keypressed");
+    ::highlight__add_members("file", "read lines write append exists mkdir remove delete remove_all rename move copy list listdir walk isdir isfile size modified cwd chdir abspath join dirname parent basename name extension stem");
+    ::highlight__add_members("random", "int float bool chance choice shuffle seed");
+    ::highlight__add_members("math", "abs min max pow sqrt floor ceil round trunc mod sign clamp lerp cbrt hypot sin cos tan asin acos atan atan2 sinh cosh tanh deg rad log log2 log10 exp pi tau e inf");
+    ::highlight__add_members("crypto", "xor sha256 sha1 hmac_sha256 hex_encode hex_decode base64_encode base64_decode random_bytes");
+    ::highlight__add_members("http", "get post put patch delete request localhost accept reply raw close");
+    ::highlight__add_members("tcp", "connect listen accept send recv port close");
+    ::highlight__add_members("udp", "open port send recv sender sender_port close");
+    ::highlight__add_members("json", "parse stringify of null bool int float string array object");
+    ::highlight__add_members("time", "sleep seconds milliseconds now_ms unix unix_ms format format_utc year month day hour minute second weekday");
+    ::highlight__add_members("thread", "spawn join worker run worker_join mutex lock unlock");
+    ::highlight__add_members("dll", "load call");
+    ::highlight__add_members("gfx", "open resize width height scale title close poll closed clear plot get fill rect round_rect fill_round_rect line circle fill_circle ellipse fill_ellipse arc pie tri fill_tri poly fill_poly alpha save text text_size text_width text_height present maxfps fullscreen borderless ontop transparent audio sample audio_queued audio_flush sound play loop stop volume image decode image_w image_h upload blit blit_rot icon cursor key pressed released wheel wheel_x typed mouse_x mouse_y mouse pads pad pad_pressed pad_axis rumble drop opendialog openfile");
+    ::highlight__add_members("gfx3d", "open close closed poll present clear width height maxfps backend renderer camera perspective ambient light reset translate rotate scale draw cube box sphere cylinder cone capsule teapot grid tri line3 model model_tris texture use shader use_shader shader_set shader_error get save key pressed released typed mouse mouse_x mouse_y wheel wheel_x pads pad pad_pressed pad_axis rumble audio sample audio_queued audio_flush sound sound_at play loop stop volume");
+    ::highlight__add_members("ui", "open background theme style accent rounding font_size text heading caption text_width text_height panel separator button checkbox toggle radio slider progress textbox dropdown tabs list table menubar menu dialog tooltip");
+    ::highlight__add_members("term", "color bg bold dim italic underline reverse clear clear_line clear_eol move home hide_cursor show_cursor cursor progress spinner alt_screen raw getkey key_available width height");
+    ::state__nx_methods = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })("upper lower trim len contains starts_with ends_with index_of last_index_of count replace substring repeat split push pop insert remove clear has sort sort_desc reverse min max sum join keys values ok value error kind is_null is_bool is_number is_string is_array is_object is_error as_bool as_int as_float as_string get set", " ");
+    ::highlight__add_words(0, "bits from_bits32 from_bits64", 2);
 }
 
-static int lang_for(const std::string& path) {
+static int highlight__lang_for(const std::string& path) {
     std::string p = ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(path);
     std::string name = __nexa_file_basename((p).c_str());
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".nxa")) {
-        return L_NEXA;
+        return ::state__L_NEXA;
     }
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".cpp") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".hpp") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".h") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".c") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".cc") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".cxx") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".hh") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".rc")) {
-        return L_CPP;
+        return ::state__L_CPP;
     }
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".json") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".jsonc") || name == "nexapkg.lock") {
-        return L_JSON;
+        return ::state__L_JSON;
     }
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".md") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".markdown")) {
-        return L_MD;
+        return ::state__L_MD;
     }
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".ini") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".toml") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".yaml") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".yml") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".cfg") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".conf") || name == ".gitignore" || name == ".gitattributes" || name == ".editorconfig") {
-        return L_INI;
+        return ::state__L_INI;
     }
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".sh") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".bat") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".cmd") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".ps1") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".bash") || name == "makefile" || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, ".mk")) {
-        return L_SHELL;
+        return ::state__L_SHELL;
     }
-    return L_PLAIN;
+    return ::state__L_PLAIN;
 }
 
-static std::string lang_name(int l) {
+static std::string highlight__lang_name(int l) {
     switch (l) {
     case 1: {
         return "Nexa";
@@ -4056,98 +4297,98 @@ static std::string lang_name(int l) {
     return "Plain Text";
 }
 
-static std::string lang_comment(int l) {
-    if (l == L_NEXA || l == L_CPP || l == L_JSON) {
+static std::string highlight__lang_comment(int l) {
+    if (l == ::state__L_NEXA || l == ::state__L_CPP || l == ::state__L_JSON) {
         return "//";
     }
-    if (l == L_INI || l == L_SHELL) {
+    if (l == ::state__L_INI || l == ::state__L_SHELL) {
         return "#";
     }
     return "";
 }
 
-static int lang_color(const std::string& path) {
-    int l = lang_for(path);
-    if (l == L_NEXA) {
+static int highlight__lang_color(const std::string& path) {
+    int l = ::highlight__lang_for(path);
+    if (l == ::state__L_NEXA) {
         return 0x4FC1FF;
     }
-    if (l == L_CPP) {
+    if (l == ::state__L_CPP) {
         return 0x9B7BD4;
     }
-    if (l == L_JSON) {
+    if (l == ::state__L_JSON) {
         return 0xCBCB41;
     }
-    if (l == L_MD) {
+    if (l == ::state__L_MD) {
         return 0x519ABA;
     }
-    if (l == L_INI) {
+    if (l == ::state__L_INI) {
         return 0x6D8086;
     }
-    if (l == L_SHELL) {
+    if (l == ::state__L_SHELL) {
         return 0x89E051;
     }
     return 0x8B8B8B;
 }
 
-static std::string lang_badge(const std::string& path) {
-    int l = lang_for(path);
-    if (l == L_NEXA) {
+static std::string highlight__lang_badge(const std::string& path) {
+    int l = ::highlight__lang_for(path);
+    if (l == ::state__L_NEXA) {
         return "N";
     }
-    if (l == L_CPP) {
+    if (l == ::state__L_CPP) {
         if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(path, ".h") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(path, ".hpp")) {
             return "h";
         }
         return "C";
     }
-    if (l == L_JSON) {
+    if (l == ::state__L_JSON) {
         return "{}";
     }
-    if (l == L_MD) {
+    if (l == ::state__L_MD) {
         return "M";
     }
-    if (l == L_INI) {
+    if (l == ::state__L_INI) {
         return "#";
     }
-    if (l == L_SHELL) {
+    if (l == ::state__L_SHELL) {
         return "$";
     }
     return "";
 }
 
-static int bracket_color(int depth) {
+static int highlight__bracket_color(int depth) {
     int d = (depth % 3);
     if (d < 0) {
         d = d + 3;
     }
     if (d == 0) {
-        return S_BR1;
+        return ::state__S_BR1;
     }
     if (d == 1) {
-        return S_BR2;
+        return ::state__S_BR2;
     }
-    return S_BR3;
+    return ::state__S_BR3;
 }
 
-static void paint(int a, int b, int c) {
-    int n = (int)((HC).size());
-    int i = imax(a, 0);
-    int e = imin(b, n);
+static void highlight__paint(int a, int b, int c) {
+    int n = (int)((::state__HC).size());
+    int i = ::draw__imax(a, 0);
+    int e = ::draw__imin(b, n);
     while (i < e) {
-        HC[i] = c;
+        ::state__HC[i] = c;
         i = i + 1;
     }
 }
 
-static void paint_comment(std::string s, int a, int b) {
-    paint(a, b, S_COMMENT);
+static void highlight__paint_comment(std::string s, int a, int b) {
+    ::highlight__paint(a, b, ::state__S_COMMENT);
     {
         const std::vector<std::string>& __nexa_forin_3 = std::vector<std::string>{"TODO", "FIXME", "NOTE", "HACK", "XXX", "BUG"};
         for (const std::string& tag : __nexa_forin_3) {
             int at = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, tag, a);
             while (at >= 0 && (at + (int)((tag).size())) <= b) {
-                if (!(is_word_at(s, (at - 1))) && !(is_word_at(s, (at + (int)((tag).size()))))) {
-                    paint(at, (at + (int)((tag).size())), S_TODO);
+                if (!(::nxtext__is_word_at(s, (at - 1))) && !(::nxtext__is_word_at(s, (at + (int)((tag).size()))))) {
+                    ::highlight__paint(at, (at + (int)((tag).size())), ::state__S_TODO);
                 }
                 at = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, tag, (at + 1));
             }
@@ -4155,68 +4396,68 @@ static void paint_comment(std::string s, int a, int b) {
     }
 }
 
-static int word_end(const std::string& s, int i) {
+static int highlight__word_end(const std::string& s, int i) {
     int j = i;
-    while (j < (int)((s).size()) && is_word_b(ubyte(s, j))) {
+    while (j < (int)((s).size()) && ::nxtext__is_word_b(::nxtext__ubyte(s, j))) {
         j = j + 1;
     }
     return j;
 }
 
-static int skip_ws(const std::string& s, int i) {
+static int highlight__skip_ws(const std::string& s, int i) {
     int j = i;
-    while (j < (int)((s).size()) && is_space_b(ubyte(s, j))) {
+    while (j < (int)((s).size()) && ::nxtext__is_space_b(::nxtext__ubyte(s, j))) {
         j = j + 1;
     }
     return j;
 }
 
-static int prev_non_ws(const std::string& s, int i) {
+static int highlight__prev_non_ws(const std::string& s, int i) {
     int j = (i - 1);
-    while (j >= 0 && is_space_b(ubyte(s, j))) {
+    while (j >= 0 && ::nxtext__is_space_b(::nxtext__ubyte(s, j))) {
         j = j - 1;
     }
     return j;
 }
 
-static bool is_digit_b(int b) {
+static bool highlight__is_digit_b(int b) {
     return (b >= 48 && b <= 57);
 }
 
-static bool is_upper_b(int b) {
+static bool highlight__is_upper_b(int b) {
     return (b >= 65 && b <= 90);
 }
 
-static std::vector<int> hl_line(int lang, std::string s, int st, std::string dl) {
-    hl_out_delim = dl;
-    if (lang == L_NEXA || lang == L_CPP) {
-        return hl_code(lang, s, st, dl);
+static std::vector<int> highlight__hl_line(int lang, std::string s, int st, std::string dl) {
+    ::state__hl_out_delim = dl;
+    if (lang == ::state__L_NEXA || lang == ::state__L_CPP) {
+        return ::highlight__hl_code(lang, s, st, dl);
     }
-    if (lang == L_JSON) {
-        return hl_json(s, st);
+    if (lang == ::state__L_JSON) {
+        return ::highlight__hl_json(s, st);
     }
-    if (lang == L_MD) {
-        return hl_md(s, st);
+    if (lang == ::state__L_MD) {
+        return ::highlight__hl_md(s, st);
     }
-    if (lang == L_INI) {
-        return hl_ini(s);
+    if (lang == ::state__L_INI) {
+        return ::highlight__hl_ini(s);
     }
-    if (lang == L_SHELL) {
-        return hl_shell(s);
+    if (lang == ::state__L_SHELL) {
+        return ::highlight__hl_shell(s);
     }
-    HC.clear();
+    ::state__HC.clear();
     for (int i = 0; i < (int)((s).size()); i++) {
-        HC.push_back(S_TEXT);
+        ::state__HC.push_back(::state__S_TEXT);
     }
-    hl_out_state = 0;
-    return HC;
+    ::state__hl_out_state = 0;
+    return ::state__HC;
 }
 
-static int hl_string(int lang, std::string s, int i, bool fstr) {
+static int highlight__hl_string(int lang, std::string s, int i, bool fstr) {
     char q = s[i];
     int n = (int)((s).size());
     int j = (i + 1);
-    HC[i] = S_STRING;
+    ::state__HC[i] = ::state__S_STRING;
     while (j < n) {
         char c = s[j];
         if (c == '\\') {
@@ -4226,21 +4467,21 @@ static int hl_string(int lang, std::string s, int i, bool fstr) {
                 char d = s[(j + 1)];
                 if (d == 'x') {
                     e = (j + 4);
-                    ok = ((j + 3) < n && is_hex(s[(j + 2)]) && is_hex(s[(j + 3)]));
-                    if (lang == L_CPP) {
-                        ok = ((j + 2) < n && is_hex(s[(j + 2)]));
+                    ok = ((j + 3) < n && ::highlight__is_hex(s[(j + 2)]) && ::highlight__is_hex(s[(j + 3)]));
+                    if (lang == ::state__L_CPP) {
+                        ok = ((j + 2) < n && ::highlight__is_hex(s[(j + 2)]));
                     }
-                } else if (lang == L_NEXA) {
+                } else if (lang == ::state__L_NEXA) {
                     ok = (d == 'n' || d == 't' || d == 'r' || d == 'a' || d == 'b' || d == 'f' || d == 'v' || d == '0' || d == '\\' || d == '"' || d == '\'');
                 }
             }
-            paint(j, imin(e, n), ((ok) ? (S_ESCAPE) : (S_INVALID)));
+            ::highlight__paint(j, ::draw__imin(e, n), ((ok) ? (::state__S_ESCAPE) : (::state__S_INVALID)));
             j = e;
             continue;
         }
         if (fstr && c == '{') {
             if ((j + 1) < n && s[(j + 1)] == '{') {
-                paint(j, (j + 2), S_ESCAPE);
+                ::highlight__paint(j, (j + 2), ::state__S_ESCAPE);
                 j = j + 2;
                 continue;
             }
@@ -4265,34 +4506,34 @@ static int hl_string(int lang, std::string s, int i, bool fstr) {
                 }
                 k = k + 1;
             }
-            HC[j] = S_KEYWORD;
+            ::state__HC[j] = ::state__S_KEYWORD;
             std::string inner = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, (j + 1), (k - j - 1));
             int fmt = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(inner, ":");
             std::string code = inner;
             if (fmt >= 0 && !(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(inner, "?")) && !(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(inner, "\""))) {
                 code = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(inner, 0, fmt);
             }
-            std::vector<int> saved = HC;
-            std::vector<int> sub = hl_code(lang, code, 0, "");
-            HC = saved;
+            std::vector<int> saved = ::state__HC;
+            std::vector<int> sub = ::highlight__hl_code(lang, code, 0, "");
+            ::state__HC = saved;
             for (int t = 0; t < (int)((sub).size()); t++) {
-                HC[(j + 1 + t)] = sub[t];
+                ::state__HC[(j + 1 + t)] = sub[t];
             }
             if ((int)((code).size()) < (int)((inner).size())) {
-                paint((j + 1 + (int)((code).size())), k, S_ESCAPE);
+                ::highlight__paint((j + 1 + (int)((code).size())), k, ::state__S_ESCAPE);
             }
             if (k < n) {
-                HC[k] = S_KEYWORD;
+                ::state__HC[k] = ::state__S_KEYWORD;
             }
             j = (k + 1);
             continue;
         }
         if (fstr && c == '}' && (j + 1) < n && s[(j + 1)] == '}') {
-            paint(j, (j + 2), S_ESCAPE);
+            ::highlight__paint(j, (j + 2), ::state__S_ESCAPE);
             j = j + 2;
             continue;
         }
-        HC[j] = S_STRING;
+        ::state__HC[j] = ::state__S_STRING;
         j = j + 1;
         if (c == q) {
             return j;
@@ -4301,18 +4542,18 @@ static int hl_string(int lang, std::string s, int i, bool fstr) {
     return n;
 }
 
-static bool is_hex(char c) {
+static bool highlight__is_hex(char c) {
     return ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'));
 }
 
-static int hl_number(std::string s, int i) {
+static int highlight__hl_number(std::string s, int i) {
     int n = (int)((s).size());
     int j = i;
     bool ok = true;
     if (s[j] == '0' && (j + 1) < n && (s[(j + 1)] == 'x' || s[(j + 1)] == 'X')) {
         j = j + 2;
         int st = j;
-        while (j < n && (is_hex(s[j]) || s[j] == '\'')) {
+        while (j < n && (::highlight__is_hex(s[j]) || s[j] == '\'')) {
             j = j + 1;
         }
         ok = (j > st);
@@ -4322,12 +4563,12 @@ static int hl_number(std::string s, int i) {
             j = j + 1;
         }
     } else {
-        while (j < n && (is_digit_b(ubyte(s, j)) || s[j] == '\'' || s[j] == '_')) {
+        while (j < n && (::highlight__is_digit_b(::nxtext__ubyte(s, j)) || s[j] == '\'' || s[j] == '_')) {
             j = j + 1;
         }
-        if (j < n && s[j] == '.' && (j + 1) < n && is_digit_b(ubyte(s, (j + 1)))) {
+        if (j < n && s[j] == '.' && (j + 1) < n && ::highlight__is_digit_b(::nxtext__ubyte(s, (j + 1)))) {
             j = j + 1;
-            while (j < n && is_digit_b(ubyte(s, j))) {
+            while (j < n && ::highlight__is_digit_b(::nxtext__ubyte(s, j))) {
                 j = j + 1;
             }
         }
@@ -4336,16 +4577,16 @@ static int hl_number(std::string s, int i) {
             if (k < n && (s[k] == '+' || s[k] == '-')) {
                 k = k + 1;
             }
-            if (k < n && is_digit_b(ubyte(s, k))) {
+            if (k < n && ::highlight__is_digit_b(::nxtext__ubyte(s, k))) {
                 j = k;
-                while (j < n && is_digit_b(ubyte(s, j))) {
+                while (j < n && ::highlight__is_digit_b(::nxtext__ubyte(s, j))) {
                     j = j + 1;
                 }
             }
         }
     }
     int suf = j;
-    while (j < n && is_word_b(ubyte(s, j))) {
+    while (j < n && ::nxtext__is_word_b(::nxtext__ubyte(s, j))) {
         j = j + 1;
     }
     if (j > suf) {
@@ -4354,50 +4595,66 @@ static int hl_number(std::string s, int i) {
             ok = false;
         }
     }
-    paint(i, j, ((ok) ? (S_NUMBER) : (S_INVALID)));
+    ::highlight__paint(i, j, ((ok) ? (::state__S_NUMBER) : (::state__S_INVALID)));
     return j;
 }
 
-static std::vector<int> hl_code(int lang, std::string s, int st, std::string dl) {
+static bool highlight__nexa_type_word(const std::string& w) {
+    if (::highlight__word_kind(::state__L_NEXA, w) == 3) {
+        return true;
+    }
+    if ((int)((w).size()) == 0 || !(::highlight__is_upper_b(::nxtext__ubyte(w, 0)))) {
+        return false;
+    }
+    bool caps = true;
+    for (int k = 0; k < (int)((w).size()); k++) {
+        if (::nxtext__ubyte(w, k) >= 97 && ::nxtext__ubyte(w, k) <= 122) {
+            caps = false;
+        }
+    }
+    return (!(caps) || (int)((w).size()) == 1);
+}
+
+static std::vector<int> highlight__hl_code(int lang, std::string s, int st, std::string dl) {
     int n = (int)((s).size());
-    HC.clear();
+    ::state__HC.clear();
     for (int k = 0; k < n; k++) {
-        HC.push_back(S_PLAIN);
+        ::state__HC.push_back(::state__S_PLAIN);
     }
     int mode = (st & 15);
     int depth = (st >> 4);
     std::string delim = dl;
     int i = 0;
-    if (mode == HM_BLOCK) {
+    if (mode == ::state__HM_BLOCK) {
         int e = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(s, "*/");
         if (e < 0) {
-            paint_comment(s, 0, n);
-            hl_out_state = st;
-            return HC;
+            ::highlight__paint_comment(s, 0, n);
+            ::state__hl_out_state = st;
+            return ::state__HC;
         }
-        paint_comment(s, 0, (e + 2));
+        ::highlight__paint_comment(s, 0, (e + 2));
         i = (e + 2);
-        mode = HM_NORMAL;
-    } else if (mode == HM_RAW) {
-        std::string close = (std::string(")") + delim + "\"");
-        int e = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(s, close);
+        mode = ::state__HM_NORMAL;
+    } else if (mode == ::state__HM_RAW) {
+        std::string close_ = (std::string(")") + delim + "\"");
+        int e = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(s, close_);
         if (e < 0) {
-            paint(0, n, S_STRING);
-            hl_out_state = st;
-            hl_out_delim = delim;
-            return HC;
+            ::highlight__paint(0, n, ::state__S_STRING);
+            ::state__hl_out_state = st;
+            ::state__hl_out_delim = delim;
+            return ::state__HC;
         }
-        paint(0, (e + (int)((close).size())), S_STRING);
-        i = (e + (int)((close).size()));
-        mode = HM_NORMAL;
+        ::highlight__paint(0, (e + (int)((close_).size())), ::state__S_STRING);
+        i = (e + (int)((close_).size()));
+        mode = ::state__HM_NORMAL;
     }
-    int first = skip_ws(s, i);
+    int first = ::highlight__skip_ws(s, i);
     if (i == 0 && first < n && s[first] == '#') {
-        int we = word_end(s, skip_ws(s, (first + 1)));
+        int we = ::highlight__word_end(s, ::highlight__skip_ws(s, (first + 1)));
         std::string dir = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, first, (we - first));
-        paint(first, we, S_CONTROL);
+        ::highlight__paint(first, we, ::state__S_CONTROL);
         i = we;
-        int rest = skip_ws(s, i);
+        int rest = ::highlight__skip_ws(s, i);
         if (([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(dir, "include") && rest < n && (s[rest] == '<' || s[rest] == '"')) {
             std::string closer = ((s[rest] == '<') ? (std::string(">")) : (std::string("\"")));
             int e = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, closer, (rest + 1));
@@ -4406,62 +4663,63 @@ static std::vector<int> hl_code(int lang, std::string s, int st, std::string dl)
             }
             std::string path = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, (rest + 1), (e - rest - 1));
             bool ok = true;
-            if (lang == L_NEXA && s[rest] == '<' && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(path, "std/")) {
-                ok = ([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(STD_MODULES, (std::string(" ") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(path, 4, -1) + " "));
+            if (lang == ::state__L_NEXA && s[rest] == '<' && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(path, "std/")) {
+                ok = ([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(::state__STD_MODULES, (std::string(" ") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(path, 4, -1) + " "));
             }
-            paint(rest, (e + 1), ((ok) ? (S_STRING) : (S_INVALID)));
+            ::highlight__paint(rest, (e + 1), ((ok) ? (::state__S_STRING) : (::state__S_INVALID)));
             i = (e + 1);
-        } else if (lang == L_CPP && (([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(dir, "define") || ([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(dir, "ifdef") || ([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(dir, "ifndef") || ([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(dir, "undef"))) {
-            int ns = skip_ws(s, i);
-            int ne = word_end(s, ns);
-            paint(ns, ne, S_FUNC);
+        } else if (lang == ::state__L_CPP && (([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(dir, "define") || ([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(dir, "ifdef") || ([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(dir, "ifndef") || ([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(dir, "undef"))) {
+            int ns = ::highlight__skip_ws(s, i);
+            int ne = ::highlight__word_end(s, ns);
+            ::highlight__paint(ns, ne, ::state__S_FUNC);
             i = ne;
         }
     }
     std::string prev_word = "";
+    int type_depth = 0;
     while (i < n) {
         char c = s[i];
-        int b = ubyte(s, i);
+        int b = ::nxtext__ubyte(s, i);
         if (c == '/' && (i + 1) < n && s[(i + 1)] == '/') {
-            paint_comment(s, i, n);
+            ::highlight__paint_comment(s, i, n);
             break;
         }
         if (c == '/' && (i + 1) < n && s[(i + 1)] == '*') {
             int e = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, "*/", (i + 2));
             if (e < 0) {
-                paint_comment(s, i, n);
-                mode = HM_BLOCK;
+                ::highlight__paint_comment(s, i, n);
+                mode = ::state__HM_BLOCK;
                 break;
             }
-            paint_comment(s, i, (e + 2));
+            ::highlight__paint_comment(s, i, (e + 2));
             i = (e + 2);
             continue;
         }
-        if (c == 'R' && (i + 1) < n && s[(i + 1)] == '"' && !(is_word_at(s, (i - 1)))) {
+        if (c == 'R' && (i + 1) < n && s[(i + 1)] == '"' && !(::nxtext__is_word_at(s, (i - 1)))) {
             int p = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, "(", (i + 2));
             if (p >= 0 && (p - i - 2) <= 16) {
                 delim = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, (i + 2), (p - i - 2));
-                std::string close = (std::string(")") + delim + "\"");
-                int e = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, close, (p + 1));
+                std::string close_ = (std::string(")") + delim + "\"");
+                int e = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, close_, (p + 1));
                 if (e < 0) {
-                    paint(i, n, S_STRING);
-                    mode = HM_RAW;
-                    hl_out_delim = delim;
+                    ::highlight__paint(i, n, ::state__S_STRING);
+                    mode = ::state__HM_RAW;
+                    ::state__hl_out_delim = delim;
                     break;
                 }
-                paint(i, (e + (int)((close).size())), S_STRING);
-                i = (e + (int)((close).size()));
+                ::highlight__paint(i, (e + (int)((close_).size())), ::state__S_STRING);
+                i = (e + (int)((close_).size()));
                 continue;
             }
         }
         if (c == '"') {
-            i = hl_string(lang, s, i, false);
+            i = ::highlight__hl_string(lang, s, i, false);
             prev_word = "";
             continue;
         }
-        if (c == 'f' && lang == L_NEXA && (i + 1) < n && s[(i + 1)] == '"' && !(is_word_at(s, (i - 1)))) {
-            HC[i] = S_KEYWORD;
-            i = hl_string(lang, s, (i + 1), true);
+        if (c == 'f' && lang == ::state__L_NEXA && (i + 1) < n && s[(i + 1)] == '"' && !(::nxtext__is_word_at(s, (i - 1)))) {
+            ::state__HC[i] = ::state__S_KEYWORD;
+            i = ::highlight__hl_string(lang, s, (i + 1), true);
             prev_word = "";
             continue;
         }
@@ -4470,250 +4728,297 @@ static std::vector<int> hl_code(int lang, std::string s, int st, std::string dl)
             if (e < n && s[e] == '\\') {
                 e = e + 2;
             } else {
-                e = next_i(s, e);
+                e = ::nxtext__next_i(s, e);
             }
-            if (lang == L_CPP) {
+            if (lang == ::state__L_CPP) {
                 while (e < n && s[e] != '\'') {
                     e = e + 1;
                 }
             }
             if (e < n && s[e] == '\'') {
-                paint(i, (e + 1), S_STRING);
+                ::highlight__paint(i, (e + 1), ::state__S_STRING);
                 if ((i + 1) < n && s[(i + 1)] == '\\') {
-                    paint((i + 1), e, S_ESCAPE);
+                    ::highlight__paint((i + 1), e, ::state__S_ESCAPE);
                 }
                 i = (e + 1);
                 continue;
             }
-            HC[i] = S_PLAIN;
+            ::state__HC[i] = ::state__S_PLAIN;
             i = i + 1;
             continue;
         }
-        if (is_digit_b(b) || (c == '.' && (i + 1) < n && is_digit_b(ubyte(s, (i + 1))) && !(is_word_at(s, (i - 1))))) {
-            i = hl_number(s, i);
+        if (::highlight__is_digit_b(b) || (c == '.' && (i + 1) < n && ::highlight__is_digit_b(::nxtext__ubyte(s, (i + 1))) && !(::nxtext__is_word_at(s, (i - 1))))) {
+            i = ::highlight__hl_number(s, i);
             continue;
         }
-        if (is_word_b(b)) {
-            int e = word_end(s, i);
+        if (::nxtext__is_word_b(b)) {
+            int e = ::highlight__word_end(s, i);
             std::string w = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, i, (e - i));
-            int after = skip_ws(s, e);
+            int after = ::highlight__skip_ws(s, e);
             char next_c = ' ';
             if (after < n) {
                 next_c = s[after];
             }
-            int before = prev_non_ws(s, i);
+            int before = ::highlight__prev_non_ws(s, i);
             char prev_c = ' ';
             if (before >= 0) {
                 prev_c = s[before];
             }
-            int color = S_VAR;
-            int kind = word_kind(lang, w);
+            int color = ::state__S_VAR;
+            int kind = ::highlight__word_kind(lang, w);
             if (prev_c == '.' && before >= 1 && s[(before - 1)] != '.') {
                 int owner_end = before;
                 int owner_start = owner_end;
-                while (owner_start > 0 && is_word_b(ubyte(s, (owner_start - 1)))) {
+                while (owner_start > 0 && ::nxtext__is_word_b(::nxtext__ubyte(s, (owner_start - 1)))) {
                     owner_start = owner_start - 1;
                 }
                 std::string owner = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, owner_start, (owner_end - owner_start));
                 if (next_c == '(') {
-                    color = S_FUNC;
-                } else if ((int)((owner).size()) > 0 && is_upper_b(ubyte(owner, 0)) && !(((nx_words).find(owner) != (nx_words).end()))) {
-                    color = S_ENUM;
+                    color = ::state__S_FUNC;
+                } else if ((int)((owner).size()) > 0 && ::highlight__is_upper_b(::nxtext__ubyte(owner, 0)) && !(((::state__nx_words).find(owner) != (::state__nx_words).end()))) {
+                    color = ::state__S_ENUM;
                 } else {
-                    color = S_PROP;
+                    color = ::state__S_PROP;
                 }
-            } else if (lang == L_CPP && before >= 1 && prev_c == ':' && s[(before - 1)] == ':') {
-                color = ((next_c == '(') ? (S_FUNC) : (((kind == 3) ? (S_TYPE) : (S_VAR))));
-                if (is_upper_b(ubyte(w, 0)) && next_c != '(') {
-                    color = S_TYPE;
+            } else if (lang == ::state__L_CPP && before >= 1 && prev_c == ':' && s[(before - 1)] == ':') {
+                color = ((next_c == '(') ? (::state__S_FUNC) : (((kind == 3) ? (::state__S_TYPE) : (::state__S_VAR))));
+                if (::highlight__is_upper_b(::nxtext__ubyte(w, 0)) && next_c != '(') {
+                    color = ::state__S_TYPE;
                 }
             } else if (kind == 1) {
-                color = S_CONTROL;
+                color = ::state__S_CONTROL;
             } else if (kind == 2 || kind == 4) {
-                color = S_KEYWORD;
+                color = ::state__S_KEYWORD;
             } else if (kind == 3) {
-                color = S_TYPE;
+                color = ::state__S_TYPE;
             } else if (kind == 5) {
-                color = ((next_c == '.') ? (S_TYPE) : (S_VAR));
+                color = ((next_c == '.') ? (::state__S_TYPE) : (::state__S_VAR));
             } else if (w == "inline_cpp" && next_c == '!') {
-                color = S_CONTROL;
+                color = ::state__S_CONTROL;
             } else if (prev_word == "fn") {
-                color = S_FUNC;
-            } else if (prev_word == "struct" || prev_word == "enum" || prev_word == "class" || prev_word == "namespace" || prev_word == "union") {
-                color = S_TYPE;
+                color = ::state__S_FUNC;
+            } else if (prev_word == "struct" || prev_word == "enum" || prev_word == "type" || prev_word == "shape" || prev_word == "class" || prev_word == "namespace" || prev_word == "union") {
+                color = ::state__S_TYPE;
             } else if (next_c == '(') {
-                color = S_FUNC;
-            } else if (lang == L_CPP && next_c == ':' && (after + 1) < n && s[(after + 1)] == ':') {
-                color = S_TYPE;
-            } else if (is_upper_b(b)) {
+                color = ::state__S_FUNC;
+            } else if (lang == ::state__L_CPP && next_c == ':' && (after + 1) < n && s[(after + 1)] == ':') {
+                color = ::state__S_TYPE;
+            } else if (::highlight__is_upper_b(b)) {
                 bool caps = true;
                 for (int k = 0; k < (int)((w).size()); k++) {
-                    int wb = ubyte(w, k);
+                    int wb = ::nxtext__ubyte(w, k);
                     if (wb >= 97 && wb <= 122) {
                         caps = false;
                     }
                 }
-                color = ((caps && (int)((w).size()) > 1) ? (S_ENUM) : (S_TYPE));
-            } else if (prev_c == ':' && lang == L_NEXA) {
-                color = S_TYPE;
+                color = ((caps && (int)((w).size()) > 1) ? (::state__S_ENUM) : (::state__S_TYPE));
+            } else if (prev_c == ':' && lang == ::state__L_NEXA) {
+                color = ::state__S_TYPE;
             }
-            paint(i, e, color);
+            ::highlight__paint(i, e, color);
             prev_word = w;
             i = e;
             continue;
         }
+        if (lang == ::state__L_NEXA && c == '[') {
+            int j = i;
+            int slices = 0;
+            while ((j + 1) < n && s[j] == '[' && s[(j + 1)] == ']') {
+                slices = slices + 1;
+                j = j + 2;
+                while (j < n && ::nxtext__is_space_b(::nxtext__ubyte(s, j))) {
+                    j = j + 1;
+                }
+            }
+            if (slices > 0 && j < n && ::nxtext__is_word_b(::nxtext__ubyte(s, j))) {
+                int we = ::highlight__word_end(s, j);
+                if (::highlight__nexa_type_word(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, j, (we - j)))) {
+                    ::highlight__paint(i, j, ::state__S_TYPE);
+                    i = j;
+                    continue;
+                }
+            }
+            if (prev_word == "Result" || prev_word == "result" || prev_word == "map") {
+                ::state__HC[i] = ::state__S_TYPE;
+                type_depth = type_depth + 1;
+                prev_word = "";
+                i = i + 1;
+                continue;
+            }
+        }
+        if (lang == ::state__L_NEXA && c == '*') {
+            int j = i;
+            while (j < n && s[j] == '*') {
+                j = j + 1;
+            }
+            int stars = j;
+            while (j < n && ::nxtext__is_space_b(::nxtext__ubyte(s, j))) {
+                j = j + 1;
+            }
+            if (stars > i && j < n && ::nxtext__is_word_b(::nxtext__ubyte(s, j))) {
+                int we = ::highlight__word_end(s, j);
+                if (::highlight__nexa_type_word(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, j, (we - j)))) {
+                    ::highlight__paint(i, stars, ::state__S_TYPE);
+                    i = stars;
+                    continue;
+                }
+            }
+        }
         if (c == '(' || c == '[' || c == '{') {
-            HC[i] = bracket_color(depth);
+            ::state__HC[i] = ::highlight__bracket_color(depth);
             depth = depth + 1;
+        } else if (c == ']' && type_depth > 0) {
+            type_depth = type_depth - 1;
+            ::state__HC[i] = ::state__S_TYPE;
         } else if (c == ')' || c == ']' || c == '}') {
             depth = depth - 1;
             if (depth < 0) {
-                HC[i] = S_INVALID;
+                ::state__HC[i] = ::state__S_INVALID;
                 depth = 0;
             } else {
-                HC[i] = bracket_color(depth);
+                ::state__HC[i] = ::highlight__bracket_color(depth);
             }
         } else if (c != ' ' && c != '\t') {
-            HC[i] = S_PLAIN;
+            ::state__HC[i] = ::state__S_PLAIN;
             if (c != '*' && c != '&') {
                 prev_word = "";
             }
         }
         i = i + 1;
     }
-    hl_out_state = (mode | (depth << 4));
-    if (mode == HM_RAW) {
-        hl_out_delim = delim;
+    ::state__hl_out_state = (mode | (depth << 4));
+    if (mode == ::state__HM_RAW) {
+        ::state__hl_out_delim = delim;
     }
-    return HC;
+    return ::state__HC;
 }
 
-static std::vector<int> hl_json(std::string s, int st) {
+static std::vector<int> highlight__hl_json(std::string s, int st) {
     int n = (int)((s).size());
-    HC.clear();
+    ::state__HC.clear();
     for (int k = 0; k < n; k++) {
-        HC.push_back(S_PLAIN);
+        ::state__HC.push_back(::state__S_PLAIN);
     }
     int depth = (st >> 4);
     int i = 0;
     while (i < n) {
         char c = s[i];
         if (c == '/' && (i + 1) < n && s[(i + 1)] == '/') {
-            paint_comment(s, i, n);
+            ::highlight__paint_comment(s, i, n);
             break;
         }
         if (c == '"') {
-            int e = hl_string(L_JSON, s, i, false);
-            int after = skip_ws(s, e);
+            int e = ::highlight__hl_string(::state__L_JSON, s, i, false);
+            int after = ::highlight__skip_ws(s, e);
             if (after < n && s[after] == ':') {
-                paint(i, e, S_VAR);
+                ::highlight__paint(i, e, ::state__S_VAR);
             }
             i = e;
             continue;
         }
-        if (is_digit_b(ubyte(s, i)) || c == '-') {
+        if (::highlight__is_digit_b(::nxtext__ubyte(s, i)) || c == '-') {
             int e = (i + 1);
-            while (e < n && (is_digit_b(ubyte(s, e)) || s[e] == '.' || s[e] == 'e' || s[e] == 'E' || s[e] == '+' || s[e] == '-')) {
+            while (e < n && (::highlight__is_digit_b(::nxtext__ubyte(s, e)) || s[e] == '.' || s[e] == 'e' || s[e] == 'E' || s[e] == '+' || s[e] == '-')) {
                 e = e + 1;
             }
-            paint(i, e, S_NUMBER);
+            ::highlight__paint(i, e, ::state__S_NUMBER);
             i = e;
             continue;
         }
-        if (is_word_b(ubyte(s, i))) {
-            int e = word_end(s, i);
+        if (::nxtext__is_word_b(::nxtext__ubyte(s, i))) {
+            int e = ::highlight__word_end(s, i);
             std::string w = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, i, (e - i));
-            paint(i, e, ((w == "true" || w == "false" || w == "null") ? (S_KEYWORD) : (S_INVALID)));
+            ::highlight__paint(i, e, ((w == "true" || w == "false" || w == "null") ? (::state__S_KEYWORD) : (::state__S_INVALID)));
             i = e;
             continue;
         }
         if (c == '{' || c == '[') {
-            HC[i] = bracket_color(depth);
+            ::state__HC[i] = ::highlight__bracket_color(depth);
             depth = depth + 1;
         } else if (c == '}' || c == ']') {
-            depth = imax((depth - 1), 0);
-            HC[i] = bracket_color(depth);
+            depth = ::draw__imax((depth - 1), 0);
+            ::state__HC[i] = ::highlight__bracket_color(depth);
         }
         i = i + 1;
     }
-    hl_out_state = (depth << 4);
-    return HC;
+    ::state__hl_out_state = (depth << 4);
+    return ::state__HC;
 }
 
-static int fence_lang(const std::string& tag) {
+static int highlight__fence_lang(const std::string& tag) {
     std::string t = ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(tag));
     if (t == "nexa" || t == "nxa") {
-        return L_NEXA;
+        return ::state__L_NEXA;
     }
     if (t == "cpp" || t == "c++" || t == "c" || t == "h" || t == "hpp") {
-        return L_CPP;
+        return ::state__L_CPP;
     }
     if (t == "json" || t == "jsonc") {
-        return L_JSON;
+        return ::state__L_JSON;
     }
     if (t == "sh" || t == "bash" || t == "bat" || t == "cmd" || t == "powershell" || t == "ps1" || t == "shell" || t == "console" || t == "make" || t == "makefile") {
-        return L_SHELL;
+        return ::state__L_SHELL;
     }
     if (t == "ini" || t == "toml" || t == "yaml" || t == "yml") {
-        return L_INI;
+        return ::state__L_INI;
     }
-    return L_PLAIN;
+    return ::state__L_PLAIN;
 }
 
-static std::vector<int> hl_md(std::string s, int st) {
+static std::vector<int> highlight__hl_md(std::string s, int st) {
     int n = (int)((s).size());
-    HC.clear();
+    ::state__HC.clear();
     for (int k = 0; k < n; k++) {
-        HC.push_back(S_TEXT);
+        ::state__HC.push_back(::state__S_TEXT);
     }
     std::string t = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(s);
     int mode = (st & 15);
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "```") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "~~~")) {
         int at = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(s, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, 3));
-        paint(0, n, C_MUTED);
-        if (mode == HM_FENCE) {
-            hl_out_state = 0;
+        ::highlight__paint(0, n, ::state__C_MUTED);
+        if (mode == ::state__HM_FENCE) {
+            ::state__hl_out_state = 0;
         } else {
-            paint((at + 3), n, S_STRING);
-            hl_out_state = (HM_FENCE | (fence_lang(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 3, -1)) << 4));
+            ::highlight__paint((at + 3), n, ::state__S_STRING);
+            ::state__hl_out_state = (::state__HM_FENCE | (::highlight__fence_lang(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 3, -1)) << 4));
         }
-        return HC;
+        return ::state__HC;
     }
-    if (mode == HM_FENCE) {
+    if (mode == ::state__HM_FENCE) {
         int fl = (st >> 4);
-        hl_out_state = st;
-        if (fl == L_PLAIN) {
-            paint(0, n, S_STRING);
-            return HC;
+        ::state__hl_out_state = st;
+        if (fl == ::state__L_PLAIN) {
+            ::highlight__paint(0, n, ::state__S_STRING);
+            return ::state__HC;
         }
-        std::vector<int> inner = hl_line(fl, s, 0, "");
-        hl_out_state = st;
+        std::vector<int> inner = ::highlight__hl_line(fl, s, 0, "");
+        ::state__hl_out_state = st;
         return inner;
     }
-    hl_out_state = 0;
-    int i = skip_ws(s, 0);
+    ::state__hl_out_state = 0;
+    int i = ::highlight__skip_ws(s, 0);
     if (i < n && s[i] == '#') {
-        paint(i, n, S_HEADING);
-        return HC;
+        ::highlight__paint(i, n, ::state__S_HEADING);
+        return ::state__HC;
     }
     if (i < n && s[i] == '>') {
-        HC[i] = S_COMMENT;
+        ::state__HC[i] = ::state__S_COMMENT;
         i = i + 1;
     }
     if (t == "---" || t == "***" || t == "___") {
-        paint(0, n, C_MUTED);
-        return HC;
+        ::highlight__paint(0, n, ::state__C_MUTED);
+        return ::state__HC;
     }
     if ((i + 1) < n && (s[i] == '-' || s[i] == '*' || s[i] == '+') && s[(i + 1)] == ' ') {
-        HC[i] = 0x6796E6;
+        ::state__HC[i] = 0x6796E6;
         i = i + 2;
     } else {
         int d = i;
-        while (d < n && is_digit_b(ubyte(s, d))) {
+        while (d < n && ::highlight__is_digit_b(::nxtext__ubyte(s, d))) {
             d = d + 1;
         }
         if (d > i && (d + 1) < n && (s[d] == '.' || s[d] == ')') && s[(d + 1)] == ' ') {
-            paint(i, (d + 1), 0x6796E6);
+            ::highlight__paint(i, (d + 1), 0x6796E6);
             i = (d + 2);
         }
     }
@@ -4724,15 +5029,15 @@ static std::vector<int> hl_md(std::string s, int st) {
             if (e < 0) {
                 e = (n - 1);
             }
-            paint(i, (e + 1), S_STRING);
+            ::highlight__paint(i, (e + 1), ::state__S_STRING);
             i = (e + 1);
             continue;
         }
         if ((c == '*' || c == '_') && (i + 1) < n && s[(i + 1)] == c) {
-            std::string close = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, i, 2);
-            int e = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, close, (i + 2));
+            std::string close_ = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, i, 2);
+            int e = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, close_, (i + 2));
             if (e > (i + 2)) {
-                paint(i, (e + 2), S_KEYWORD);
+                ::highlight__paint(i, (e + 2), ::state__S_KEYWORD);
                 i = (e + 2);
                 continue;
             }
@@ -4741,8 +5046,8 @@ static std::vector<int> hl_md(std::string s, int st) {
             int e = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, "](", i);
             int f = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, ")", (e + 2));
             if (e > i && f > e) {
-                paint(i, (e + 1), S_STRING);
-                paint((e + 1), (f + 1), S_LINK);
+                ::highlight__paint(i, (e + 1), ::state__S_STRING);
+                ::highlight__paint((e + 1), (f + 1), ::state__S_LINK);
                 i = (f + 1);
                 continue;
             }
@@ -4750,22 +5055,22 @@ static std::vector<int> hl_md(std::string s, int st) {
         if (c == '<' && ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, "http", i) == (i + 1)) {
             int e = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, ">", i);
             if (e > i) {
-                paint(i, (e + 1), S_LINK);
+                ::highlight__paint(i, (e + 1), ::state__S_LINK);
                 i = (e + 1);
                 continue;
             }
         }
         if (c == '|') {
-            HC[i] = C_MUTED;
+            ::state__HC[i] = ::state__C_MUTED;
         }
         i = i + 1;
     }
-    return HC;
+    return ::state__HC;
 }
 
-static void hl_value(std::string s, int a) {
+static void highlight__hl_value(std::string s, int a) {
     int n = (int)((s).size());
-    int i = skip_ws(s, a);
+    int i = ::highlight__skip_ws(s, a);
     if (i >= n) {
         return;
     }
@@ -4779,60 +5084,60 @@ static void hl_value(std::string s, int a) {
             }
             e = e + 1;
         }
-        paint(i, (e + 1), S_STRING);
+        ::highlight__paint(i, (e + 1), ::state__S_STRING);
         int after = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, "#", e);
         if (after > e) {
-            paint_comment(s, after, n);
+            ::highlight__paint_comment(s, after, n);
         }
         return;
     }
     if (rest == "true" || rest == "false" || rest == "yes" || rest == "no" || rest == "on" || rest == "off" || rest == "null") {
-        paint(i, n, S_KEYWORD);
+        ::highlight__paint(i, n, ::state__S_KEYWORD);
         return;
     }
-    if ((int)((rest).size()) > 0 && (is_digit_b(ubyte(rest, 0)) || rest[0] == '-')) {
+    if ((int)((rest).size()) > 0 && (::highlight__is_digit_b(::nxtext__ubyte(rest, 0)) || rest[0] == '-')) {
         bool ok = true;
         for (int k = 0; k < (int)((rest).size()); k++) {
-            int rb = ubyte(rest, k);
-            if (!(is_digit_b(rb) || rest[k] == '.' || rest[k] == '-' || rest[k] == '_' || rest[k] == 'e')) {
+            int rb = ::nxtext__ubyte(rest, k);
+            if (!(::highlight__is_digit_b(rb) || rest[k] == '.' || rest[k] == '-' || rest[k] == '_' || rest[k] == 'e')) {
                 ok = false;
             }
         }
         if (ok) {
-            paint(i, n, S_NUMBER);
+            ::highlight__paint(i, n, ::state__S_NUMBER);
             return;
         }
     }
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(rest, "[") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(rest, "{")) {
-        paint(i, n, S_PLAIN);
+        ::highlight__paint(i, n, ::state__S_PLAIN);
         return;
     }
-    paint(i, n, S_STRING);
+    ::highlight__paint(i, n, ::state__S_STRING);
 }
 
-static std::vector<int> hl_ini(std::string s) {
+static std::vector<int> highlight__hl_ini(std::string s) {
     int n = (int)((s).size());
-    HC.clear();
+    ::state__HC.clear();
     for (int k = 0; k < n; k++) {
-        HC.push_back(S_TEXT);
+        ::state__HC.push_back(::state__S_TEXT);
     }
-    hl_out_state = 0;
-    int i = skip_ws(s, 0);
+    ::state__hl_out_state = 0;
+    int i = ::highlight__skip_ws(s, 0);
     if (i >= n) {
-        return HC;
+        return ::state__HC;
     }
     char c = s[i];
     if (c == ';' || c == '#') {
-        paint_comment(s, i, n);
-        return HC;
+        ::highlight__paint_comment(s, i, n);
+        return ::state__HC;
     }
     if (c == '[') {
-        paint(i, n, S_KEYWORD);
-        return HC;
+        ::highlight__paint(i, n, ::state__S_KEYWORD);
+        return ::state__HC;
     }
     if (c == '-' && (i + 1) < n && s[(i + 1)] == ' ') {
-        HC[i] = S_PLAIN;
-        i = skip_ws(s, (i + 1));
+        ::state__HC[i] = ::state__S_PLAIN;
+        i = ::highlight__skip_ws(s, (i + 1));
     }
     int eq = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, "=", i);
     int colon = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, ":", i);
@@ -4841,41 +5146,41 @@ static std::vector<int> hl_ini(std::string s) {
         sep = colon;
     }
     if (sep > i) {
-        paint(i, sep, S_VAR);
-        hl_value(s, (sep + 1));
+        ::highlight__paint(i, sep, ::state__S_VAR);
+        ::highlight__hl_value(s, (sep + 1));
     } else {
-        hl_value(s, i);
+        ::highlight__hl_value(s, i);
     }
-    return HC;
+    return ::state__HC;
 }
 
-static std::vector<int> hl_shell(std::string s) {
+static std::vector<int> highlight__hl_shell(std::string s) {
     int n = (int)((s).size());
-    HC.clear();
+    ::state__HC.clear();
     for (int k = 0; k < n; k++) {
-        HC.push_back(S_TEXT);
+        ::state__HC.push_back(::state__S_TEXT);
     }
-    hl_out_state = 0;
-    int i = skip_ws(s, 0);
+    ::state__hl_out_state = 0;
+    int i = ::highlight__skip_ws(s, 0);
     std::string low = ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, i, -1));
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(low, "rem ") || low == "rem" || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(low, "::") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(low, "@rem")) {
-        paint_comment(s, i, n);
-        return HC;
+        ::highlight__paint_comment(s, i, n);
+        return ::state__HC;
     }
     if (i == 0 && n > 0 && s[0] == ':') {
-        paint(0, n, S_FUNC);
-        return HC;
+        ::highlight__paint(0, n, ::state__S_FUNC);
+        return ::state__HC;
     }
     int tcolon = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(s, ":");
-    if (i == 0 && tcolon > 0 && !(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(s, "=")) && ((tcolon + 1) >= n || s[(tcolon + 1)] != '=') && !(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(s, " :")) && is_word_b(ubyte(s, 0))) {
-        paint(0, tcolon, S_FUNC);
+    if (i == 0 && tcolon > 0 && !(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(s, "=")) && ((tcolon + 1) >= n || s[(tcolon + 1)] != '=') && !(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(s, " :")) && ::nxtext__is_word_b(::nxtext__ubyte(s, 0))) {
+        ::highlight__paint(0, tcolon, ::state__S_FUNC);
         i = (tcolon + 1);
     }
     bool first_word = true;
     while (i < n) {
         char c = s[i];
-        if (c == '#' && (i == 0 || is_space_b(ubyte(s, (i - 1))))) {
-            paint_comment(s, i, n);
+        if (c == '#' && (i == 0 || ::nxtext__is_space_b(::nxtext__ubyte(s, (i - 1))))) {
+            ::highlight__paint_comment(s, i, n);
             break;
         }
         if (c == '"' || c == '\'') {
@@ -4886,21 +5191,21 @@ static std::vector<int> hl_shell(std::string s) {
                 }
                 e = e + 1;
             }
-            paint(i, (e + 1), S_STRING);
+            ::highlight__paint(i, (e + 1), ::state__S_STRING);
             if (c == '"') {
                 int k = (i + 1);
                 while (k < e && k < n) {
                     if (s[k] == '$' || s[k] == '%') {
                         int ve = (k + 1);
                         if (ve < n && (s[ve] == '{' || s[ve] == '(')) {
-                            std::string close = ((s[ve] == '{') ? (std::string("}")) : (std::string(")")));
-                            ve = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, close, ve);
+                            std::string close_ = ((s[ve] == '{') ? (std::string("}")) : (std::string(")")));
+                            ve = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, close_, ve);
                             if (ve < 0) {
                                 ve = e;
                             }
                             ve = ve + 1;
                         } else {
-                            while (ve < n && is_word_b(ubyte(s, ve))) {
+                            while (ve < n && ::nxtext__is_word_b(::nxtext__ubyte(s, ve))) {
                                 ve = ve + 1;
                             }
                             if (s[k] == '%' && ve < n && s[ve] == '%') {
@@ -4908,7 +5213,7 @@ static std::vector<int> hl_shell(std::string s) {
                             }
                         }
                         if (ve > (k + 1)) {
-                            paint(k, imin(ve, e), S_VAR);
+                            ::highlight__paint(k, ::draw__imin(ve, e), ::state__S_VAR);
                         }
                         k = ve;
                     } else {
@@ -4923,14 +5228,14 @@ static std::vector<int> hl_shell(std::string s) {
         if (c == '$' || c == '%') {
             int ve = (i + 1);
             if (ve < n && (s[ve] == '{' || s[ve] == '(')) {
-                std::string close = ((s[ve] == '{') ? (std::string("}")) : (std::string(")")));
-                ve = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, close, ve);
+                std::string close_ = ((s[ve] == '{') ? (std::string("}")) : (std::string(")")));
+                ve = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, close_, ve);
                 if (ve < 0) {
                     ve = (n - 1);
                 }
                 ve = ve + 1;
             } else {
-                while (ve < n && (is_word_b(ubyte(s, ve)) || s[ve] == '~')) {
+                while (ve < n && (::nxtext__is_word_b(::nxtext__ubyte(s, ve)) || s[ve] == '~')) {
                     ve = ve + 1;
                 }
                 if (c == '%' && ve < n && s[ve] == '%') {
@@ -4938,39 +5243,39 @@ static std::vector<int> hl_shell(std::string s) {
                 }
             }
             if (ve > (i + 1)) {
-                paint(i, ve, S_VAR);
+                ::highlight__paint(i, ve, ::state__S_VAR);
                 i = ve;
                 continue;
             }
         }
-        if (c == '-' && (i + 1) < n && (is_word_b(ubyte(s, (i + 1))) || s[(i + 1)] == '-') && (i == 0 || is_space_b(ubyte(s, (i - 1))))) {
+        if (c == '-' && (i + 1) < n && (::nxtext__is_word_b(::nxtext__ubyte(s, (i + 1))) || s[(i + 1)] == '-') && (i == 0 || ::nxtext__is_space_b(::nxtext__ubyte(s, (i - 1))))) {
             int e = (i + 1);
-            while (e < n && (is_word_b(ubyte(s, e)) || s[e] == '-')) {
+            while (e < n && (::nxtext__is_word_b(::nxtext__ubyte(s, e)) || s[e] == '-')) {
                 e = e + 1;
             }
-            paint(i, e, S_KEYWORD);
+            ::highlight__paint(i, e, ::state__S_KEYWORD);
             i = e;
             continue;
         }
-        if (is_digit_b(ubyte(s, i)) && !(is_word_at(s, (i - 1)))) {
-            int e = word_end(s, i);
-            paint(i, e, S_NUMBER);
+        if (::highlight__is_digit_b(::nxtext__ubyte(s, i)) && !(::nxtext__is_word_at(s, (i - 1)))) {
+            int e = ::highlight__word_end(s, i);
+            ::highlight__paint(i, e, ::state__S_NUMBER);
             i = e;
             continue;
         }
-        if (is_word_b(ubyte(s, i)) || c == '@') {
+        if (::nxtext__is_word_b(::nxtext__ubyte(s, i)) || c == '@') {
             int st2 = i;
             if (c == '@') {
                 i = i + 1;
             }
-            int e = word_end(s, i);
+            int e = ::highlight__word_end(s, i);
             std::string w = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, i, (e - i));
             std::string lw = ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(w);
-            if (((sh_words).find(lw) != (sh_words).end())) {
-                int k = sh_words[lw];
-                paint(st2, e, ((k == 1) ? (S_CONTROL) : (S_KEYWORD)));
+            if (((::state__sh_words).find(lw) != (::state__sh_words).end())) {
+                int k = ::state__sh_words[lw];
+                ::highlight__paint(st2, e, ((k == 1) ? (::state__S_CONTROL) : (::state__S_KEYWORD)));
             } else if (first_word && (e - st2) > 0) {
-                paint(st2, e, S_FUNC);
+                ::highlight__paint(st2, e, ::state__S_FUNC);
             }
             first_word = false;
             i = e;
@@ -4981,378 +5286,378 @@ static std::vector<int> hl_shell(std::string s) {
         }
         i = i + 1;
     }
-    return HC;
+    return ::state__HC;
 }
 
-static void draw_badge(int x, int y, int h, const std::string& name) {
-    std::string b = lang_badge(name);
+static void highlight__draw_badge(int x, int y, int h, const std::string& name) {
+    std::string b = ::highlight__lang_badge(name);
     if ((int)((b).size()) == 0) {
-        draw_glyph("file", x, (y + ((h - px(14)) / 2)), px(14), 0x8B8B8B);
+        ::draw__draw_glyph("file", x, (y + ((h - ::draw__px(14)) / 2)), ::draw__px(14), 0x8B8B8B);
         return;
     }
-    int w = tw(b, UI_SMALL);
-    txt_v((x + ((px(14) - w) / 2)), y, h, b, lang_color(name), UI_SMALL);
+    int w = ::draw__tw(b, ::state__UI_SMALL);
+    ::draw__txt_v((x + ((::draw__px(14) - w) / 2)), y, h, b, ::highlight__lang_color(name), ::state__UI_SMALL);
 }
 
-static void doc_store() {
-    if (active < 0 || active >= (int)((bufs).size())) {
+static void buffer__doc_store() {
+    if (::state__active < 0 || ::state__active >= (int)((::state__bufs).size())) {
         return;
     }
-    bufs[active].lines = L;
-    bufs[active].cy = cy;
-    bufs[active].cx = cx;
-    bufs[active].ay = ay;
-    bufs[active].ax = ax;
-    bufs[active].want = want;
-    bufs[active].sy = sy;
-    bufs[active].sx = sx;
-    bufs[active].ver = doc_ver;
-    bufs[active].saved = doc_saved;
-    bufs[active].lang = doc_lang;
-    bufs[active].path = doc_path;
-    bufs[active].crlf = doc_crlf;
-    bufs[active].undo = U;
-    bufs[active].redo = R;
-    bufs[active].hl_st = hl_st;
-    bufs[active].hl_dl = hl_dl;
-    bufs[active].hl_valid = hl_valid;
+    ::state__bufs[::state__active].lines = ::state__L;
+    ::state__bufs[::state__active].cy = ::state__cy;
+    ::state__bufs[::state__active].cx = ::state__cx;
+    ::state__bufs[::state__active].ay = ::state__ay;
+    ::state__bufs[::state__active].ax = ::state__ax;
+    ::state__bufs[::state__active].want = ::state__want;
+    ::state__bufs[::state__active].sy = ::state__sy;
+    ::state__bufs[::state__active].sx = ::state__sx;
+    ::state__bufs[::state__active].ver = ::state__doc_ver;
+    ::state__bufs[::state__active].saved = ::state__doc_saved;
+    ::state__bufs[::state__active].lang = ::state__doc_lang;
+    ::state__bufs[::state__active].path = ::state__doc_path;
+    ::state__bufs[::state__active].crlf = ::state__doc_crlf;
+    ::state__bufs[::state__active].undo = ::state__U;
+    ::state__bufs[::state__active].redo = ::state__R;
+    ::state__bufs[::state__active].hl_st = ::state__hl_st;
+    ::state__bufs[::state__active].hl_dl = ::state__hl_dl;
+    ::state__bufs[::state__active].hl_valid = ::state__hl_valid;
 }
 
-static void doc_load(int i) {
-    active = i;
-    if (i < 0 || i >= (int)((bufs).size())) {
-        active = -1;
-        L = std::vector<std::string>{""};
-        cy = 0;
-        cx = 0;
-        ay = 0;
-        ax = 0;
-        doc_path = "";
-        doc_lang = 0;
-        U = std::vector<Snap>{};
-        R = std::vector<Snap>{};
-        hl_st = std::vector<int>{};
-        hl_dl = std::vector<std::string>{};
-        hl_valid = 0;
+static void buffer__doc_load(int i) {
+    ::state__active = i;
+    if (i < 0 || i >= (int)((::state__bufs).size())) {
+        ::state__active = -1;
+        ::state__L = std::vector<std::string>{""};
+        ::state__cy = 0;
+        ::state__cx = 0;
+        ::state__ay = 0;
+        ::state__ax = 0;
+        ::state__doc_path = "";
+        ::state__doc_lang = 0;
+        ::state__U = std::vector<state__Snap>{};
+        ::state__R = std::vector<state__Snap>{};
+        ::state__hl_st = std::vector<int>{};
+        ::state__hl_dl = std::vector<std::string>{};
+        ::state__hl_valid = 0;
         return;
     }
-    L = bufs[i].lines;
-    cy = bufs[i].cy;
-    cx = bufs[i].cx;
-    ay = bufs[i].ay;
-    ax = bufs[i].ax;
-    want = bufs[i].want;
-    sy = bufs[i].sy;
-    sx = bufs[i].sx;
-    doc_ver = bufs[i].ver;
-    doc_saved = bufs[i].saved;
-    doc_lang = bufs[i].lang;
-    doc_path = bufs[i].path;
-    doc_crlf = bufs[i].crlf;
-    U = bufs[i].undo;
-    R = bufs[i].redo;
-    hl_st = bufs[i].hl_st;
-    hl_dl = bufs[i].hl_dl;
-    hl_valid = bufs[i].hl_valid;
-    if ((int)((L).size()) == 0) {
-        L = std::vector<std::string>{""};
+    ::state__L = ::state__bufs[i].lines;
+    ::state__cy = ::state__bufs[i].cy;
+    ::state__cx = ::state__bufs[i].cx;
+    ::state__ay = ::state__bufs[i].ay;
+    ::state__ax = ::state__bufs[i].ax;
+    ::state__want = ::state__bufs[i].want;
+    ::state__sy = ::state__bufs[i].sy;
+    ::state__sx = ::state__bufs[i].sx;
+    ::state__doc_ver = ::state__bufs[i].ver;
+    ::state__doc_saved = ::state__bufs[i].saved;
+    ::state__doc_lang = ::state__bufs[i].lang;
+    ::state__doc_path = ::state__bufs[i].path;
+    ::state__doc_crlf = ::state__bufs[i].crlf;
+    ::state__U = ::state__bufs[i].undo;
+    ::state__R = ::state__bufs[i].redo;
+    ::state__hl_st = ::state__bufs[i].hl_st;
+    ::state__hl_dl = ::state__bufs[i].hl_dl;
+    ::state__hl_valid = ::state__bufs[i].hl_valid;
+    if ((int)((::state__L).size()) == 0) {
+        ::state__L = std::vector<std::string>{""};
     }
 }
 
-static void switch_to(int i) {
-    if (i == active) {
+static void buffer__switch_to(int i) {
+    if (i == ::state__active) {
         return;
     }
-    page_scroll = 0;
-    doc_store();
-    doc_load(i);
-    comp_open = false;
-    last_edit_kind = "";
-    find_hits_ver = -1;
-    check_due = (now_ms + 300);
-    frame_dirty = true;
-    update_title();
+    ::state__page_scroll = 0;
+    ::buffer__doc_store();
+    ::buffer__doc_load(i);
+    ::state__comp_open = false;
+    ::state__last_edit_kind = "";
+    ::state__find_hits_ver = -1;
+    ::state__check_due = (::state__now_ms + 300);
+    ::state__frame_dirty = true;
+    ::app__update_title();
 }
 
-static int active_kind() {
-    if (active < 0) {
+static int buffer__active_kind() {
+    if (::state__active < 0) {
         return -1;
     }
-    return bufs[active].kind;
+    return ::state__bufs[::state__active].kind;
 }
 
-static bool is_file_tab() {
-    return (active >= 0 && bufs[active].kind == 0);
+static bool buffer__is_file_tab() {
+    return (::state__active >= 0 && ::state__bufs[::state__active].kind == 0);
 }
 
-static bool buf_dirty(int i) {
-    if (i == active) {
-        return (doc_ver != doc_saved);
+static bool buffer__buf_dirty(int i) {
+    if (i == ::state__active) {
+        return (::state__doc_ver != ::state__doc_saved);
     }
-    return (bufs[i].ver != bufs[i].saved);
+    return (::state__bufs[i].ver != ::state__bufs[i].saved);
 }
 
-static bool any_dirty() {
-    for (int i = 0; i < (int)((bufs).size()); i++) {
-        if (buf_dirty(i)) {
+static bool buffer__any_dirty() {
+    for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+        if (::buffer__buf_dirty(i)) {
             return true;
         }
     }
     return false;
 }
 
-static bool same_path(const std::string& a, const std::string& b) {
+static bool buffer__same_path(const std::string& a, const std::string& b) {
     return (([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(a, "/", "\\")) == ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(b, "/", "\\")));
 }
 
-static int find_buf(const std::string& path) {
-    for (int i = 0; i < (int)((bufs).size()); i++) {
-        std::string p = bufs[i].path;
-        if (bufs[i].kind == 0 && (int)((p).size()) > 0 && same_path(p, path)) {
+static int buffer__find_buf(const std::string& path) {
+    for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+        std::string p = __nexa_text(::state__bufs[i].path);
+        if (::state__bufs[i].kind == 0 && (int)((p).size()) > 0 && ::buffer__same_path(p, path)) {
             return i;
         }
     }
     return -1;
 }
 
-static Buf new_buf(std::string path, std::string name, int kind) {
-    Buf b{};
+static state__Buf buffer__new_buf(std::string path, std::string name, int kind) {
+    state__Buf b{};
     b.path = path;
     b.name = name;
     b.kind = kind;
     b.lines = std::vector<std::string>{""};
-    b.lang = lang_for(name);
+    b.lang = ::highlight__lang_for(name);
     b.want = -1;
-    b.ver = ver_seq;
-    b.saved = ver_seq;
-    ver_seq = ver_seq + 1;
+    b.ver = ::state__ver_seq;
+    b.saved = ::state__ver_seq;
+    ::state__ver_seq = ::state__ver_seq + 1;
     return b;
 }
 
-static bool open_file(std::string path, bool preview) {
-    int at = find_buf(path);
+static bool buffer__open_file(std::string path, bool preview) {
+    int at = ::buffer__find_buf(path);
     if (at >= 0) {
         if (!(preview)) {
-            bufs[at].preview = false;
+            ::state__bufs[at].preview = false;
         }
-        switch_to(at);
+        ::buffer__switch_to(at);
         return true;
     }
     if (!(__nexa_file_isfile((path).c_str()))) {
-        log_out((std::string("Cannot open ") + path));
+        ::panel__log_out((std::string("Cannot open ") + path));
         return false;
     }
-    int size = __nexa_file_size((path).c_str());
+    int size = __nexa_file_size64((path).c_str());
     if (size > (16 * 1024 * 1024)) {
-        log_out((std::string("Not opening ") + path + ": larger than 16 MB"));
+        ::panel__log_out((std::string("Not opening ") + path + ": larger than 16 MB"));
         return false;
     }
     std::string text = __nexa_file_read((path).c_str());
     if (([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(text, 0, 8192), std::string("\x00", 1))) {
-        log_out((std::string("Not opening ") + __nexa_file_basename((path).c_str()) + ": it looks like a binary file"));
+        ::panel__log_out((std::string("Not opening ") + __nexa_file_basename((path).c_str()) + ": it looks like a binary file"));
         return false;
     }
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(text, "\xEF\xBB\xBF")) {
         text = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(text, 3, -1);
     }
-    Buf b = new_buf(path, __nexa_file_basename((path).c_str()), 0);
+    state__Buf b = ::buffer__new_buf(path, __nexa_file_basename((path).c_str()), 0);
     b.crlf = ([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(text, "\r\n");
-    b.lines = split_lines(text);
+    b.lines = ::nxtext__split_lines(text);
     b.mtime = nx_mtime(path.c_str());
     b.preview = preview;
-    doc_store();
+    ::buffer__doc_store();
     int slot = -1;
     if (preview) {
-        for (int i = 0; i < (int)((bufs).size()); i++) {
-            if (bufs[i].preview && !(buf_dirty(i))) {
+        for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+            if (::state__bufs[i].preview && !(::buffer__buf_dirty(i))) {
                 slot = i;
             }
         }
     }
     if (slot >= 0) {
-        bufs[slot] = b;
-        active = -1;
-        doc_load(slot);
+        ::state__bufs[slot] = b;
+        ::state__active = -1;
+        ::buffer__doc_load(slot);
     } else {
-        int at2 = (active + 1);
+        int at2 = (::state__active + 1);
         if (at2 <= 0) {
-            at2 = (int)((bufs).size());
+            at2 = (int)((::state__bufs).size());
         }
-        ([&](){ auto& __nexa_v = bufs; int __nexa_i = at2; int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, b); })();
-        active = -1;
-        doc_load(at2);
+        ([&](){ auto& __nexa_v = ::state__bufs; int __nexa_i = at2; int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, b); })();
+        ::state__active = -1;
+        ::buffer__doc_load(at2);
     }
-    remember_files();
-    after_switch();
+    ::app__remember_files();
+    ::buffer__after_switch();
     return true;
 }
 
-static void after_switch() {
-    page_scroll = 0;
-    comp_open = false;
-    find_hits_ver = -1;
-    last_edit_kind = "";
-    check_due = (now_ms + 200);
-    frame_dirty = true;
-    reveal(true);
-    update_title();
+static void buffer__after_switch() {
+    ::state__page_scroll = 0;
+    ::state__comp_open = false;
+    ::state__find_hits_ver = -1;
+    ::state__last_edit_kind = "";
+    ::state__check_due = (::state__now_ms + 200);
+    ::state__frame_dirty = true;
+    ::editor__reveal(true);
+    ::app__update_title();
 }
 
-static void new_untitled() {
+static void buffer__new_untitled() {
     int n = 1;
     std::string name = "Untitled-1";
     bool taken = true;
     while (taken) {
         taken = false;
         name = (std::string("Untitled-") + std::to_string(n));
-        for (int i = 0; i < (int)((bufs).size()); i++) {
-            if (bufs[i].name == name) {
+        for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+            if (::state__bufs[i].name == name) {
                 taken = true;
             }
         }
         n = n + 1;
     }
-    Buf b = new_buf("", name, 0);
-    b.lang = L_NEXA;
-    doc_store();
-    int at = (active + 1);
-    ([&](){ auto& __nexa_v = bufs; int __nexa_i = at; int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, b); })();
-    active = -1;
-    doc_load(at);
-    after_switch();
-    focus = F_EDITOR;
+    state__Buf b = ::buffer__new_buf("", name, 0);
+    b.lang = ::state__L_NEXA;
+    ::buffer__doc_store();
+    int at = (::state__active + 1);
+    ([&](){ auto& __nexa_v = ::state__bufs; int __nexa_i = at; int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, b); })();
+    ::state__active = -1;
+    ::buffer__doc_load(at);
+    ::buffer__after_switch();
+    ::state__focus = ::state__F_EDITOR;
 }
 
-static int find_name(const std::string& name) {
-    for (int i = 0; i < (int)((bufs).size()); i++) {
-        if (bufs[i].name == name) {
+static int buffer__find_name(const std::string& name) {
+    for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+        if (::state__bufs[i].name == name) {
             return i;
         }
     }
     return -1;
 }
 
-static void open_special(int kind) {
-    for (int i = 0; i < (int)((bufs).size()); i++) {
-        if (bufs[i].kind == kind) {
-            switch_to(i);
+static void buffer__open_special(int kind) {
+    for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+        if (::state__bufs[i].kind == kind) {
+            ::buffer__switch_to(i);
             return;
         }
     }
-    Buf b = new_buf("", ((kind == 1) ? (std::string("Settings")) : (std::string("Welcome"))), kind);
-    doc_store();
-    bufs.push_back(b);
-    active = -1;
-    doc_load(((int)((bufs).size()) - 1));
-    after_switch();
+    state__Buf b = ::buffer__new_buf("", ((kind == 1) ? (std::string("Settings")) : (std::string("Welcome"))), kind);
+    ::buffer__doc_store();
+    ::state__bufs.push_back(b);
+    ::state__active = -1;
+    ::buffer__doc_load(((int)((::state__bufs).size()) - 1));
+    ::buffer__after_switch();
 }
 
-static std::string text_of_doc() {
-    std::string nl = ((doc_crlf) ? (std::string("\r\n")) : (std::string("\n")));
-    return ([&](){ const auto& __nexa_v = L; std::string __nexa_s = nl; std::string __nexa_o; for (size_t __nexa_i = 0; __nexa_i < __nexa_v.size(); __nexa_i++) { if (__nexa_i) __nexa_o += __nexa_s; __nexa_o += __nexa_v[__nexa_i]; } return __nexa_o; })();
+static std::string buffer__text_of_doc() {
+    std::string nl = ((::state__doc_crlf) ? (std::string("\r\n")) : (std::string("\n")));
+    return ([&](){ const auto& __nexa_v = ::state__L; std::string __nexa_s = nl; std::string __nexa_o; for (size_t __nexa_i = 0; __nexa_i < __nexa_v.size(); __nexa_i++) { if (__nexa_i) __nexa_o += __nexa_s; __nexa_o += __nexa_v[__nexa_i]; } return __nexa_o; })();
 }
 
-static bool save_doc() {
-    if (!(is_file_tab())) {
+static bool buffer__save_doc() {
+    if (!(::buffer__is_file_tab())) {
         return false;
     }
-    if ((int)((doc_path).size()) == 0) {
-        return save_doc_as();
+    if ((int)((::state__doc_path).size()) == 0) {
+        return ::buffer__save_doc_as();
     }
-    if (!(([&](const std::string& __nexa_fc) -> int { return __nexa_file_write((doc_path).c_str(), __nexa_fc.data(), __nexa_fc.size(), 0); })(text_of_doc()))) {
-        nx_message((std::string("Could not save ") + doc_path + ".").c_str());
+    if (!(([&](const std::string& __nexa_fc) -> int { return __nexa_file_write((::state__doc_path).c_str(), __nexa_fc.data(), __nexa_fc.size(), 0); })(::buffer__text_of_doc()))) {
+        nx_message((std::string("Could not save ") + ::state__doc_path + ".").c_str());
         return false;
     }
-    doc_saved = doc_ver;
-    bufs[active].preview = false;
-    bufs[active].mtime = nx_mtime(doc_path.c_str());
-    doc_store();
-    check_due = now_ms;
-    frame_dirty = true;
+    ::state__doc_saved = ::state__doc_ver;
+    ::state__bufs[::state__active].preview = false;
+    ::state__bufs[::state__active].mtime = nx_mtime(::state__doc_path.c_str());
+    ::buffer__doc_store();
+    ::state__check_due = ::state__now_ms;
+    ::state__frame_dirty = true;
     return true;
 }
 
-static bool save_doc_as() {
-    if (!(is_file_tab())) {
+static bool buffer__save_doc_as() {
+    if (!(::buffer__is_file_tab())) {
         return false;
     }
-    std::string name = bufs[active].name;
-    if ((int)((doc_path).size()) > 0) {
-        name = __nexa_file_basename((doc_path).c_str());
+    std::string name = ::state__bufs[::state__active].name;
+    if ((int)((::state__doc_path).size()) > 0) {
+        name = __nexa_file_basename((::state__doc_path).c_str());
     }
-    std::string p = nx_save_file(name.c_str());
+    std::string p = __nexa_text(nx_save_file(name.c_str()));
     if ((int)((p).size()) == 0) {
         return false;
     }
-    doc_path = p;
-    bufs[active].path = p;
-    bufs[active].name = __nexa_file_basename((p).c_str());
-    doc_lang = lang_for(p);
-    hl_valid = 0;
-    bool ok = save_doc();
-    refresh_tree();
-    remember_files();
-    update_title();
+    ::state__doc_path = p;
+    ::state__bufs[::state__active].path = p;
+    ::state__bufs[::state__active].name = __nexa_file_basename((p).c_str());
+    ::state__doc_lang = ::highlight__lang_for(p);
+    ::state__hl_valid = 0;
+    bool ok = ::buffer__save_doc();
+    ::workspace__refresh_tree();
+    ::app__remember_files();
+    ::app__update_title();
     return ok;
 }
 
-static void save_all() {
-    int keep = active;
-    for (int i = 0; i < (int)((bufs).size()); i++) {
-        if (bufs[i].kind == 0 && buf_dirty(i)) {
-            switch_to(i);
-            save_doc();
+static void buffer__save_all() {
+    int keep = ::state__active;
+    for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+        if (::state__bufs[i].kind == 0 && ::buffer__buf_dirty(i)) {
+            ::buffer__switch_to(i);
+            ::buffer__save_doc();
         }
     }
-    switch_to(keep);
+    ::buffer__switch_to(keep);
 }
 
-static bool close_tab(int i) {
-    if (i < 0 || i >= (int)((bufs).size())) {
+static bool buffer__close_tab(int i) {
+    if (i < 0 || i >= (int)((::state__bufs).size())) {
         return false;
     }
-    if (buf_dirty(i)) {
-        switch_to(i);
-        int r = nx_ask_save(bufs[i].name.c_str());
+    if (::buffer__buf_dirty(i)) {
+        ::buffer__switch_to(i);
+        int r = nx_ask_save(::state__bufs[i].name.c_str());
         if (r == 0) {
             return false;
         }
-        if (r == 1 && !(save_doc())) {
+        if (r == 1 && !(::buffer__save_doc())) {
             return false;
         }
     }
-    doc_store();
-    int was = active;
-    ([&](){ auto& __nexa_v = bufs; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+    ::buffer__doc_store();
+    int was = ::state__active;
+    ([&](){ auto& __nexa_v = ::state__bufs; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
     int next = was;
     if (i < was) {
         next = (was - 1);
     }
     if (i == was) {
-        next = imin(i, ((int)((bufs).size()) - 1));
+        next = ::draw__imin(i, ((int)((::state__bufs).size()) - 1));
     }
-    active = -1;
-    doc_load(next);
-    remember_files();
-    after_switch();
+    ::state__active = -1;
+    ::buffer__doc_load(next);
+    ::app__remember_files();
+    ::buffer__after_switch();
     return true;
 }
 
-static bool close_all() {
-    while ((int)((bufs).size()) > 0) {
-        if (!(close_tab(((int)((bufs).size()) - 1)))) {
+static bool buffer__close_all() {
+    while ((int)((::state__bufs).size()) > 0) {
+        if (!(::buffer__close_tab(((int)((::state__bufs).size()) - 1)))) {
             return false;
         }
     }
     return true;
 }
 
-static void close_others(int keep) {
-    std::string target = bufs[keep].name;
-    int i = ((int)((bufs).size()) - 1);
+static void buffer__close_others(int keep) {
+    std::string target = ::state__bufs[keep].name;
+    int i = ((int)((::state__bufs).size()) - 1);
     while (i >= 0) {
-        if (bufs[i].name != target) {
-            if (!(close_tab(i))) {
+        if (::state__bufs[i].name != target) {
+            if (!(::buffer__close_tab(i))) {
                 return;
             }
         }
@@ -5360,389 +5665,389 @@ static void close_others(int keep) {
     }
 }
 
-static void check_disk_changes() {
-    doc_store();
-    for (int i = 0; i < (int)((bufs).size()); i++) {
-        std::string p = bufs[i].path;
-        if (bufs[i].kind != 0 || (int)((p).size()) == 0 || buf_dirty(i)) {
+static void buffer__check_disk_changes() {
+    ::buffer__doc_store();
+    for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+        std::string p = __nexa_text(::state__bufs[i].path);
+        if (::state__bufs[i].kind != 0 || (int)((p).size()) == 0 || ::buffer__buf_dirty(i)) {
             continue;
         }
         long long m = nx_mtime(p.c_str());
-        if (m == 0 || m == bufs[i].mtime) {
+        if (m == 0 || m == ::state__bufs[i].mtime) {
             continue;
         }
         std::string text = __nexa_file_read((p).c_str());
         if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(text, "\xEF\xBB\xBF")) {
             text = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(text, 3, -1);
         }
-        bufs[i].lines = split_lines(text);
-        bufs[i].mtime = m;
-        bufs[i].hl_valid = 0;
-        bufs[i].undo = std::vector<Snap>{};
-        bufs[i].redo = std::vector<Snap>{};
-        int nl = (int)((bufs[i].lines).size());
-        bufs[i].cy = imin(bufs[i].cy, (nl - 1));
-        bufs[i].ay = bufs[i].cy;
-        bufs[i].cx = 0;
-        bufs[i].ax = 0;
+        ::state__bufs[i].lines = ::nxtext__split_lines(text);
+        ::state__bufs[i].mtime = m;
+        ::state__bufs[i].hl_valid = 0;
+        ::state__bufs[i].undo = std::vector<state__Snap>{};
+        ::state__bufs[i].redo = std::vector<state__Snap>{};
+        int nl = (int)((::state__bufs[i].lines).size());
+        ::state__bufs[i].cy = ::draw__imin(::state__bufs[i].cy, (nl - 1));
+        ::state__bufs[i].ay = ::state__bufs[i].cy;
+        ::state__bufs[i].cx = 0;
+        ::state__bufs[i].ax = 0;
     }
-    int keep = active;
-    active = -1;
-    doc_load(keep);
-    frame_dirty = true;
+    int keep = ::state__active;
+    ::state__active = -1;
+    ::buffer__doc_load(keep);
+    ::state__frame_dirty = true;
 }
 
-static bool has_sel() {
-    return (ay != cy || ax != cx);
+static bool buffer__has_sel() {
+    return (::state__ay != ::state__cy || ::state__ax != ::state__cx);
 }
 
-static void sel_bounds() {
-    if (ay < cy || (ay == cy && ax <= cx)) {
-        sel_y1 = ay;
-        sel_x1 = ax;
-        sel_y2 = cy;
-        sel_x2 = cx;
+static void buffer__sel_bounds() {
+    if (::state__ay < ::state__cy || (::state__ay == ::state__cy && ::state__ax <= ::state__cx)) {
+        ::state__sel_y1 = ::state__ay;
+        ::state__sel_x1 = ::state__ax;
+        ::state__sel_y2 = ::state__cy;
+        ::state__sel_x2 = ::state__cx;
     } else {
-        sel_y1 = cy;
-        sel_x1 = cx;
-        sel_y2 = ay;
-        sel_x2 = ax;
+        ::state__sel_y1 = ::state__cy;
+        ::state__sel_x1 = ::state__cx;
+        ::state__sel_y2 = ::state__ay;
+        ::state__sel_x2 = ::state__ax;
     }
 }
 
-static std::string get_text(int y1, int x1, int y2, int x2) {
-    if (y1 == y2) {
-        return ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(L[y1], x1, (x2 - x1));
+static std::string buffer__get_text(int y1_, int x1, int y2, int x2) {
+    if (y1_ == y2) {
+        return ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(::state__L[y1_], x1, (x2 - x1));
     }
-    std::string out = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(L[y1], x1, -1);
-    int y = (y1 + 1);
+    std::string out = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(::state__L[y1_], x1, -1);
+    int y = (y1_ + 1);
     while (y < y2) {
-        out += (std::string("\n") + L[y]);
+        out += (std::string("\n") + ::state__L[y]);
         y = y + 1;
     }
-    out += (std::string("\n") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(L[y2], 0, x2));
+    out += (std::string("\n") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(::state__L[y2], 0, x2));
     return out;
 }
 
-static std::string sel_text() {
-    if (!(has_sel())) {
+static std::string buffer__sel_text() {
+    if (!(::buffer__has_sel())) {
         return "";
     }
-    sel_bounds();
-    return get_text(sel_y1, sel_x1, sel_y2, sel_x2);
+    ::buffer__sel_bounds();
+    return ::buffer__get_text(::state__sel_y1, ::state__sel_x1, ::state__sel_y2, ::state__sel_x2);
 }
 
-static void clamp_cursor() {
-    cy = clamp(cy, 0, ((int)((L).size()) - 1));
-    cx = clamp(cx, 0, (int)((L[cy]).size()));
-    ay = clamp(ay, 0, ((int)((L).size()) - 1));
-    ax = clamp(ax, 0, (int)((L[ay]).size()));
+static void buffer__clamp_cursor() {
+    ::state__cy = ::draw__clamp(::state__cy, 0, ((int)((::state__L).size()) - 1));
+    ::state__cx = ::draw__clamp(::state__cx, 0, (int)((::state__L[::state__cy]).size()));
+    ::state__ay = ::draw__clamp(::state__ay, 0, ((int)((::state__L).size()) - 1));
+    ::state__ax = ::draw__clamp(::state__ax, 0, (int)((::state__L[::state__ay]).size()));
 }
 
-static void set_cursor(int y, int x, bool extend) {
-    cy = clamp(y, 0, ((int)((L).size()) - 1));
-    cx = clamp(x, 0, (int)((L[cy]).size()));
+static void buffer__set_cursor(int y, int x, bool extend) {
+    ::state__cy = ::draw__clamp(y, 0, ((int)((::state__L).size()) - 1));
+    ::state__cx = ::draw__clamp(x, 0, (int)((::state__L[::state__cy]).size()));
     if (!(extend)) {
-        ay = cy;
-        ax = cx;
+        ::state__ay = ::state__cy;
+        ::state__ax = ::state__cx;
     }
-    blink_ms = now_ms;
-    frame_dirty = true;
+    ::state__blink_ms = ::state__now_ms;
+    ::state__frame_dirty = true;
 }
 
-static void begin_edit(std::string kind) {
-    bool merge = (kind == last_edit_kind && (kind == "type" || kind == "delete") && (now_ms - last_edit_ms) < 1000 && cy == last_edit_y && (int)((U).size()) > 0);
+static void buffer__begin_edit(std::string kind) {
+    bool merge = (kind == ::state__last_edit_kind && (kind == "type" || kind == "delete") && (::state__now_ms - ::state__last_edit_ms) < 1000 && ::state__cy == ::state__last_edit_y && (int)((::state__U).size()) > 0);
     if (!(merge)) {
-        Snap s = snap_now();
-        U.push_back(s);
-        int cap = clamp((4000000 / imax((int)((L).size()), 1)), 20, 300);
-        while ((int)((U).size()) > cap) {
-            ([&](){ auto& __nexa_v = U; int __nexa_i = 0; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+        state__Snap s = ::buffer__snap_now();
+        ::state__U.push_back(s);
+        int cap = ::draw__clamp((4000000 / ::draw__imax((int)((::state__L).size()), 1)), 20, 300);
+        while ((int)((::state__U).size()) > cap) {
+            ([&](){ auto& __nexa_v = ::state__U; int __nexa_i = 0; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
         }
     }
-    R.clear();
-    last_edit_kind = kind;
-    last_edit_ms = now_ms;
+    ::state__R.clear();
+    ::state__last_edit_kind = kind;
+    ::state__last_edit_ms = ::state__now_ms;
 }
 
-static void end_edit(int from_line) {
-    doc_ver = ver_seq;
-    ver_seq = ver_seq + 1;
-    last_edit_y = cy;
-    if (from_line < hl_valid) {
-        hl_valid = imax(from_line, 0);
+static void buffer__end_edit(int from_line) {
+    ::state__doc_ver = ::state__ver_seq;
+    ::state__ver_seq = ::state__ver_seq + 1;
+    ::state__last_edit_y = ::state__cy;
+    if (from_line < ::state__hl_valid) {
+        ::state__hl_valid = ::draw__imax(from_line, 0);
     }
-    blink_ms = now_ms;
-    frame_dirty = true;
-    check_due = (now_ms + 700);
-    if (active >= 0) {
-        bufs[active].preview = false;
+    ::state__blink_ms = ::state__now_ms;
+    ::state__frame_dirty = true;
+    ::state__check_due = (::state__now_ms + 700);
+    if (::state__active >= 0) {
+        ::state__bufs[::state__active].preview = false;
     }
 }
 
-static void undo() {
-    if ((int)((U).size()) == 0) {
+static void buffer__undo() {
+    if ((int)((::state__U).size()) == 0) {
         return;
     }
-    Snap s = ([&](){ auto& __nexa_v = U; Snap __nexa_x = __nexa_v.back(); __nexa_v.pop_back(); return __nexa_x; })();
-    Snap cur = snap_now();
-    R.push_back(cur);
-    restore_snap(s);
+    state__Snap s = ([&](){ auto& __nexa_v = ::state__U; state__Snap __nexa_x = __nexa_v.back(); __nexa_v.pop_back(); return __nexa_x; })();
+    state__Snap cur = ::buffer__snap_now();
+    ::state__R.push_back(cur);
+    ::buffer__restore_snap(s);
 }
 
-static void redo() {
-    if ((int)((R).size()) == 0) {
+static void buffer__redo() {
+    if ((int)((::state__R).size()) == 0) {
         return;
     }
-    Snap s = ([&](){ auto& __nexa_v = R; Snap __nexa_x = __nexa_v.back(); __nexa_v.pop_back(); return __nexa_x; })();
-    Snap cur = snap_now();
-    U.push_back(cur);
-    restore_snap(s);
+    state__Snap s = ([&](){ auto& __nexa_v = ::state__R; state__Snap __nexa_x = __nexa_v.back(); __nexa_v.pop_back(); return __nexa_x; })();
+    state__Snap cur = ::buffer__snap_now();
+    ::state__U.push_back(cur);
+    ::buffer__restore_snap(s);
 }
 
-static void restore_snap(Snap s) {
-    int n = imin((int)((L).size()), (int)((s.lines).size()));
+static void buffer__restore_snap(state__Snap s) {
+    int n = ::draw__imin((int)((::state__L).size()), (int)((s.lines).size()));
     int first = 0;
-    while (first < n && L[first] == s.lines[first]) {
+    while (first < n && ::state__L[first] == s.lines[first]) {
         first = first + 1;
     }
-    L = s.lines;
-    cy = s.cy;
-    cx = s.cx;
-    ay = s.ay;
-    ax = s.ax;
-    doc_ver = s.ver;
-    clamp_cursor();
-    if (first < hl_valid) {
-        hl_valid = first;
+    ::state__L = s.lines;
+    ::state__cy = s.cy;
+    ::state__cx = s.cx;
+    ::state__ay = s.ay;
+    ::state__ax = s.ax;
+    ::state__doc_ver = s.ver;
+    ::buffer__clamp_cursor();
+    if (first < ::state__hl_valid) {
+        ::state__hl_valid = first;
     }
-    last_edit_kind = "";
-    comp_open = false;
-    frame_dirty = true;
-    check_due = (now_ms + 700);
-    reveal(false);
+    ::state__last_edit_kind = "";
+    ::state__comp_open = false;
+    ::state__frame_dirty = true;
+    ::state__check_due = (::state__now_ms + 700);
+    ::editor__reveal(false);
 }
 
-static void delete_range(int y1, int x1, int y2, int x2) {
-    if (y1 == y2) {
-        std::string s = L[y1];
-        L[y1] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, x1) + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, x2, -1));
+static void buffer__delete_range(int y1_, int x1, int y2, int x2) {
+    if (y1_ == y2) {
+        std::string s = ::state__L[y1_];
+        ::state__L[y1_] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, x1) + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, x2, -1));
     } else {
-        std::string head = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(L[y1], 0, x1);
-        std::string tail = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(L[y2], x2, -1);
-        L[y1] = (head + tail);
+        std::string head = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(::state__L[y1_], 0, x1);
+        std::string tail = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(::state__L[y2], x2, -1);
+        ::state__L[y1_] = (head + tail);
         int k = y2;
-        while (k > y1) {
-            ([&](){ auto& __nexa_v = L; int __nexa_i = k; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+        while (k > y1_) {
+            ([&](){ auto& __nexa_v = ::state__L; int __nexa_i = k; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
             k = k - 1;
         }
     }
-    cy = y1;
-    cx = x1;
-    ay = cy;
-    ax = cx;
+    ::state__cy = y1_;
+    ::state__cx = x1;
+    ::state__ay = ::state__cy;
+    ::state__ax = ::state__cx;
 }
 
-static void delete_sel() {
-    if (!(has_sel())) {
+static void buffer__delete_sel() {
+    if (!(::buffer__has_sel())) {
         return;
     }
-    sel_bounds();
-    delete_range(sel_y1, sel_x1, sel_y2, sel_x2);
+    ::buffer__sel_bounds();
+    ::buffer__delete_range(::state__sel_y1, ::state__sel_x1, ::state__sel_y2, ::state__sel_x2);
 }
 
-static void insert_text(std::string t) {
-    delete_sel();
+static void buffer__insert_text(std::string t) {
+    ::buffer__delete_sel();
     std::vector<std::string> parts = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(t, "\n");
-    std::string s = L[cy];
-    std::string head = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, cx);
-    std::string tail = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, cx, -1);
+    std::string s = ::state__L[::state__cy];
+    std::string head = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, ::state__cx);
+    std::string tail = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, ::state__cx, -1);
     if ((int)((parts).size()) == 1) {
-        L[cy] = (head + t + tail);
-        cx = cx + (int)((t).size());
+        ::state__L[::state__cy] = (head + t + tail);
+        ::state__cx = ::state__cx + (int)((t).size());
     } else {
-        L[cy] = (head + parts[0]);
+        ::state__L[::state__cy] = (head + parts[0]);
         int k = 1;
         while (k < (int)((parts).size())) {
             std::string p = parts[k];
             if (k == ((int)((parts).size()) - 1)) {
-                ([&](){ auto& __nexa_v = L; int __nexa_i = (cy + k); int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, (p + tail)); })();
+                ([&](){ auto& __nexa_v = ::state__L; int __nexa_i = (::state__cy + k); int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, (p + tail)); })();
             } else {
-                ([&](){ auto& __nexa_v = L; int __nexa_i = (cy + k); int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, p); })();
+                ([&](){ auto& __nexa_v = ::state__L; int __nexa_i = (::state__cy + k); int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, p); })();
             }
             k = k + 1;
         }
-        cy = cy + ((int)((parts).size()) - 1);
-        cx = (int)((parts[((int)((parts).size()) - 1)]).size());
+        ::state__cy = ::state__cy + ((int)((parts).size()) - 1);
+        ::state__cx = (int)((parts[((int)((parts).size()) - 1)]).size());
     }
-    ay = cy;
-    ax = cx;
+    ::state__ay = ::state__cy;
+    ::state__ax = ::state__cx;
 }
 
-static void edit_insert(std::string t, std::string kind) {
-    sel_bounds();
-    int from = ((has_sel()) ? (sel_y1) : (cy));
-    begin_edit(kind);
-    insert_text(t);
-    end_edit(from);
-    reveal(false);
+static void buffer__edit_insert(std::string t, std::string kind) {
+    ::buffer__sel_bounds();
+    int from = ((::buffer__has_sel()) ? (::state__sel_y1) : (::state__cy));
+    ::buffer__begin_edit(kind);
+    ::buffer__insert_text(t);
+    ::buffer__end_edit(from);
+    ::editor__reveal(false);
 }
 
-static void replace_line(int y, std::string s) {
-    L[y] = s;
+static void buffer__replace_line(int y, std::string s) {
+    ::state__L[y] = s;
 }
 
-static Snap snap_now() {
-    Snap s{};
-    s.lines = L;
-    s.cy = cy;
-    s.cx = cx;
-    s.ay = ay;
-    s.ax = ax;
-    s.ver = doc_ver;
+static state__Snap buffer__snap_now() {
+    state__Snap s{};
+    s.lines = ::state__L;
+    s.cy = ::state__cy;
+    s.cx = ::state__cx;
+    s.ay = ::state__ay;
+    s.ax = ::state__ax;
+    s.ver = ::state__doc_ver;
     return s;
 }
 
-static int code_h() {
-    return imax(ed_h, LH);
+static int editor__code_h() {
+    return ::draw__imax(::state__ed_h, ::state__LH);
 }
 
-static int visible_lines() {
-    return imax(1, (code_h() / LH));
+static int editor__visible_lines() {
+    return ::draw__imax(1, (::editor__code_h() / ::state__LH));
 }
 
-static int max_sy() {
-    return imax(0, (((int)((L).size()) - 1) * LH));
+static int editor__max_sy() {
+    return ::draw__imax(0, (((int)((::state__L).size()) - 1) * ::state__LH));
 }
 
-static void clamp_scroll() {
-    sy = clamp(sy, 0, max_sy());
-    if (sx < 0) {
-        sx = 0;
+static void editor__clamp_scroll() {
+    ::state__sy = ::draw__clamp(::state__sy, 0, ::editor__max_sy());
+    if (::state__sx < 0) {
+        ::state__sx = 0;
     }
 }
 
-static void reveal(bool center) {
-    if (ed_h <= 0) {
+static void editor__reveal(bool center) {
+    if (::state__ed_h <= 0) {
         return;
     }
-    int y = (cy * LH);
-    int h = code_h();
-    if (y < sy || (y + LH) > (sy + h)) {
+    int y = (::state__cy * ::state__LH);
+    int h = ::editor__code_h();
+    if (y < ::state__sy || (y + ::state__LH) > (::state__sy + h)) {
         if (center) {
-            sy = (y - (h / 2) + LH);
-        } else if (y < sy) {
-            sy = y;
+            ::state__sy = (y - (h / 2) + ::state__LH);
+        } else if (y < ::state__sy) {
+            ::state__sy = y;
         } else {
-            sy = (y + LH - h);
+            ::state__sy = (y + ::state__LH - h);
         }
     }
-    int x = (vcol(L[cy], cx) * CW);
-    int w = imax((text_w - SCROLL_W), (CW * 4));
-    if (x < sx) {
-        sx = imax(0, (x - (CW * 4)));
+    int x = (::nxtext__vcol(::state__L[::state__cy], ::state__cx) * ::state__CW);
+    int w = ::draw__imax((::state__text_w - ::state__SCROLL_W), (::state__CW * 4));
+    if (x < ::state__sx) {
+        ::state__sx = ::draw__imax(0, (x - (::state__CW * 4)));
     }
-    if (x > (sx + w - (CW * 2))) {
-        sx = (x - w + (CW * 6));
+    if (x > (::state__sx + w - (::state__CW * 2))) {
+        ::state__sx = (x - w + (::state__CW * 6));
     }
-    clamp_scroll();
-    frame_dirty = true;
+    ::editor__clamp_scroll();
+    ::state__frame_dirty = true;
 }
 
-static void hit_test(int px_, int py_) {
-    int y = ((py_ - ed_y + sy) / LH);
-    if (py_ < ed_y) {
-        y = ((sy - (ed_y - py_) - LH + 1) / LH);
+static void editor__hit_test(int px_, int py_) {
+    int y = ((py_ - ::state__ed_y + ::state__sy) / ::state__LH);
+    if (py_ < ::state__ed_y) {
+        y = ((::state__sy - (::state__ed_y - py_) - ::state__LH + 1) / ::state__LH);
     }
-    hit_y = clamp(y, 0, ((int)((L).size()) - 1));
-    int v = ((px_ - text_x + sx + (CW / 2)) / CW);
+    ::state__hit_y = ::draw__clamp(y, 0, ((int)((::state__L).size()) - 1));
+    int v = ((px_ - ::state__text_x + ::state__sx + (::state__CW / 2)) / ::state__CW);
     if (v < 0) {
         v = 0;
     }
-    hit_x = at_vcol(L[hit_y], v);
+    ::state__hit_x = ::nxtext__at_vcol(::state__L[::state__hit_y], v);
 }
 
-static void hl_ensure(int upto) {
-    int want_n = ((int)((L).size()) + 1);
-    if ((int)((hl_st).size()) != want_n) {
-        while ((int)((hl_st).size()) > want_n) {
-            ([&](){ auto& __nexa_v = hl_st; int __nexa_x = __nexa_v.back(); __nexa_v.pop_back(); return __nexa_x; })();
-            ([&](){ auto& __nexa_v = hl_dl; std::string __nexa_x = __nexa_v.back(); __nexa_v.pop_back(); return __nexa_x; })();
+static void editor__hl_ensure(int upto) {
+    int want_n = ((int)((::state__L).size()) + 1);
+    if ((int)((::state__hl_st).size()) != want_n) {
+        while ((int)((::state__hl_st).size()) > want_n) {
+            ([&](){ auto& __nexa_v = ::state__hl_st; int __nexa_x = __nexa_v.back(); __nexa_v.pop_back(); return __nexa_x; })();
+            ([&](){ auto& __nexa_v = ::state__hl_dl; std::string __nexa_x = __nexa_v.back(); __nexa_v.pop_back(); return __nexa_x; })();
         }
-        while ((int)((hl_st).size()) < want_n) {
-            hl_st.push_back(0);
-            hl_dl.push_back("");
+        while ((int)((::state__hl_st).size()) < want_n) {
+            ::state__hl_st.push_back(0);
+            ::state__hl_dl.push_back("");
         }
     }
-    if (hl_valid > (int)((L).size())) {
-        hl_valid = (int)((L).size());
+    if (::state__hl_valid > (int)((::state__L).size())) {
+        ::state__hl_valid = (int)((::state__L).size());
     }
-    hl_st[0] = 0;
-    hl_dl[0] = "";
-    int stop = imin(upto, (int)((L).size()));
-    while (hl_valid < stop) {
-        int k = hl_valid;
-        std::vector<int> cols = hl_line(doc_lang, L[k], hl_st[k], hl_dl[k]);
-        hl_st[(k + 1)] = hl_out_state;
-        hl_dl[(k + 1)] = hl_out_delim;
-        hl_valid = hl_valid + 1;
+    ::state__hl_st[0] = 0;
+    ::state__hl_dl[0] = "";
+    int stop = ::draw__imin(upto, (int)((::state__L).size()));
+    while (::state__hl_valid < stop) {
+        int k = ::state__hl_valid;
+        std::vector<int> cols = ::highlight__hl_line(::state__doc_lang, ::state__L[k], ::state__hl_st[k], ::state__hl_dl[k]);
+        ::state__hl_st[(k + 1)] = ::state__hl_out_state;
+        ::state__hl_dl[(k + 1)] = ::state__hl_out_delim;
+        ::state__hl_valid = ::state__hl_valid + 1;
     }
 }
 
-static std::vector<int> line_colors(int k) {
-    hl_ensure((k + 1));
-    return hl_line(doc_lang, L[k], hl_st[k], hl_dl[k]);
+static std::vector<int> editor__line_colors(int k) {
+    ::editor__hl_ensure((k + 1));
+    return ::highlight__hl_line(::state__doc_lang, ::state__L[k], ::state__hl_st[k], ::state__hl_dl[k]);
 }
 
-static std::string word_at(int y, int x) {
-    std::string s = L[y];
+static std::string editor__word_at(int y, int x) {
+    std::string s = ::state__L[y];
     int a = x;
     int b = x;
-    if (!(is_word_at(s, a)) && is_word_at(s, (a - 1))) {
+    if (!(::nxtext__is_word_at(s, a)) && ::nxtext__is_word_at(s, (a - 1))) {
         a = a - 1;
         b = b - 1;
     }
-    if (!(is_word_at(s, a))) {
-        word_a = x;
-        word_b = x;
+    if (!(::nxtext__is_word_at(s, a))) {
+        ::state__word_a = x;
+        ::state__word_b = x;
         return "";
     }
-    while (a > 0 && is_word_at(s, (a - 1))) {
+    while (a > 0 && ::nxtext__is_word_at(s, (a - 1))) {
         a = a - 1;
     }
-    while (b < (int)((s).size()) && is_word_at(s, b)) {
+    while (b < (int)((s).size()) && ::nxtext__is_word_at(s, b)) {
         b = b + 1;
     }
-    word_a = a;
-    word_b = b;
+    ::state__word_a = a;
+    ::state__word_b = b;
     return ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, a, (b - a));
 }
 
-static void select_word() {
-    std::string w = word_at(cy, cx);
+static void editor__select_word() {
+    std::string w = ::editor__word_at(::state__cy, ::state__cx);
     if ((int)((w).size()) == 0) {
         return;
     }
-    ay = cy;
-    ax = word_a;
-    cx = word_b;
+    ::state__ay = ::state__cy;
+    ::state__ax = ::state__word_a;
+    ::state__cx = ::state__word_b;
 }
 
-static void block_lines() {
-    sel_bounds();
-    blk_a = sel_y1;
-    blk_b = sel_y2;
-    if (has_sel() && sel_x2 == 0 && sel_y2 > sel_y1) {
-        blk_b = (sel_y2 - 1);
+static void editor__block_lines() {
+    ::buffer__sel_bounds();
+    ::state__blk_a = ::state__sel_y1;
+    ::state__blk_b = ::state__sel_y2;
+    if (::buffer__has_sel() && ::state__sel_x2 == 0 && ::state__sel_y2 > ::state__sel_y1) {
+        ::state__blk_b = (::state__sel_y2 - 1);
     }
 }
 
-static void indent_lines(bool out) {
-    block_lines();
-    begin_edit("indent");
-    int y = blk_a;
-    while (y <= blk_b) {
-        std::string s = L[y];
+static void editor__indent_lines(bool out) {
+    ::editor__block_lines();
+    ::buffer__begin_edit("indent");
+    int y = ::state__blk_a;
+    while (y <= ::state__blk_b) {
+        std::string s = ::state__L[y];
         if (out) {
             int n = 0;
             if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "\t")) {
@@ -5752,45 +6057,45 @@ static void indent_lines(bool out) {
                     n = n + 1;
                 }
             }
-            L[y] = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, n, -1);
-            if (cy == y) {
-                cx = imax(0, (cx - n));
+            ::state__L[y] = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, n, -1);
+            if (::state__cy == y) {
+                ::state__cx = ::draw__imax(0, (::state__cx - n));
             }
-            if (ay == y) {
-                ax = imax(0, (ax - n));
+            if (::state__ay == y) {
+                ::state__ax = ::draw__imax(0, (::state__ax - n));
             }
-        } else if ((int)((s).size()) > 0 || blk_a == blk_b) {
-            L[y] = (std::string("    ") + s);
-            if (cy == y) {
-                cx = cx + 4;
+        } else if ((int)((s).size()) > 0 || ::state__blk_a == ::state__blk_b) {
+            ::state__L[y] = (std::string("    ") + s);
+            if (::state__cy == y) {
+                ::state__cx = ::state__cx + 4;
             }
-            if (ay == y && (has_sel() || ay != cy)) {
-                ax = ax + 4;
+            if (::state__ay == y && (::buffer__has_sel() || ::state__ay != ::state__cy)) {
+                ::state__ax = ::state__ax + 4;
             }
         }
         y = y + 1;
     }
-    if (!(has_sel())) {
-        ax = cx;
-        ay = cy;
+    if (!(::buffer__has_sel())) {
+        ::state__ax = ::state__cx;
+        ::state__ay = ::state__cy;
     }
-    end_edit(blk_a);
+    ::buffer__end_edit(::state__blk_a);
 }
 
-static void toggle_comment() {
-    std::string tok = lang_comment(doc_lang);
+static void editor__toggle_comment() {
+    std::string tok = ::highlight__lang_comment(::state__doc_lang);
     if ((int)((tok).size()) == 0) {
         return;
     }
-    block_lines();
+    ::editor__block_lines();
     bool all = true;
     int min_ind = 100000;
-    int y = blk_a;
-    while (y <= blk_b) {
-        std::string s = L[y];
-        if (!(is_blank(s))) {
-            std::string ws = leading_ws(s);
-            min_ind = imin(min_ind, (int)((ws).size()));
+    int y = ::state__blk_a;
+    while (y <= ::state__blk_b) {
+        std::string s = ::state__L[y];
+        if (!(::nxtext__is_blank(s))) {
+            std::string ws = ::nxtext__leading_ws(s);
+            min_ind = ::draw__imin(min_ind, (int)((ws).size()));
             if (!(([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, (int)((ws).size()), -1), tok))) {
                 all = false;
             }
@@ -5800,173 +6105,177 @@ static void toggle_comment() {
     if (min_ind == 100000) {
         min_ind = 0;
     }
-    begin_edit("comment");
-    y = blk_a;
-    while (y <= blk_b) {
-        std::string s = L[y];
+    ::buffer__begin_edit("comment");
+    y = ::state__blk_a;
+    while (y <= ::state__blk_b) {
+        std::string s = ::state__L[y];
         int delta = 0;
         int at = 0;
         if (all) {
-            std::string ws = leading_ws(s);
+            std::string ws = ::nxtext__leading_ws(s);
             at = (int)((ws).size());
             if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, at, -1), tok)) {
                 int n = (int)((tok).size());
                 if (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, (at + n), 1) == " ") {
                     n = n + 1;
                 }
-                L[y] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, at) + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, (at + n), -1));
+                ::state__L[y] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, at) + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, (at + n), -1));
                 delta = (0 - n);
             }
-        } else if (!(is_blank(s)) || blk_a == blk_b) {
-            at = imin(min_ind, (int)((s).size()));
-            L[y] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, at) + tok + " " + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, at, -1));
+        } else if (!(::nxtext__is_blank(s)) || ::state__blk_a == ::state__blk_b) {
+            at = ::draw__imin(min_ind, (int)((s).size()));
+            ::state__L[y] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, at) + tok + " " + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, at, -1));
             delta = ((int)((tok).size()) + 1);
         }
-        if (cy == y && cx >= at) {
-            cx = imax(at, (cx + delta));
+        if (::state__cy == y && ::state__cx >= at) {
+            ::state__cx = ::draw__imax(at, (::state__cx + delta));
         }
-        if (ay == y && ax >= at) {
-            ax = imax(at, (ax + delta));
+        if (::state__ay == y && ::state__ax >= at) {
+            ::state__ax = ::draw__imax(at, (::state__ax + delta));
         }
         y = y + 1;
     }
-    end_edit(blk_a);
+    ::buffer__end_edit(::state__blk_a);
 }
 
-static void move_lines(int dir) {
-    block_lines();
-    if (dir < 0 && blk_a == 0) {
+static void editor__move_lines(int dir) {
+    ::editor__block_lines();
+    if (dir < 0 && ::state__blk_a == 0) {
         return;
     }
-    if (dir > 0 && blk_b >= ((int)((L).size()) - 1)) {
+    if (dir > 0 && ::state__blk_b >= ((int)((::state__L).size()) - 1)) {
         return;
     }
-    begin_edit("move");
+    ::buffer__begin_edit("move");
     if (dir < 0) {
-        std::string above = L[(blk_a - 1)];
-        ([&](){ auto& __nexa_v = L; int __nexa_i = (blk_a - 1); __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
-        ([&](){ auto& __nexa_v = L; int __nexa_i = blk_b; int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, above); })();
+        std::string above = ::state__L[(::state__blk_a - 1)];
+        ([&](){ auto& __nexa_v = ::state__L; int __nexa_i = (::state__blk_a - 1); __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+        ([&](){ auto& __nexa_v = ::state__L; int __nexa_i = ::state__blk_b; int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, above); })();
     } else {
-        std::string below = L[(blk_b + 1)];
-        ([&](){ auto& __nexa_v = L; int __nexa_i = (blk_b + 1); __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
-        ([&](){ auto& __nexa_v = L; int __nexa_i = blk_a; int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, below); })();
+        std::string below = ::state__L[(::state__blk_b + 1)];
+        ([&](){ auto& __nexa_v = ::state__L; int __nexa_i = (::state__blk_b + 1); __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+        ([&](){ auto& __nexa_v = ::state__L; int __nexa_i = ::state__blk_a; int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, below); })();
     }
-    cy = cy + dir;
-    ay = ay + dir;
-    end_edit(imin(blk_a, (blk_a + dir)));
-    reveal(false);
+    ::state__cy = ::state__cy + dir;
+    ::state__ay = ::state__ay + dir;
+    ::buffer__end_edit(::draw__imin(::state__blk_a, (::state__blk_a + dir)));
+    ::editor__reveal(false);
 }
 
-static void copy_lines(int dir) {
-    block_lines();
-    begin_edit("copy");
-    std::vector<std::string> chunk = ([&](){ const auto& __nexa_s = L; int __nexa_n = (int)__nexa_s.size(); int __nexa_a = blk_a; int __nexa_b = (blk_b + 1); if (__nexa_a < 0) __nexa_a = __nexa_n + __nexa_a; if (__nexa_b < 0) __nexa_b = __nexa_n + __nexa_b; if (__nexa_a < 0) __nexa_a = 0; if (__nexa_b < 0) __nexa_b = 0; if (__nexa_a > __nexa_n) __nexa_a = __nexa_n; if (__nexa_b > __nexa_n) __nexa_b = __nexa_n; if (__nexa_b < __nexa_a) __nexa_b = __nexa_a; return std::vector<std::string>(__nexa_s.begin() + __nexa_a, __nexa_s.begin() + __nexa_b); })();
+static void editor__copy_lines(int dir) {
+    ::editor__block_lines();
+    ::buffer__begin_edit("copy");
+    std::vector<std::string> chunk = ([&](){ const auto& __nexa_s = ::state__L; int __nexa_n = (int)__nexa_s.size(); int __nexa_a = ::state__blk_a; int __nexa_b = (::state__blk_b + 1); if (__nexa_a < 0) __nexa_a = __nexa_n + __nexa_a; if (__nexa_b < 0) __nexa_b = __nexa_n + __nexa_b; if (__nexa_a < 0) __nexa_a = 0; if (__nexa_b < 0) __nexa_b = 0; if (__nexa_a > __nexa_n) __nexa_a = __nexa_n; if (__nexa_b > __nexa_n) __nexa_b = __nexa_n; if (__nexa_b < __nexa_a) __nexa_b = __nexa_a; return std::vector<std::string>(__nexa_s.begin() + __nexa_a, __nexa_s.begin() + __nexa_b); })();
     int n = (int)((chunk).size());
     int k = (n - 1);
     while (k >= 0) {
-        ([&](){ auto& __nexa_v = L; int __nexa_i = (blk_b + 1); int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, chunk[k]); })();
+        ([&](){ auto& __nexa_v = ::state__L; int __nexa_i = (::state__blk_b + 1); int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, chunk[k]); })();
         k = k - 1;
     }
     if (dir > 0) {
-        cy = cy + n;
-        ay = ay + n;
+        ::state__cy = ::state__cy + n;
+        ::state__ay = ::state__ay + n;
     }
-    end_edit(blk_a);
-    reveal(false);
+    ::buffer__end_edit(::state__blk_a);
+    ::editor__reveal(false);
 }
 
-static void delete_lines() {
-    block_lines();
-    begin_edit("delete-line");
-    int k = blk_b;
-    while (k >= blk_a) {
-        ([&](){ auto& __nexa_v = L; int __nexa_i = k; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+static void editor__delete_lines() {
+    ::editor__block_lines();
+    ::buffer__begin_edit("delete-line");
+    int k = ::state__blk_b;
+    while (k >= ::state__blk_a) {
+        ([&](){ auto& __nexa_v = ::state__L; int __nexa_i = k; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
         k = k - 1;
     }
-    if ((int)((L).size()) == 0) {
-        L.push_back("");
+    if ((int)((::state__L).size()) == 0) {
+        ::state__L.push_back("");
     }
-    cy = imin(blk_a, ((int)((L).size()) - 1));
-    cx = imin(cx, (int)((L[cy]).size()));
-    ay = cy;
-    ax = cx;
-    end_edit(blk_a);
-    reveal(false);
+    ::state__cy = ::draw__imin(::state__blk_a, ((int)((::state__L).size()) - 1));
+    ::state__cx = ::draw__imin(::state__cx, (int)((::state__L[::state__cy]).size()));
+    ::state__ay = ::state__cy;
+    ::state__ax = ::state__cx;
+    ::buffer__end_edit(::state__blk_a);
+    ::editor__reveal(false);
 }
 
-static void insert_line(bool below) {
-    begin_edit("line");
-    std::string ind = leading_ws(L[cy]);
+static void editor__insert_line(bool below) {
+    ::buffer__begin_edit("line");
+    std::string ind = ::nxtext__leading_ws(::state__L[::state__cy]);
     if (below) {
-        ([&](){ auto& __nexa_v = L; int __nexa_i = (cy + 1); int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, ind); })();
-        cy = cy + 1;
+        ([&](){ auto& __nexa_v = ::state__L; int __nexa_i = (::state__cy + 1); int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, ind); })();
+        ::state__cy = ::state__cy + 1;
     } else {
-        ([&](){ auto& __nexa_v = L; int __nexa_i = cy; int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, ind); })();
+        ([&](){ auto& __nexa_v = ::state__L; int __nexa_i = ::state__cy; int __nexa_n = (int)__nexa_v.size(); if (__nexa_i < 0) __nexa_i = 0; if (__nexa_i > __nexa_n) __nexa_i = __nexa_n; __nexa_v.insert(__nexa_v.begin() + __nexa_i, ind); })();
     }
-    cx = (int)((ind).size());
-    ay = cy;
-    ax = cx;
-    end_edit((cy - 1));
-    reveal(false);
+    ::state__cx = (int)((ind).size());
+    ::state__ay = ::state__cy;
+    ::state__ax = ::state__cx;
+    ::buffer__end_edit((::state__cy - 1));
+    ::editor__reveal(false);
 }
 
-static void select_line() {
-    if (!(has_sel())) {
-        ay = cy;
-        ax = 0;
+static void editor__select_line() {
+    if (!(::buffer__has_sel())) {
+        ::state__ay = ::state__cy;
+        ::state__ax = 0;
     }
-    if (cy < ((int)((L).size()) - 1)) {
-        cy = cy + 1;
-        cx = 0;
+    if (::state__cy < ((int)((::state__L).size()) - 1)) {
+        ::state__cy = ::state__cy + 1;
+        ::state__cx = 0;
     } else {
-        cx = (int)((L[cy]).size());
+        ::state__cx = (int)((::state__L[::state__cy]).size());
     }
-    reveal(false);
+    ::editor__reveal(false);
 }
 
-static void trim_trailing() {
-    begin_edit("trim");
-    for (int y = 0; y < (int)((L).size()); y++) {
-        std::string s = L[y];
+static void editor__trim_trailing() {
+    ::buffer__begin_edit("trim");
+    for (int y = 0; y < (int)((::state__L).size()); y++) {
+        std::string s = __nexa_text(::state__L[y]);
         int e = (int)((s).size());
-        while (e > 0 && is_space_b(ubyte(s, (e - 1)))) {
+        while (e > 0 && ::nxtext__is_space_b(::nxtext__ubyte(s, (e - 1)))) {
             e = e - 1;
         }
         if (e < (int)((s).size())) {
-            L[y] = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, e);
+            ::state__L[y] = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, e);
         }
     }
-    clamp_cursor();
-    end_edit(0);
+    ::buffer__clamp_cursor();
+    ::buffer__end_edit(0);
 }
 
-static void change_case(bool upper) {
-    if (!(has_sel())) {
-        select_word();
+static void editor__change_case(bool to_upper) {
+    if (!(::buffer__has_sel())) {
+        ::editor__select_word();
     }
-    if (!(has_sel())) {
+    if (!(::buffer__has_sel())) {
         return;
     }
-    std::string t = sel_text();
-    sel_bounds();
-    int y1 = sel_y1;
-    int x1 = sel_x1;
-    bool rev = (ay > cy || (ay == cy && ax > cx));
-    begin_edit("case");
-    insert_text(((upper) ? (([](std::string __s){ for (char& __c : __s) __c = (char)std::toupper((unsigned char)__c); return __s; })(t)) : (([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(t))));
-    if (rev) {
-        ay = cy;
-        ax = cx;
-        cy = y1;
-        cx = x1;
-    } else {
-        ay = y1;
-        ax = x1;
+    std::string t = ::buffer__sel_text();
+    ::buffer__sel_bounds();
+    int y1_ = ::state__sel_y1;
+    int x1 = ::state__sel_x1;
+    bool rev = (::state__ay > ::state__cy || (::state__ay == ::state__cy && ::state__ax > ::state__cx));
+    ::buffer__begin_edit("case");
+    std::string cased = ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(t);
+    if (to_upper) {
+        cased = ([](std::string __s){ for (char& __c : __s) __c = (char)std::toupper((unsigned char)__c); return __s; })(t);
     }
-    end_edit(y1);
+    ::buffer__insert_text(cased);
+    if (rev) {
+        ::state__ay = ::state__cy;
+        ::state__ax = ::state__cx;
+        ::state__cy = y1_;
+        ::state__cx = x1;
+    } else {
+        ::state__ay = y1_;
+        ::state__ax = x1;
+    }
+    ::buffer__end_edit(y1_);
 }
 
-static char bracket_pair(char c) {
+static char editor__bracket_pair(char c) {
     if (c == '(') {
         return ')';
     }
@@ -5988,38 +6297,38 @@ static char bracket_pair(char c) {
     return ' ';
 }
 
-static bool is_open_br(char c) {
+static bool editor__is_open_br(char c) {
     return (c == '(' || c == '[' || c == '{');
 }
 
-static bool is_close_br(char c) {
+static bool editor__is_close_br(char c) {
     return (c == ')' || c == ']' || c == '}');
 }
 
-static void match_brackets() {
-    br_y = -1;
-    br_my = -1;
-    std::string s = L[cy];
+static void editor__match_brackets() {
+    ::state__br_y = -1;
+    ::state__br_my = -1;
+    std::string s = ::state__L[::state__cy];
     int x = -1;
-    if (cx < (int)((s).size()) && (is_open_br(s[cx]) || is_close_br(s[cx]))) {
-        x = cx;
-    } else if (cx > 0 && (is_open_br(s[(cx - 1)]) || is_close_br(s[(cx - 1)]))) {
-        x = (cx - 1);
+    if (::state__cx < (int)((s).size()) && (::editor__is_open_br(s[::state__cx]) || ::editor__is_close_br(s[::state__cx]))) {
+        x = ::state__cx;
+    } else if (::state__cx > 0 && (::editor__is_open_br(s[(::state__cx - 1)]) || ::editor__is_close_br(s[(::state__cx - 1)]))) {
+        x = (::state__cx - 1);
     }
     if (x < 0) {
         return;
     }
-    br_y = cy;
-    br_x = x;
+    ::state__br_y = ::state__cy;
+    ::state__br_x = x;
     char c = s[x];
-    char other = bracket_pair(c);
-    int dir = ((is_open_br(c)) ? (1) : (-1));
+    char other = ::editor__bracket_pair(c);
+    int dir = ((::editor__is_open_br(c)) ? (1) : (-1));
     int depth = 0;
-    int y = cy;
+    int y = ::state__cy;
     int i = x;
     int steps = 0;
-    while (y >= 0 && y < (int)((L).size()) && steps < 200000) {
-        std::string t = L[y];
+    while (y >= 0 && y < (int)((::state__L).size()) && steps < 200000) {
+        std::string t = ::state__L[y];
         while (i >= 0 && i < (int)((t).size())) {
             char ch = t[i];
             if (ch == c) {
@@ -6028,8 +6337,8 @@ static void match_brackets() {
             if (ch == other) {
                 depth = depth - 1;
                 if (depth == 0) {
-                    br_my = y;
-                    br_mx = i;
+                    ::state__br_my = y;
+                    ::state__br_mx = i;
                     return;
                 }
             }
@@ -6037,46 +6346,46 @@ static void match_brackets() {
             steps = steps + 1;
         }
         y = y + dir;
-        if (y >= 0 && y < (int)((L).size())) {
+        if (y >= 0 && y < (int)((::state__L).size())) {
             if (dir > 0) {
                 i = 0;
             } else {
-                i = ((int)((L[y]).size()) - 1);
+                i = ((int)((::state__L[y]).size()) - 1);
             }
         }
     }
 }
 
-static void jump_bracket() {
-    match_brackets();
-    if (br_my < 0) {
+static void editor__jump_bracket() {
+    ::editor__match_brackets();
+    if (::state__br_my < 0) {
         return;
     }
-    if (cy == br_my && (cx == br_mx || cx == (br_mx + 1))) {
-        set_cursor(br_y, br_x, false);
+    if (::state__cy == ::state__br_my && (::state__cx == ::state__br_mx || ::state__cx == (::state__br_mx + 1))) {
+        ::buffer__set_cursor(::state__br_y, ::state__br_x, false);
     } else {
-        set_cursor(br_my, br_mx, false);
+        ::buffer__set_cursor(::state__br_my, ::state__br_mx, false);
     }
-    reveal(false);
+    ::editor__reveal(false);
 }
 
-static std::string next_char() {
-    std::string s = L[cy];
-    if (cx < (int)((s).size())) {
-        return ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, cx, 1);
-    }
-    return "";
-}
-
-static std::string prev_char() {
-    std::string s = L[cy];
-    if (cx > 0) {
-        return ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, (cx - 1), 1);
+static std::string editor__next_char() {
+    std::string s = ::state__L[::state__cy];
+    if (::state__cx < (int)((s).size())) {
+        return ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, ::state__cx, 1);
     }
     return "";
 }
 
-static std::string closer_for(const std::string& ch) {
+static std::string editor__prev_char() {
+    std::string s = ::state__L[::state__cy];
+    if (::state__cx > 0) {
+        return ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, (::state__cx - 1), 1);
+    }
+    return "";
+}
+
+static std::string editor__closer_for(const std::string& ch) {
     if (ch == "(") {
         return ")";
     }
@@ -6098,616 +6407,621 @@ static std::string closer_for(const std::string& ch) {
     return "";
 }
 
-static bool code_lang() {
-    return (doc_lang == L_NEXA || doc_lang == L_CPP || doc_lang == L_JSON || doc_lang == L_SHELL);
+static bool editor__code_lang() {
+    return (::state__doc_lang == ::state__L_NEXA || ::state__doc_lang == ::state__L_CPP || ::state__doc_lang == ::state__L_JSON || ::state__doc_lang == ::state__L_SHELL);
 }
 
-static void type_char(int cp) {
-    std::string ch = utf8(cp);
-    std::string close = closer_for(ch);
+static void editor__type_char(int cp) {
+    std::string ch = ::nxtext__utf8(cp);
+    std::string close_ = ::editor__closer_for(ch);
     bool quote = (ch == "\"" || ch == "'" || ch == "`");
-    if (ch == "`" && doc_lang != L_MD) {
-        close = "";
+    if (ch == "`" && ::state__doc_lang != ::state__L_MD) {
+        close_ = "";
     }
-    if (ch == "'" && !(code_lang())) {
-        close = "";
+    if (ch == "'" && !(::editor__code_lang())) {
+        close_ = "";
     }
-    if (has_sel() && (int)((close).size()) > 0 && !(sel_y1 != sel_y2 && quote)) {
-        sel_bounds();
-        std::string t = sel_text();
-        int y1 = sel_y1;
-        int x1 = sel_x1;
-        begin_edit("wrap");
-        insert_text((ch + t + close));
-        ay = y1;
-        ax = (x1 + (int)((ch).size()));
-        cx = cx - (int)((close).size());
-        end_edit(y1);
+    if (::buffer__has_sel() && (int)((close_).size()) > 0 && !(::state__sel_y1 != ::state__sel_y2 && quote)) {
+        ::buffer__sel_bounds();
+        std::string t = ::buffer__sel_text();
+        int y1_ = ::state__sel_y1;
+        int x1 = ::state__sel_x1;
+        ::buffer__begin_edit("wrap");
+        ::buffer__insert_text((ch + t + close_));
+        ::state__ay = y1_;
+        ::state__ax = (x1 + (int)((ch).size()));
+        ::state__cx = ::state__cx - (int)((close_).size());
+        ::buffer__end_edit(y1_);
         return;
     }
-    std::string nxt = next_char();
-    if (!(has_sel()) && (ch == ")" || ch == "]" || ch == "}" || quote) && nxt == ch) {
-        set_cursor(cy, (cx + 1), false);
-        last_edit_kind = "";
+    std::string nxt = ::editor__next_char();
+    if (!(::buffer__has_sel()) && (ch == ")" || ch == "]" || ch == "}" || quote) && nxt == ch) {
+        ::buffer__set_cursor(::state__cy, (::state__cx + 1), false);
+        ::state__last_edit_kind = "";
         return;
     }
-    if ((int)((close).size()) > 0 && !(has_sel())) {
+    if ((int)((close_).size()) > 0 && !(::buffer__has_sel())) {
         bool pairs = (nxt == "" || nxt == " " || nxt == "\t" || nxt == ")" || nxt == "]" || nxt == "}" || nxt == ";" || nxt == ",");
         if (quote) {
-            std::string pv = prev_char();
-            pairs = (pairs && !((int)((pv).size()) > 0 && is_word_b(ubyte(pv, 0))) && pv != ch);
-            std::string before = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(L[cy], 0, cx);
+            std::string pv = ::editor__prev_char();
+            pairs = (pairs && !((int)((pv).size()) > 0 && ::nxtext__is_word_b(::nxtext__ubyte(pv, 0))) && pv != ch);
+            std::string before = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(::state__L[::state__cy], 0, ::state__cx);
             if ((([](const std::string& __s, const std::string& __p){ if (__p.empty()) return 0; int __c = 0; size_t __i = 0; while ((__i = __s.find(__p, __i)) != std::string::npos) { __c++; __i += __p.size(); } return __c; })(before, ch) % 2) == 1) {
                 pairs = false;
             }
         }
         if (pairs) {
-            begin_edit("type");
-            insert_text((ch + close));
-            cx = cx - (int)((close).size());
-            ax = cx;
-            end_edit(cy);
-            update_completion(false);
+            ::buffer__begin_edit("type");
+            ::buffer__insert_text((ch + close_));
+            ::state__cx = ::state__cx - (int)((close_).size());
+            ::state__ax = ::state__cx;
+            ::buffer__end_edit(::state__cy);
+            ::editor__update_completion(false);
             return;
         }
     }
-    if (ch == "}" && !(has_sel()) && is_blank(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(L[cy], 0, cx)) && cx >= 4) {
-        begin_edit("type");
-        std::string ind = leading_ws(L[cy]);
-        int cut = imin(4, (int)((ind).size()));
-        L[cy] = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(L[cy], cut, -1);
-        cx = cx - cut;
-        ax = cx;
-        insert_text("}");
-        end_edit(cy);
+    if (ch == "}" && !(::buffer__has_sel()) && ::nxtext__is_blank(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(::state__L[::state__cy], 0, ::state__cx)) && ::state__cx >= 4) {
+        ::buffer__begin_edit("type");
+        std::string ind = ::nxtext__leading_ws(::state__L[::state__cy]);
+        int cut = ::draw__imin(4, (int)((ind).size()));
+        ::state__L[::state__cy] = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(::state__L[::state__cy], cut, -1);
+        ::state__cx = ::state__cx - cut;
+        ::state__ax = ::state__cx;
+        ::buffer__insert_text("}");
+        ::buffer__end_edit(::state__cy);
         return;
     }
-    begin_edit("type");
-    insert_text(ch);
-    end_edit(cy);
-    reveal(false);
-    update_completion(false);
+    ::buffer__begin_edit("type");
+    ::buffer__insert_text(ch);
+    ::buffer__end_edit(::state__cy);
+    ::editor__reveal(false);
+    ::editor__update_completion(false);
 }
 
-static void press_enter() {
-    std::string s = L[cy];
-    std::string ind = leading_ws(s);
-    if ((int)((ind).size()) > cx) {
-        ind = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(ind, 0, cx);
+static void editor__press_enter() {
+    std::string s = ::state__L[::state__cy];
+    std::string ind = ::nxtext__leading_ws(s);
+    if ((int)((ind).size()) > ::state__cx) {
+        ind = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(ind, 0, ::state__cx);
     }
-    std::string before = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, cx));
-    std::string after = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, cx, -1));
+    std::string before = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, ::state__cx));
+    std::string after = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, ::state__cx, -1));
     std::string last = "";
     if ((int)((before).size()) > 0) {
         last = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(before, ((int)((before).size()) - 1), 1);
     }
-    begin_edit("enter");
-    delete_sel();
+    ::buffer__begin_edit("enter");
+    ::buffer__delete_sel();
     if (last == "{" || last == "[" || last == "(") {
         std::string inner = (ind + "    ");
         std::string first = "";
         if ((int)((after).size()) > 0) {
             first = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(after, 0, 1);
         }
-        if (first == closer_for(last)) {
-            insert_text((std::string("\n") + inner + "\n" + ind));
-            cy = cy - 1;
-            cx = (int)((inner).size());
+        if (first == ::editor__closer_for(last)) {
+            ::buffer__insert_text((std::string("\n") + inner + "\n" + ind));
+            ::state__cy = ::state__cy - 1;
+            ::state__cx = (int)((inner).size());
         } else {
-            insert_text((std::string("\n") + inner));
+            ::buffer__insert_text((std::string("\n") + inner));
         }
     } else {
-        std::string head = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(L[cy], 0, cx);
+        std::string head = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(::state__L[::state__cy], 0, ::state__cx);
         std::string trimmed = head;
-        while ((int)((trimmed).size()) > 0 && is_space_b(ubyte(trimmed, ((int)((trimmed).size()) - 1))) && (int)((trimmed).size()) > (int)((ind).size())) {
+        while ((int)((trimmed).size()) > 0 && ::nxtext__is_space_b(::nxtext__ubyte(trimmed, ((int)((trimmed).size()) - 1))) && (int)((trimmed).size()) > (int)((ind).size())) {
             trimmed = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(trimmed, 0, ((int)((trimmed).size()) - 1));
         }
-        if (is_blank(head)) {
+        if (::nxtext__is_blank(head)) {
             trimmed = "";
         }
-        L[cy] = (trimmed + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(L[cy], cx, -1));
-        cx = (int)((trimmed).size());
-        std::string rest = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(L[cy], cx, -1);
+        ::state__L[::state__cy] = (trimmed + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(::state__L[::state__cy], ::state__cx, -1));
+        ::state__cx = (int)((trimmed).size());
+        std::string rest = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(::state__L[::state__cy], ::state__cx, -1);
         int skip = 0;
-        while (skip < (int)((rest).size()) && is_space_b(ubyte(rest, skip))) {
+        while (skip < (int)((rest).size()) && ::nxtext__is_space_b(::nxtext__ubyte(rest, skip))) {
             skip = skip + 1;
         }
-        L[cy] = (trimmed + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(rest, skip, -1));
-        insert_text((std::string("\n") + ind));
+        ::state__L[::state__cy] = (trimmed + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(rest, skip, -1));
+        ::buffer__insert_text((std::string("\n") + ind));
     }
-    ay = cy;
-    ax = cx;
-    end_edit((cy - 1));
-    reveal(false);
+    ::state__ay = ::state__cy;
+    ::state__ax = ::state__cx;
+    ::buffer__end_edit((::state__cy - 1));
+    ::editor__reveal(false);
 }
 
-static void backspace(bool ctrl) {
-    if (has_sel()) {
-        sel_bounds();
-        int from = sel_y1;
-        begin_edit("delete");
-        delete_sel();
-        end_edit(from);
+static void editor__backspace(bool ctrl) {
+    if (::buffer__has_sel()) {
+        ::buffer__sel_bounds();
+        int from = ::state__sel_y1;
+        ::buffer__begin_edit("delete");
+        ::buffer__delete_sel();
+        ::buffer__end_edit(from);
         return;
     }
-    if (cx == 0) {
-        if (cy == 0) {
+    if (::state__cx == 0) {
+        if (::state__cy == 0) {
             return;
         }
-        begin_edit("join");
-        int prev_len = (int)((L[(cy - 1)]).size());
-        L[(cy - 1)] = (L[(cy - 1)] + L[cy]);
-        ([&](){ auto& __nexa_v = L; int __nexa_i = cy; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
-        cy = cy - 1;
-        cx = prev_len;
-        ay = cy;
-        ax = cx;
-        end_edit(cy);
-        reveal(false);
+        ::buffer__begin_edit("join");
+        int prev_len = (int)((::state__L[(::state__cy - 1)]).size());
+        ::state__L[(::state__cy - 1)] = (::state__L[(::state__cy - 1)] + ::state__L[::state__cy]);
+        ([&](){ auto& __nexa_v = ::state__L; int __nexa_i = ::state__cy; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+        ::state__cy = ::state__cy - 1;
+        ::state__cx = prev_len;
+        ::state__ay = ::state__cy;
+        ::state__ax = ::state__cx;
+        ::buffer__end_edit(::state__cy);
+        ::editor__reveal(false);
         return;
     }
-    std::string s = L[cy];
-    int from = prev_i(s, cx);
-    int to = cx;
+    std::string s = ::state__L[::state__cy];
+    int from = ::nxtext__prev_i(s, ::state__cx);
+    int to = ::state__cx;
     if (ctrl) {
-        from = word_left(s, cx);
-    } else if (is_blank(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, cx)) && !(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(s, "\t"))) {
-        int v = cx;
-        from = imax(0, ((v - 1) / 4 * 4));
+        from = ::nxtext__word_left(s, ::state__cx);
+    } else if (::nxtext__is_blank(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, ::state__cx)) && !(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(s, "\t"))) {
+        int v = ::state__cx;
+        from = ::draw__imax(0, ((v - 1) / 4 * 4));
     } else {
         std::string pv = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, from, (to - from));
-        std::string cl = closer_for(pv);
-        if ((int)((cl).size()) > 0 && cx < (int)((s).size()) && ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, cx, (int)((cl).size())) == cl) {
-            to = (cx + (int)((cl).size()));
+        std::string cl = ::editor__closer_for(pv);
+        if ((int)((cl).size()) > 0 && ::state__cx < (int)((s).size()) && ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, ::state__cx, (int)((cl).size())) == cl) {
+            to = (::state__cx + (int)((cl).size()));
         }
     }
-    begin_edit("delete");
-    L[cy] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, from) + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, to, -1));
-    cx = from;
-    ax = cx;
-    ay = cy;
-    end_edit(cy);
-    update_completion(true);
-    reveal(false);
+    ::buffer__begin_edit("delete");
+    ::state__L[::state__cy] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, from) + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, to, -1));
+    ::state__cx = from;
+    ::state__ax = ::state__cx;
+    ::state__ay = ::state__cy;
+    ::buffer__end_edit(::state__cy);
+    ::editor__update_completion(true);
+    ::editor__reveal(false);
 }
 
-static void delete_forward(bool ctrl) {
-    if (has_sel()) {
-        sel_bounds();
-        int from = sel_y1;
-        begin_edit("delete");
-        delete_sel();
-        end_edit(from);
+static void editor__delete_forward(bool ctrl) {
+    if (::buffer__has_sel()) {
+        ::buffer__sel_bounds();
+        int from = ::state__sel_y1;
+        ::buffer__begin_edit("delete");
+        ::buffer__delete_sel();
+        ::buffer__end_edit(from);
         return;
     }
-    std::string s = L[cy];
-    if (cx >= (int)((s).size())) {
-        if (cy >= ((int)((L).size()) - 1)) {
+    std::string s = ::state__L[::state__cy];
+    if (::state__cx >= (int)((s).size())) {
+        if (::state__cy >= ((int)((::state__L).size()) - 1)) {
             return;
         }
-        begin_edit("join");
-        L[cy] = (s + L[(cy + 1)]);
-        ([&](){ auto& __nexa_v = L; int __nexa_i = (cy + 1); __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
-        end_edit(cy);
+        ::buffer__begin_edit("join");
+        ::state__L[::state__cy] = (s + ::state__L[(::state__cy + 1)]);
+        ([&](){ auto& __nexa_v = ::state__L; int __nexa_i = (::state__cy + 1); __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+        ::buffer__end_edit(::state__cy);
         return;
     }
-    int to = next_i(s, cx);
+    int to = ::nxtext__next_i(s, ::state__cx);
     if (ctrl) {
-        to = word_right(s, cx);
+        to = ::nxtext__word_right(s, ::state__cx);
     }
-    begin_edit("delete");
-    L[cy] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, cx) + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, to, -1));
-    end_edit(cy);
+    ::buffer__begin_edit("delete");
+    ::state__L[::state__cy] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, ::state__cx) + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, to, -1));
+    ::buffer__end_edit(::state__cy);
 }
 
-static void copy_sel(bool cut) {
-    if (has_sel()) {
-        std::string t = sel_text();
+static void editor__copy_sel(bool cut) {
+    if (::buffer__has_sel()) {
+        std::string t = ::buffer__sel_text();
         nx_clip_set(t.c_str());
-        line_clip = "";
+        ::state__line_clip = "";
         if (cut) {
-            sel_bounds();
-            int from = sel_y1;
-            begin_edit("cut");
-            delete_sel();
-            end_edit(from);
+            ::buffer__sel_bounds();
+            int from = ::state__sel_y1;
+            ::buffer__begin_edit("cut");
+            ::buffer__delete_sel();
+            ::buffer__end_edit(from);
         }
         return;
     }
-    std::string t = (L[cy] + "\n");
+    std::string t = (::state__L[::state__cy] + "\n");
     nx_clip_set(t.c_str());
-    line_clip = t;
+    ::state__line_clip = t;
     if (cut) {
-        begin_edit("cut");
-        ([&](){ auto& __nexa_v = L; int __nexa_i = cy; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
-        if ((int)((L).size()) == 0) {
-            L.push_back("");
+        ::buffer__begin_edit("cut");
+        ([&](){ auto& __nexa_v = ::state__L; int __nexa_i = ::state__cy; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+        if ((int)((::state__L).size()) == 0) {
+            ::state__L.push_back("");
         }
-        cy = imin(cy, ((int)((L).size()) - 1));
-        cx = imin(cx, (int)((L[cy]).size()));
-        ay = cy;
-        ax = cx;
-        end_edit(cy);
+        ::state__cy = ::draw__imin(::state__cy, ((int)((::state__L).size()) - 1));
+        ::state__cx = ::draw__imin(::state__cx, (int)((::state__L[::state__cy]).size()));
+        ::state__ay = ::state__cy;
+        ::state__ax = ::state__cx;
+        ::buffer__end_edit(::state__cy);
     }
 }
 
-static void paste() {
-    std::string t = nx_clip_get();
+static void editor__paste() {
+    std::string t = __nexa_text(nx_clip_get());
     if ((int)((t).size()) == 0) {
         return;
     }
-    if (!(has_sel()) && t == line_clip) {
-        begin_edit("paste");
-        int keep = cx;
-        cx = 0;
-        ax = 0;
-        insert_text(t);
-        cx = keep;
-        ax = cx;
-        end_edit((cy - 1));
-        reveal(false);
+    if (!(::buffer__has_sel()) && t == ::state__line_clip) {
+        ::buffer__begin_edit("paste");
+        int keep = ::state__cx;
+        ::state__cx = 0;
+        ::state__ax = 0;
+        ::buffer__insert_text(t);
+        ::state__cx = keep;
+        ::state__ax = ::state__cx;
+        ::buffer__end_edit((::state__cy - 1));
+        ::editor__reveal(false);
         return;
     }
-    sel_bounds();
-    int from = ((has_sel()) ? (sel_y1) : (cy));
-    begin_edit("paste");
-    insert_text(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(t, "\t", "    "));
-    end_edit(from);
-    reveal(false);
+    ::buffer__sel_bounds();
+    int from = ((::buffer__has_sel()) ? (::state__sel_y1) : (::state__cy));
+    ::buffer__begin_edit("paste");
+    ::buffer__insert_text(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(t, "\t", "    "));
+    ::buffer__end_edit(from);
+    ::editor__reveal(false);
 }
 
-static void move_v(int dy, bool extend) {
-    if (want < 0) {
-        want = vcol(L[cy], cx);
+static void editor__move_v(int dy, bool extend) {
+    if (::state__want < 0) {
+        ::state__want = ::nxtext__vcol(::state__L[::state__cy], ::state__cx);
     }
-    int ny = clamp((cy + dy), 0, ((int)((L).size()) - 1));
-    if (ny == cy) {
+    int ny = ::draw__clamp((::state__cy + dy), 0, ((int)((::state__L).size()) - 1));
+    if (ny == ::state__cy) {
         if (dy < 0) {
-            set_cursor(cy, 0, extend);
+            ::buffer__set_cursor(::state__cy, 0, extend);
         }
         if (dy > 0) {
-            set_cursor(cy, (int)((L[cy]).size()), extend);
+            ::buffer__set_cursor(::state__cy, (int)((::state__L[::state__cy]).size()), extend);
         }
         return;
     }
-    int w = want;
-    set_cursor(ny, at_vcol(L[ny], w), extend);
-    want = w;
+    int w = ::state__want;
+    ::buffer__set_cursor(ny, ::nxtext__at_vcol(::state__L[ny], w), extend);
+    ::state__want = w;
 }
 
-static void home(bool extend, bool ctrl) {
+static void editor__home(bool extend, bool ctrl) {
     if (ctrl) {
-        set_cursor(0, 0, extend);
+        ::buffer__set_cursor(0, 0, extend);
         return;
     }
-    int ind = (int)((leading_ws(L[cy])).size());
-    set_cursor(cy, ((cx == ind) ? (0) : (ind)), extend);
+    int ind = (int)((::nxtext__leading_ws(::state__L[::state__cy])).size());
+    ::buffer__set_cursor(::state__cy, ((::state__cx == ind) ? (0) : (ind)), extend);
 }
 
-static bool ed_key(int vk, int mods) {
-    bool ctrl = ((mods & M_CTRL) != 0);
-    bool shift = ((mods & M_SHIFT) != 0);
-    bool alt = ((mods & M_ALT) != 0);
-    if (comp_open && comp_key(vk, mods)) {
+static bool editor__ed_key(int vk, int mods) {
+    bool ctrl = ((mods & ::state__M_CTRL) != 0);
+    bool shift = ((mods & ::state__M_SHIFT) != 0);
+    bool alt = ((mods & ::state__M_ALT) != 0);
+    if (::state__comp_open && ::editor__comp_key(vk, mods)) {
         return true;
     }
     bool keep_want = false;
-    if (vk == K_LEFT) {
-        if (has_sel() && !(shift)) {
-            sel_bounds();
-            set_cursor(sel_y1, sel_x1, false);
-        } else if (cx == 0 && cy > 0) {
-            set_cursor((cy - 1), (int)((L[(cy - 1)]).size()), shift);
+    if (vk == ::state__K_LEFT) {
+        if (::buffer__has_sel() && !(shift)) {
+            ::buffer__sel_bounds();
+            ::buffer__set_cursor(::state__sel_y1, ::state__sel_x1, false);
+        } else if (::state__cx == 0 && ::state__cy > 0) {
+            ::buffer__set_cursor((::state__cy - 1), (int)((::state__L[(::state__cy - 1)]).size()), shift);
         } else {
-            set_cursor(cy, ((ctrl) ? (word_left(L[cy], cx)) : (prev_i(L[cy], cx))), shift);
+            ::buffer__set_cursor(::state__cy, ((ctrl) ? (::nxtext__word_left(::state__L[::state__cy], ::state__cx)) : (::nxtext__prev_i(::state__L[::state__cy], ::state__cx))), shift);
         }
-    } else if (vk == K_RIGHT) {
-        if (has_sel() && !(shift)) {
-            sel_bounds();
-            set_cursor(sel_y2, sel_x2, false);
-        } else if (cx >= (int)((L[cy]).size()) && cy < ((int)((L).size()) - 1)) {
-            set_cursor((cy + 1), 0, shift);
+    } else if (vk == ::state__K_RIGHT) {
+        if (::buffer__has_sel() && !(shift)) {
+            ::buffer__sel_bounds();
+            ::buffer__set_cursor(::state__sel_y2, ::state__sel_x2, false);
+        } else if (::state__cx >= (int)((::state__L[::state__cy]).size()) && ::state__cy < ((int)((::state__L).size()) - 1)) {
+            ::buffer__set_cursor((::state__cy + 1), 0, shift);
         } else {
-            set_cursor(cy, ((ctrl) ? (word_right(L[cy], cx)) : (next_i(L[cy], cx))), shift);
+            ::buffer__set_cursor(::state__cy, ((ctrl) ? (::nxtext__word_right(::state__L[::state__cy], ::state__cx)) : (::nxtext__next_i(::state__L[::state__cy], ::state__cx))), shift);
         }
-    } else if (vk == K_UP && alt) {
+    } else if (vk == ::state__K_UP && alt) {
         if (shift) {
-            copy_lines(-1);
+            ::editor__copy_lines(-1);
         } else {
-            move_lines(-1);
+            ::editor__move_lines(-1);
         }
-    } else if (vk == K_DOWN && alt) {
+    } else if (vk == ::state__K_DOWN && alt) {
         if (shift) {
-            copy_lines(1);
+            ::editor__copy_lines(1);
         } else {
-            move_lines(1);
+            ::editor__move_lines(1);
         }
-    } else if (vk == K_UP && ctrl) {
-        sy = imax(0, (sy - LH));
+    } else if (vk == ::state__K_UP && ctrl) {
+        ::state__sy = ::draw__imax(0, (::state__sy - ::state__LH));
         keep_want = true;
-    } else if (vk == K_DOWN && ctrl) {
-        sy = imin(max_sy(), (sy + LH));
+    } else if (vk == ::state__K_DOWN && ctrl) {
+        ::state__sy = ::draw__imin(::editor__max_sy(), (::state__sy + ::state__LH));
         keep_want = true;
-    } else if (vk == K_UP) {
-        move_v(-1, shift);
+    } else if (vk == ::state__K_UP) {
+        ::editor__move_v(-1, shift);
         keep_want = true;
-    } else if (vk == K_DOWN) {
-        move_v(1, shift);
+    } else if (vk == ::state__K_DOWN) {
+        ::editor__move_v(1, shift);
         keep_want = true;
-    } else if (vk == K_PGUP) {
-        int n = (visible_lines() - 1);
-        move_v((0 - n), shift);
-        sy = imax(0, (sy - (n * LH)));
+    } else if (vk == ::state__K_PGUP) {
+        int n = (::editor__visible_lines() - 1);
+        ::editor__move_v((0 - n), shift);
+        ::state__sy = ::draw__imax(0, (::state__sy - (n * ::state__LH)));
         keep_want = true;
-    } else if (vk == K_PGDN) {
-        int n = (visible_lines() - 1);
-        move_v(n, shift);
-        sy = imin(max_sy(), (sy + (n * LH)));
+    } else if (vk == ::state__K_PGDN) {
+        int n = (::editor__visible_lines() - 1);
+        ::editor__move_v(n, shift);
+        ::state__sy = ::draw__imin(::editor__max_sy(), (::state__sy + (n * ::state__LH)));
         keep_want = true;
-    } else if (vk == K_HOME) {
-        home(shift, ctrl);
-    } else if (vk == K_END) {
+    } else if (vk == ::state__K_HOME) {
+        ::editor__home(shift, ctrl);
+    } else if (vk == ::state__K_END) {
         if (ctrl) {
-            set_cursor(((int)((L).size()) - 1), (int)((L[((int)((L).size()) - 1)]).size()), shift);
+            ::buffer__set_cursor(((int)((::state__L).size()) - 1), (int)((::state__L[((int)((::state__L).size()) - 1)]).size()), shift);
         } else {
-            set_cursor(cy, (int)((L[cy]).size()), shift);
+            ::buffer__set_cursor(::state__cy, (int)((::state__L[::state__cy]).size()), shift);
         }
-    } else if (vk == K_BACK) {
-        backspace(ctrl);
-    } else if (vk == K_DELETE) {
+    } else if (vk == ::state__K_BACK) {
+        ::editor__backspace(ctrl);
+    } else if (vk == ::state__K_DELETE) {
         if (shift && !(ctrl)) {
-            copy_sel(true);
+            ::editor__copy_sel(true);
         } else {
-            delete_forward(ctrl);
+            ::editor__delete_forward(ctrl);
         }
-    } else if (vk == K_ENTER && ctrl) {
-        insert_line((!shift));
-    } else if (vk == K_ENTER) {
-        press_enter();
-    } else if (vk == K_TAB) {
-        sel_bounds();
+    } else if (vk == ::state__K_ENTER && ctrl) {
+        ::editor__insert_line((!shift));
+    } else if (vk == ::state__K_ENTER) {
+        ::editor__press_enter();
+    } else if (vk == ::state__K_TAB) {
+        ::buffer__sel_bounds();
         if (shift) {
-            indent_lines(true);
-        } else if (has_sel() && sel_y1 != sel_y2) {
-            indent_lines(false);
+            ::editor__indent_lines(true);
+        } else if (::buffer__has_sel() && ::state__sel_y1 != ::state__sel_y2) {
+            ::editor__indent_lines(false);
         } else {
-            int v = vcol(L[cy], cx);
-            edit_insert(([](const std::string& __s, int __n){ std::string __o; for (int __i = 0; __i < __n; __i++) __o += __s; return __o; })(" ", (4 - (v % 4))), "type");
+            int v = ::nxtext__vcol(::state__L[::state__cy], ::state__cx);
+            ::buffer__edit_insert(([](const std::string& __s, int __n){ std::string __o; for (int __i = 0; __i < __n; __i++) __o += __s; return __o; })(" ", (4 - (v % 4))), "type");
         }
-    } else if (vk == K_ESC) {
-        if (comp_open) {
-            comp_open = false;
-        } else if (find_open) {
-            find_open = false;
-        } else if (has_sel()) {
-            set_cursor(cy, cx, false);
+    } else if (vk == ::state__K_ESC) {
+        if (::state__comp_open) {
+            ::state__comp_open = false;
+        } else if (::state__find_open) {
+            ::state__find_open = false;
+        } else if (::buffer__has_sel()) {
+            ::buffer__set_cursor(::state__cy, ::state__cx, false);
         } else {
             return false;
         }
     } else if (ctrl && !(alt)) {
         if (vk == 90 && !(shift)) {
-            undo();
+            ::buffer__undo();
         } else if (vk == 89 || (vk == 90 && shift)) {
-            redo();
+            ::buffer__redo();
         } else if (vk == 65) {
-            ay = 0;
-            ax = 0;
-            cy = ((int)((L).size()) - 1);
-            cx = (int)((L[cy]).size());
+            ::state__ay = 0;
+            ::state__ax = 0;
+            ::state__cy = ((int)((::state__L).size()) - 1);
+            ::state__cx = (int)((::state__L[::state__cy]).size());
         } else if (vk == 67) {
-            copy_sel(false);
+            ::editor__copy_sel(false);
         } else if (vk == 88) {
-            copy_sel(true);
+            ::editor__copy_sel(true);
         } else if (vk == 86) {
-            paste();
+            ::editor__paste();
         } else if (vk == 76) {
-            select_line();
+            ::editor__select_line();
         } else if (vk == 68) {
-            copy_lines(1);
+            ::editor__copy_lines(1);
         } else if (vk == 75 && shift) {
-            delete_lines();
-        } else if (vk == K_SLASH) {
-            toggle_comment();
-        } else if (vk == K_RBRACKET) {
-            indent_lines(false);
-        } else if (vk == K_LBRACKET) {
-            indent_lines(true);
-        } else if (vk == K_BACKSLASH && shift) {
-            jump_bracket();
-        } else if (vk == K_SPACE) {
-            update_completion(true);
-            if (!(comp_open)) {
-                update_completion_any();
+            ::editor__delete_lines();
+        } else if (vk == ::state__K_SLASH) {
+            ::editor__toggle_comment();
+        } else if (vk == ::state__K_RBRACKET) {
+            ::editor__indent_lines(false);
+        } else if (vk == ::state__K_LBRACKET) {
+            ::editor__indent_lines(true);
+        } else if (vk == ::state__K_BACKSLASH && shift) {
+            ::editor__jump_bracket();
+        } else if (vk == ::state__K_SPACE) {
+            ::editor__update_completion(true);
+            if (!(::state__comp_open)) {
+                ::editor__update_completion_any();
             }
         } else {
             return false;
         }
-    } else if (vk == K_F12) {
-        goto_definition(word_at(cy, cx));
+    } else if (vk == ::state__K_F12) {
+        ::editor__goto_definition(::editor__word_at(::state__cy, ::state__cx));
     } else {
         return false;
     }
     if (!(keep_want)) {
-        want = -1;
+        ::state__want = -1;
     }
-    if (vk != K_BACK && vk != K_SPACE && !(ctrl && vk == K_SPACE)) {
-        if (vk == K_LEFT || vk == K_RIGHT || vk == K_UP || vk == K_DOWN || vk == K_HOME || vk == K_END || vk == K_PGUP || vk == K_PGDN || vk == K_ENTER) {
-            comp_open = false;
-            last_edit_kind = "";
+    if (vk != ::state__K_BACK && vk != ::state__K_SPACE && !(ctrl && vk == ::state__K_SPACE)) {
+        if (vk == ::state__K_LEFT || vk == ::state__K_RIGHT || vk == ::state__K_UP || vk == ::state__K_DOWN || vk == ::state__K_HOME || vk == ::state__K_END || vk == ::state__K_PGUP || vk == ::state__K_PGDN || vk == ::state__K_ENTER) {
+            ::state__comp_open = false;
+            ::state__last_edit_kind = "";
         }
     }
-    if ((vk != K_UP && vk != K_DOWN) || !(ctrl)) {
-        reveal(false);
+    if ((vk != ::state__K_UP && vk != ::state__K_DOWN) || !(ctrl)) {
+        ::editor__reveal(false);
     }
-    blink_ms = now_ms;
-    frame_dirty = true;
+    ::state__blink_ms = ::state__now_ms;
+    ::state__frame_dirty = true;
     return true;
 }
 
-static void ed_char(int cp) {
-    if (!(is_file_tab())) {
+static void editor__ed_char(int cp) {
+    if (!(::buffer__is_file_tab())) {
         return;
     }
-    type_char(cp);
-    want = -1;
-    blink_ms = now_ms;
+    ::editor__type_char(cp);
+    ::state__want = -1;
+    ::state__blink_ms = ::state__now_ms;
 }
 
-static void ed_mouse_down(int x, int y, int clicks, int mods) {
-    focus = F_EDITOR;
-    comp_open = false;
-    bool shift = ((mods & M_SHIFT) != 0);
-    bool ctrl = ((mods & M_CTRL) != 0);
-    int sbx = (ed_x + ed_w - SCROLL_W);
-    if (mm_w() > 0 && x >= (sbx - mm_w()) && x < sbx) {
-        drag = 6;
-        minimap_drag();
+static void editor__ed_mouse_down(int x, int y, int clicks, int mods) {
+    ::state__focus = ::state__F_EDITOR;
+    ::state__comp_open = false;
+    bool shift = ((mods & ::state__M_SHIFT) != 0);
+    bool ctrl = ((mods & ::state__M_CTRL) != 0);
+    int sbx = (::state__ed_x + ::state__ed_w - ::state__SCROLL_W);
+    if (::editor__mm_w() > 0 && x >= (sbx - ::editor__mm_w()) && x < sbx) {
+        ::state__drag = 6;
+        ::editor__minimap_drag();
         return;
     }
     if (x >= sbx) {
-        int total = (((int)((L).size()) * LH) + code_h());
-        int th = imax(px(20), (code_h() * code_h() / imax(total, 1)));
-        int ty = (ed_y + ((code_h() - th) * sy / imax(max_sy(), 1)));
+        int total = (((int)((::state__L).size()) * ::state__LH) + ::editor__code_h());
+        int th = ::draw__imax(::draw__px(20), (::editor__code_h() * ::editor__code_h() / ::draw__imax(total, 1)));
+        int ty = (::state__ed_y + ((::editor__code_h() - th) * ::state__sy / ::draw__imax(::editor__max_sy(), 1)));
         if (y >= ty && y < (ty + th)) {
-            drag = 4;
-            drag_off = (y - ty);
+            ::state__drag = 4;
+            ::state__drag_off = (y - ty);
         } else {
-            int frac = ((y - ed_y - (th / 2)) * 1000 / imax((code_h() - th), 1));
-            sy = clamp((frac * max_sy() / 1000), 0, max_sy());
-            drag = 4;
-            drag_off = (th / 2);
+            int frac = ((y - ::state__ed_y - (th / 2)) * 1000 / ::draw__imax((::editor__code_h() - th), 1));
+            ::state__sy = ::draw__clamp((frac * ::editor__max_sy() / 1000), 0, ::editor__max_sy());
+            ::state__drag = 4;
+            ::state__drag_off = (th / 2);
         }
         return;
     }
-    last_edit_kind = "";
-    hit_test(x, y);
-    if (x < text_x) {
+    ::state__last_edit_kind = "";
+    ::editor__hit_test(x, y);
+    if (x < ::state__text_x) {
         if (shift) {
-            set_cursor((((hit_y + 1) < (int)((L).size())) ? ((hit_y + 1)) : (hit_y)), (((hit_y + 1) < (int)((L).size())) ? (0) : ((int)((L[hit_y]).size()))), true);
+            ::buffer__set_cursor((((::state__hit_y + 1) < (int)((::state__L).size())) ? ((::state__hit_y + 1)) : (::state__hit_y)), (((::state__hit_y + 1) < (int)((::state__L).size())) ? (0) : ((int)((::state__L[::state__hit_y]).size()))), true);
         } else {
-            set_cursor(hit_y, 0, false);
-            if ((hit_y + 1) < (int)((L).size())) {
-                cy = (hit_y + 1);
-                cx = 0;
+            ::buffer__set_cursor(::state__hit_y, 0, false);
+            if ((::state__hit_y + 1) < (int)((::state__L).size())) {
+                ::state__cy = (::state__hit_y + 1);
+                ::state__cx = 0;
             } else {
-                cx = (int)((L[hit_y]).size());
+                ::state__cx = (int)((::state__L[::state__hit_y]).size());
             }
         }
-        drag = 3;
-        drag_line_mode = true;
-        drag_anchor_y = hit_y;
+        ::state__drag = 3;
+        ::state__drag_line_mode = true;
+        ::state__drag_anchor_y = ::state__hit_y;
         return;
     }
-    drag_line_mode = false;
+    ::state__drag_line_mode = false;
     if (ctrl && clicks == 1) {
-        std::string w = word_at(hit_y, hit_x);
+        std::string w = ::editor__word_at(::state__hit_y, ::state__hit_x);
         if ((int)((w).size()) > 0) {
-            set_cursor(hit_y, hit_x, false);
-            goto_definition(w);
+            ::buffer__set_cursor(::state__hit_y, ::state__hit_x, false);
+            ::editor__goto_definition(w);
             return;
         }
     }
     if (clicks == 2) {
-        set_cursor(hit_y, hit_x, false);
-        select_word();
-        drag_word = true;
-        drag_anchor_y = ay;
-        drag_anchor_a = ax;
-        drag_anchor_b = cx;
+        ::buffer__set_cursor(::state__hit_y, ::state__hit_x, false);
+        ::editor__select_word();
+        ::state__drag_word = true;
+        ::state__drag_anchor_y = ::state__ay;
+        ::state__drag_anchor_a = ::state__ax;
+        ::state__drag_anchor_b = ::state__cx;
     } else if (clicks >= 3) {
-        set_cursor(hit_y, 0, false);
-        select_line();
-        drag_line_mode = true;
-        drag_anchor_y = hit_y;
+        ::buffer__set_cursor(::state__hit_y, 0, false);
+        ::editor__select_line();
+        ::state__drag_line_mode = true;
+        ::state__drag_anchor_y = ::state__hit_y;
     } else {
-        set_cursor(hit_y, hit_x, shift);
-        drag_word = false;
+        ::buffer__set_cursor(::state__hit_y, ::state__hit_x, shift);
+        ::state__drag_word = false;
     }
-    want = -1;
-    drag = 3;
+    ::state__want = -1;
+    ::state__drag = 3;
 }
 
-static void ed_drag() {
-    if (drag == 4) {
-        int total = (((int)((L).size()) * LH) + code_h());
-        int th = imax(px(20), (code_h() * code_h() / imax(total, 1)));
-        int frac = ((my - drag_off - ed_y) * 1000 / imax((code_h() - th), 1));
-        sy = clamp((frac * max_sy() / 1000), 0, max_sy());
-        frame_dirty = true;
+static void editor__ed_drag() {
+    if (::state__drag == 4) {
+        int total = (((int)((::state__L).size()) * ::state__LH) + ::editor__code_h());
+        int th = ::draw__imax(::draw__px(20), (::editor__code_h() * ::editor__code_h() / ::draw__imax(total, 1)));
+        int frac = ((::state__my - ::state__drag_off - ::state__ed_y) * 1000 / ::draw__imax((::editor__code_h() - th), 1));
+        ::state__sy = ::draw__clamp((frac * ::editor__max_sy() / 1000), 0, ::editor__max_sy());
+        ::state__frame_dirty = true;
         return;
     }
-    if (my < ed_y) {
-        sy = imax(0, (sy - LH));
+    if (::state__my < ::state__ed_y) {
+        ::state__sy = ::draw__imax(0, (::state__sy - ::state__LH));
     }
-    if (my > (ed_y + ed_h)) {
-        sy = imin(max_sy(), (sy + LH));
+    if (::state__my > (::state__ed_y + ::state__ed_h)) {
+        ::state__sy = ::draw__imin(::editor__max_sy(), (::state__sy + ::state__LH));
     }
-    hit_test(mx, clamp(my, ed_y, (ed_y + ed_h - 1)));
-    if (drag_line_mode) {
-        if (hit_y >= drag_anchor_y) {
-            ay = drag_anchor_y;
-            ax = 0;
-            if ((hit_y + 1) < (int)((L).size())) {
-                cy = (hit_y + 1);
-                cx = 0;
+    ::editor__hit_test(::state__mx, ::draw__clamp(::state__my, ::state__ed_y, (::state__ed_y + ::state__ed_h - 1)));
+    if (::state__drag_line_mode) {
+        if (::state__hit_y >= ::state__drag_anchor_y) {
+            ::state__ay = ::state__drag_anchor_y;
+            ::state__ax = 0;
+            if ((::state__hit_y + 1) < (int)((::state__L).size())) {
+                ::state__cy = (::state__hit_y + 1);
+                ::state__cx = 0;
             } else {
-                cy = hit_y;
-                cx = (int)((L[hit_y]).size());
+                ::state__cy = ::state__hit_y;
+                ::state__cx = (int)((::state__L[::state__hit_y]).size());
             }
         } else {
-            ay = imin((drag_anchor_y + 1), ((int)((L).size()) - 1));
-            ax = (((drag_anchor_y + 1) < (int)((L).size())) ? (0) : ((int)((L[drag_anchor_y]).size())));
-            cy = hit_y;
-            cx = 0;
+            ::state__ay = ::draw__imin((::state__drag_anchor_y + 1), ((int)((::state__L).size()) - 1));
+            ::state__ax = (((::state__drag_anchor_y + 1) < (int)((::state__L).size())) ? (0) : ((int)((::state__L[::state__drag_anchor_y]).size())));
+            ::state__cy = ::state__hit_y;
+            ::state__cx = 0;
         }
-    } else if (drag_word) {
-        std::string w = word_at(hit_y, hit_x);
-        int a = hit_x;
-        int b = hit_x;
+    } else if (::state__drag_word) {
+        std::string w = ::editor__word_at(::state__hit_y, ::state__hit_x);
+        int a = ::state__hit_x;
+        int b = ::state__hit_x;
         if ((int)((w).size()) > 0) {
-            a = word_a;
-            b = word_b;
+            a = ::state__word_a;
+            b = ::state__word_b;
         }
-        if (hit_y < drag_anchor_y || (hit_y == drag_anchor_y && a < drag_anchor_a)) {
-            ay = drag_anchor_y;
-            ax = drag_anchor_b;
-            cy = hit_y;
-            cx = a;
+        if (::state__hit_y < ::state__drag_anchor_y || (::state__hit_y == ::state__drag_anchor_y && a < ::state__drag_anchor_a)) {
+            ::state__ay = ::state__drag_anchor_y;
+            ::state__ax = ::state__drag_anchor_b;
+            ::state__cy = ::state__hit_y;
+            ::state__cx = a;
         } else {
-            ay = drag_anchor_y;
-            ax = drag_anchor_a;
-            cy = hit_y;
-            cx = b;
+            ::state__ay = ::state__drag_anchor_y;
+            ::state__ax = ::state__drag_anchor_a;
+            ::state__cy = ::state__hit_y;
+            ::state__cx = b;
         }
     } else {
-        cy = hit_y;
-        cx = hit_x;
+        ::state__cy = ::state__hit_y;
+        ::state__cx = ::state__hit_x;
     }
-    frame_dirty = true;
-    reveal(false);
+    ::state__frame_dirty = true;
+    ::editor__reveal(false);
 }
 
-static void ed_wheel(int delta, bool horizontal) {
-    if (horizontal || (nx_mods() & M_SHIFT) != 0) {
-        sx = imax(0, (sx - (delta * CW * 6 / 120)));
+static void editor__ed_wheel(int delta, bool horizontal) {
+    if (horizontal || (nx_mods() & ::state__M_SHIFT) != 0) {
+        ::state__sx = ::draw__imax(0, (::state__sx - (delta * ::state__CW * 6 / 120)));
     } else {
-        sy = clamp((sy - (delta * LH * 3 / 120)), 0, max_sy());
+        ::state__sy = ::draw__clamp((::state__sy - (delta * ::state__LH * 3 / 120)), 0, ::editor__max_sy());
     }
-    frame_dirty = true;
+    ::state__frame_dirty = true;
 }
 
-static int find_def(const std::vector<std::string>& lines, const std::string& name) {
-    std::vector<std::string> pats = std::vector<std::string>{(std::string("fn ") + name + "("), (std::string("fn ") + name + " ("), (std::string("struct ") + name), (std::string("enum ") + name), (std::string("let ") + name + " "), (std::string("let ") + name + ":"), (std::string("let ") + name + "="), (std::string("let const ") + name), (std::string("#define ") + name), (std::string("class ") + name)};
+static std::string editor__strip_priv(const std::string& s) {
+    if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "priv ")) {
+        return ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 5, -1);
+    }
+    return s;
+}
+
+static int editor__find_def(const std::vector<std::string>& lines, const std::string& name) {
+    std::vector<std::string> pats = std::vector<std::string>{(std::string("fn ") + name + "("), (std::string("fn ") + name + " ("), (std::string("struct ") + name), (std::string("enum ") + name), (std::string("type ") + name), (std::string("shape ") + name), (std::string("let ") + name + " "), (std::string("let ") + name + ":"), (std::string("let ") + name + "="), (std::string("let const ") + name), (std::string("#define ") + name), (std::string("class ") + name)};
     for (int k = 0; k < (int)((lines).size()); k++) {
-        std::string t = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(lines[k]);
-        {
-            const std::vector<std::string>& __nexa_forin_2 = pats;
-            for (const std::string& p : __nexa_forin_2) {
-                if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, p) || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, (std::string("extern ") + p))) {
-                    std::string after = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, (int)((p).size()), 1);
-                    if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(p, "(") || (int)((after).size()) == 0 || !(is_word_b(ubyte(after, 0)))) {
-                        return k;
-                    }
+        std::string t = __nexa_text(::editor__strip_priv(([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(lines[k])));
+        for (int pi = 0; pi < (int)((pats).size()); pi++) {
+            std::string pat = __nexa_text(pats[pi]);
+            if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, pat) || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, (std::string("extern ") + pat))) {
+                std::string after = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, (int)((pat).size()), 1);
+                if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(pat, "(") || (int)((after).size()) == 0 || !(::nxtext__is_word_b(::nxtext__ubyte(after, 0)))) {
+                    return k;
                 }
             }
         }
@@ -6715,52 +7029,51 @@ static int find_def(const std::vector<std::string>& lines, const std::string& na
     return -1;
 }
 
-static void goto_definition(std::string name) {
+static void editor__goto_definition(std::string name) {
     if ((int)((name).size()) == 0) {
         return;
     }
-    int k = find_def(L, name);
+    std::vector<std::string> cur_lines = ::state__L;
+    int k = ::editor__find_def(cur_lines, name);
     if (k >= 0) {
-        int col = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(L[k], name);
-        set_cursor(k, imax(col, 0), false);
-        cx = (imax(col, 0) + (int)((name).size()));
-        ax = imax(col, 0);
-        reveal(true);
+        int col = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(::state__L[k], name);
+        ::buffer__set_cursor(k, ::draw__imax(col, 0), false);
+        ::state__cx = (::draw__imax(col, 0) + (int)((name).size()));
+        ::state__ax = ::draw__imax(col, 0);
+        ::editor__reveal(true);
         return;
     }
-    ensure_files_index();
-    {
-        const std::vector<std::string>& __nexa_forin_1 = files_index;
-        for (const std::string& p : __nexa_forin_1) {
-            if (!(([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(p), ".nxa")) || same_path(p, doc_path)) {
-                continue;
-            }
-            std::vector<std::string> lines = split_lines(__nexa_file_read((p).c_str()));
-            int d = find_def(lines, name);
-            if (d >= 0) {
-                open_file(p, false);
-                int col = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(L[d], name);
-                set_cursor(d, imax(col, 0), false);
-                ax = imax(col, 0);
-                cx = (ax + (int)((name).size()));
-                reveal(true);
-                return;
-            }
-        }
-    }
-    flash((std::string("No definition found for '") + name + "'"));
-}
-
-static void collect_symbols() {
-    sym_names.clear();
-    sym_lines.clear();
-    sym_kinds.clear();
-    for (int k = 0; k < (int)((L).size()); k++) {
-        std::string t = L[k];
-        if ((int)((t).size()) == 0 || (t[0] == ' ' && !(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(t, "fn ")))) {
+    ::workspace__ensure_files_index();
+    for (int fi = 0; fi < (int)((::state__files_index).size()); fi++) {
+        std::string path = __nexa_text(::state__files_index[fi]);
+        if (!(([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(path), ".nxa")) || ::buffer__same_path(path, ::state__doc_path)) {
             continue;
         }
-        std::string s = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(t);
+        std::vector<std::string> lines = ::nxtext__split_lines(__nexa_file_read((path).c_str()));
+        int d = ::editor__find_def(lines, name);
+        if (d >= 0) {
+            ::buffer__open_file(path, false);
+            int col = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(::state__L[d], name);
+            ::buffer__set_cursor(d, ::draw__imax(col, 0), false);
+            ::state__ax = ::draw__imax(col, 0);
+            ::state__cx = (::state__ax + (int)((name).size()));
+            ::editor__reveal(true);
+            return;
+        }
+    }
+    ::panel__flash((std::string("No definition found for '") + name + "'"));
+}
+
+static void editor__collect_symbols() {
+    ::state__sym_names.clear();
+    ::state__sym_lines.clear();
+    ::state__sym_kinds.clear();
+    for (int k = 0; k < (int)((::state__L).size()); k++) {
+        std::string t = __nexa_text(::state__L[k]);
+        if ((int)((t).size()) == 0 || (t[0] == ' ' && !(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(t, "fn ")) && !(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(t, "type ")) && !(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(t, "shape ")))) {
+            continue;
+        }
+        std::string s = ::editor__strip_priv(([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(t));
         int kind = 0;
         std::string rest = "";
         if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "fn ")) {
@@ -6775,7 +7088,13 @@ static void collect_symbols() {
         } else if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "enum ")) {
             kind = 3;
             rest = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 5, -1);
-        } else if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "let ") && (int)((leading_ws(t)).size()) == 0) {
+        } else if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "type ")) {
+            kind = 5;
+            rest = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 5, -1);
+        } else if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "shape ")) {
+            kind = 6;
+            rest = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 6, -1);
+        } else if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "let ") && (int)((::nxtext__leading_ws(t)).size()) == 0) {
             kind = 4;
             rest = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 4, -1);
             if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(rest, "const ")) {
@@ -6784,26 +7103,26 @@ static void collect_symbols() {
         } else {
             continue;
         }
-        int e = word_end(rest, 0);
+        int e = ::highlight__word_end(rest, 0);
         if (e == 0) {
             continue;
         }
-        sym_names.push_back(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(rest, 0, e));
-        sym_lines.push_back(k);
-        sym_kinds.push_back(kind);
+        ::state__sym_names.push_back(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(rest, 0, e));
+        ::state__sym_lines.push_back(k);
+        ::state__sym_kinds.push_back(kind);
     }
 }
 
-static std::string enclosing_symbol() {
-    int k = cy;
+static std::string editor__enclosing_symbol() {
+    int k = ::state__cy;
     while (k >= 0) {
-        std::string s = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(L[k]);
-        if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "fn ") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "struct ") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "enum ")) {
+        std::string s = ::editor__strip_priv(([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(::state__L[k]));
+        if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "fn ") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "struct ") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "enum ") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "type ") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "shape ")) {
             int sp = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(s, " ");
             std::string rest = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, (sp + 1), -1);
-            return ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(rest, 0, word_end(rest, 0));
+            return ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(rest, 0, ::highlight__word_end(rest, 0));
         }
-        if (k < cy && (int)((L[k]).size()) > 0 && L[k][0] == '}') {
+        if (k < ::state__cy && (int)((::state__L[k]).size()) > 0 && ::state__L[k][0] == '}') {
             return "";
         }
         k = k - 1;
@@ -6811,126 +7130,119 @@ static std::string enclosing_symbol() {
     return "";
 }
 
-static void comp_add(std::string w, int kind) {
-    if (([&](){ const auto& __nexa_v = comp_items; const auto& __nexa_x = w; for (const auto& __nexa_e : __nexa_v) { if (__nexa_e == __nexa_x) return true; } return false; })()) {
+static void editor__comp_add(std::string w, int kind) {
+    if (([&](){ const auto& __nexa_v = ::state__comp_items; const auto& __nexa_x = w; for (const auto& __nexa_e : __nexa_v) { if (__nexa_e == __nexa_x) return true; } return false; })()) {
         return;
     }
-    comp_items.push_back(w);
-    comp_kinds.push_back(kind);
+    ::state__comp_items.push_back(w);
+    ::state__comp_kinds.push_back(kind);
 }
 
-static void update_completion(bool force) {
-    if (doc_lang != L_NEXA && doc_lang != L_CPP && !(force)) {
-        comp_open = false;
+static void editor__update_completion(bool force) {
+    if (::state__doc_lang != ::state__L_NEXA && ::state__doc_lang != ::state__L_CPP && !(force)) {
+        ::state__comp_open = false;
         return;
     }
-    std::string s = L[cy];
-    int a = cx;
-    while (a > 0 && is_word_b(ubyte(s, (a - 1)))) {
+    std::string s = ::state__L[::state__cy];
+    int a = ::state__cx;
+    while (a > 0 && ::nxtext__is_word_b(::nxtext__ubyte(s, (a - 1)))) {
         a = a - 1;
     }
-    std::string prefix = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, a, (cx - a));
+    std::string prefix = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, a, (::state__cx - a));
     std::string member_of = "";
     if (a > 0 && s[(a - 1)] == '.') {
         int o = (a - 1);
-        while (o > 0 && is_word_b(ubyte(s, (o - 1)))) {
+        while (o > 0 && ::nxtext__is_word_b(::nxtext__ubyte(s, (o - 1)))) {
             o = o - 1;
         }
         member_of = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, o, (a - 1 - o));
     }
     if ((int)((prefix).size()) == 0 && (int)((member_of).size()) == 0 && !(force)) {
-        comp_open = false;
+        ::state__comp_open = false;
         return;
     }
-    if ((int)((prefix).size()) > 0 && is_digit_b(ubyte(prefix, 0))) {
-        comp_open = false;
+    if ((int)((prefix).size()) > 0 && ::highlight__is_digit_b(::nxtext__ubyte(prefix, 0))) {
+        ::state__comp_open = false;
         return;
     }
-    std::vector<int> cols = line_colors(cy);
-    if (cx > 0 && (cx - 1) < (int)((cols).size())) {
-        int c = cols[(cx - 1)];
-        if (c == S_STRING || c == S_COMMENT || c == S_ESCAPE) {
-            comp_open = false;
+    std::vector<int> cols = ::editor__line_colors(::state__cy);
+    if (::state__cx > 0 && (::state__cx - 1) < (int)((cols).size())) {
+        int c = cols[(::state__cx - 1)];
+        if (c == ::state__S_STRING || c == ::state__S_COMMENT || c == ::state__S_ESCAPE) {
+            ::state__comp_open = false;
             return;
         }
     }
-    comp_items.clear();
-    comp_kinds.clear();
-    comp_prefix = prefix;
+    ::state__comp_items.clear();
+    ::state__comp_kinds.clear();
+    ::state__comp_prefix = prefix;
     std::string lp = ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(prefix);
     if ((int)((member_of).size()) > 0) {
-        if (((nx_members).find(member_of) != (nx_members).end())) {
-            {
-                const std::vector<std::string>& __nexa_forin_1 = nx_members[member_of];
-                for (const std::string& m : __nexa_forin_1) {
-                    if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(m), lp)) {
-                        comp_add(m, 4);
-                    }
+        if (((::state__nx_members).find(member_of) != (::state__nx_members).end())) {
+            std::vector<std::string> mems = ::state__nx_members[member_of];
+            for (int mi = 0; mi < (int)((mems).size()); mi++) {
+                std::string m = __nexa_text(mems[mi]);
+                if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(m), lp)) {
+                    ::editor__comp_add(m, 4);
                 }
             }
         } else {
-            {
-                const std::vector<std::string>& __nexa_forin_2 = nx_methods;
-                for (const std::string& m : __nexa_forin_2) {
-                    if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(m), lp)) {
-                        comp_add(m, 6);
-                    }
+            for (int mi = 0; mi < (int)((::state__nx_methods).size()); mi++) {
+                std::string m = __nexa_text(::state__nx_methods[mi]);
+                if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(m), lp)) {
+                    ::editor__comp_add(m, 6);
                 }
             }
         }
     } else {
-        {
-            const std::map<std::string, int>& __nexa_forin_3 = nx_words;
-            for (const auto& __nexa_kv : __nexa_forin_3) {
-                const std::string& w = __nexa_kv.first;
-                const int& k = __nexa_kv.second;
-                if (doc_lang == L_NEXA && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(w), lp) && w != prefix) {
-                    comp_add(w, ((k == 3) ? (2) : (((k == 5) ? (3) : (1)))));
+        std::vector<std::string> word_keys = ([&](){ const auto& __nexa_m = ::state__nx_words; std::vector<std::string> __nexa_ks; __nexa_ks.reserve(__nexa_m.size()); for (const auto& __nexa_kv : __nexa_m) __nexa_ks.push_back(__nexa_kv.first); return __nexa_ks; })();
+        for (int wi = 0; wi < (int)((word_keys).size()); wi++) {
+            std::string w = __nexa_text(word_keys[wi]);
+            int k = ::state__nx_words[w];
+            if (::state__doc_lang == ::state__L_NEXA && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(w), lp) && w != prefix) {
+                ::editor__comp_add(w, ((k == 3) ? (2) : (((k == 5) ? (3) : (1)))));
+            }
+        }
+        if (::state__doc_lang == ::state__L_CPP) {
+            std::vector<std::string> cpp_keys = ([&](){ const auto& __nexa_m = ::state__cpp_words; std::vector<std::string> __nexa_ks; __nexa_ks.reserve(__nexa_m.size()); for (const auto& __nexa_kv : __nexa_m) __nexa_ks.push_back(__nexa_kv.first); return __nexa_ks; })();
+            for (int wi = 0; wi < (int)((cpp_keys).size()); wi++) {
+                std::string w = __nexa_text(cpp_keys[wi]);
+                int k = ::state__cpp_words[w];
+                if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(w), lp) && w != prefix) {
+                    ::editor__comp_add(w, ((k == 3) ? (2) : (1)));
                 }
             }
         }
-        if (doc_lang == L_CPP) {
-            {
-                const std::map<std::string, int>& __nexa_forin_4 = cpp_words;
-                for (const auto& __nexa_kv : __nexa_forin_4) {
-                    const std::string& w = __nexa_kv.first;
-                    const int& k = __nexa_kv.second;
-                    if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(w), lp) && w != prefix) {
-                        comp_add(w, ((k == 3) ? (2) : (1)));
-                    }
-                }
-            }
-        }
-        int y0 = imax(0, (cy - 400));
-        int y1 = imin((int)((L).size()), (cy + 400));
-        int y = y0;
+        int y0_ = ::draw__imax(0, (::state__cy - 400));
+        int y1_ = ::draw__imin((int)((::state__L).size()), (::state__cy + 400));
+        int y = y0_;
         int f0 = 0;
         int f1 = 0;
         if ((int)((lp).size()) > 0) {
-            f0 = ubyte(lp, 0);
+            f0 = ::nxtext__ubyte(lp, 0);
             f1 = f0;
             if (f0 >= 97 && f0 <= 122) {
                 f1 = (f0 - 32);
             }
         }
-        while (y < y1 && (int)((comp_items).size()) < 400) {
-            std::string t = L[y];
+        while (y < y1_ && (int)((::state__comp_items).size()) < 400) {
+            std::string t = ::state__L[y];
             int i = 0;
             while (i < (int)((t).size())) {
-                int b0 = ubyte(t, i);
-                if (is_word_b(b0) && (i == 0 || !(is_word_b(ubyte(t, (i - 1)))))) {
-                    int e = word_end(t, i);
+                int b0 = ::nxtext__ubyte(t, i);
+                if (::nxtext__is_word_b(b0) && (i == 0 || !(::nxtext__is_word_b(::nxtext__ubyte(t, (i - 1)))))) {
+                    int e = ::highlight__word_end(t, i);
                     if ((int)((lp).size()) > 0 && b0 != f0 && b0 != f1) {
                         i = e;
                         continue;
                     }
                     std::string w = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, i, (e - i));
-                    if ((e - i) > 2 && w != prefix && !(y == cy && i == a) && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(w), lp) && !(is_digit_b(ubyte(w, 0)))) {
+                    if ((e - i) > 2 && w != prefix && !(y == ::state__cy && i == a) && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(w), lp) && !(::highlight__is_digit_b(::nxtext__ubyte(w, 0)))) {
                         int kind = 5;
                         if (e < (int)((t).size()) && t[e] == '(') {
                             kind = 4;
                         }
-                        comp_add(w, kind);
+                        ::editor__comp_add(w, kind);
                     }
                     i = e;
                 } else {
@@ -6940,98 +7252,98 @@ static void update_completion(bool force) {
             y = y + 1;
         }
     }
-    if ((int)((comp_items).size()) == 0) {
-        comp_open = false;
+    if ((int)((::state__comp_items).size()) == 0) {
+        ::state__comp_open = false;
         return;
     }
     std::vector<std::string> order;
-    for (int i = 0; i < (int)((comp_items).size()); i++) {
-        std::string w = comp_items[i];
+    for (int i = 0; i < (int)((::state__comp_items).size()); i++) {
+        std::string w = __nexa_text(::state__comp_items[i]);
         int rank = ((([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(w, prefix)) ? (0) : (1));
-        order.push_back((std::string("") + std::to_string(rank) + __nexa_fmt_i(static_cast<long long>((int)((w).size())), "0", '=', 0, 3, false, 0) + w + "\x01" + std::to_string(comp_kinds[i])));
+        order.push_back((std::string("") + std::to_string(rank) + __nexa_fmt_i(static_cast<long long>((int)((w).size())), "0", '=', 0, 3, false, 0) + w + "\x01" + __nexa_text(::state__comp_kinds[i])));
     }
     ([&](){ auto& __nexa_v = order; size_t __nexa_n = __nexa_v.size(); auto __nexa_sift = [&](size_t __nexa_r, size_t __nexa_m){ while (true) { size_t __nexa_c = __nexa_r * 2 + 1; if (__nexa_c >= __nexa_m) break; if (__nexa_c + 1 < __nexa_m && __nexa_v[__nexa_c] < __nexa_v[__nexa_c + 1]) __nexa_c++; if (!(__nexa_v[__nexa_r] < __nexa_v[__nexa_c])) break; auto __nexa_t = __nexa_v[__nexa_r]; __nexa_v[__nexa_r] = __nexa_v[__nexa_c]; __nexa_v[__nexa_c] = __nexa_t; __nexa_r = __nexa_c; } }; for (size_t __nexa_i = __nexa_n / 2; __nexa_i-- > 0; ) __nexa_sift(__nexa_i, __nexa_n); for (size_t __nexa_i = __nexa_n; __nexa_i-- > 1; ) { auto __nexa_t = __nexa_v[0]; __nexa_v[0] = __nexa_v[__nexa_i]; __nexa_v[__nexa_i] = __nexa_t; __nexa_sift(0, __nexa_i); } })();
-    comp_items.clear();
-    comp_kinds.clear();
+    ::state__comp_items.clear();
+    ::state__comp_kinds.clear();
     {
-        const std::vector<std::string>& __nexa_forin_5 = order;
-        for (const std::string& o : __nexa_forin_5) {
+        const std::vector<std::string>& __nexa_forin_1 = order;
+        for (const std::string& o : __nexa_forin_1) {
             int sep = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(o, "\x01");
-            comp_items.push_back(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(o, 4, (sep - 4)));
-            comp_kinds.push_back(([](const std::string& __s){ char* __e=nullptr; long __v=std::strtol(__s.c_str(),&__e,10); return (__e==__s.c_str())?0:static_cast<int>(__v); })(std::string(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(o, (sep + 1), -1))));
+            ::state__comp_items.push_back(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(o, 4, (sep - 4)));
+            ::state__comp_kinds.push_back(([](const std::string& __s){ char* __e=nullptr; long __v=std::strtol(__s.c_str(),&__e,10); return (__e==__s.c_str())?0:static_cast<int>(__v); })(std::string(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(o, (sep + 1), -1))));
         }
     }
-    comp_open = true;
-    comp_sel = 0;
-    comp_top = 0;
+    ::state__comp_open = true;
+    ::state__comp_sel = 0;
+    ::state__comp_top = 0;
 }
 
-static void update_completion_any() {
-    update_completion(true);
+static void editor__update_completion_any() {
+    ::editor__update_completion(true);
 }
 
-static void comp_accept() {
-    if (!(comp_open) || comp_sel >= (int)((comp_items).size())) {
+static void editor__comp_accept() {
+    if (!(::state__comp_open) || ::state__comp_sel >= (int)((::state__comp_items).size())) {
         return;
     }
-    std::string w = comp_items[comp_sel];
-    std::string s = L[cy];
-    int a = cx;
-    while (a > 0 && is_word_b(ubyte(s, (a - 1)))) {
+    std::string w = ::state__comp_items[::state__comp_sel];
+    std::string s = ::state__L[::state__cy];
+    int a = ::state__cx;
+    while (a > 0 && ::nxtext__is_word_b(::nxtext__ubyte(s, (a - 1)))) {
         a = a - 1;
     }
-    int b = cx;
-    while (b < (int)((s).size()) && is_word_b(ubyte(s, b))) {
+    int b = ::state__cx;
+    while (b < (int)((s).size()) && ::nxtext__is_word_b(::nxtext__ubyte(s, b))) {
         b = b + 1;
     }
-    begin_edit("complete");
-    L[cy] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, a) + w + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, b, -1));
-    cx = (a + (int)((w).size()));
-    ax = cx;
-    ay = cy;
-    end_edit(cy);
-    comp_open = false;
-    last_edit_kind = "";
+    ::buffer__begin_edit("complete");
+    ::state__L[::state__cy] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, a) + w + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, b, -1));
+    ::state__cx = (a + (int)((w).size()));
+    ::state__ax = ::state__cx;
+    ::state__ay = ::state__cy;
+    ::buffer__end_edit(::state__cy);
+    ::state__comp_open = false;
+    ::state__last_edit_kind = "";
 }
 
-static bool comp_key(int vk, int mods) {
-    int n = (int)((comp_items).size());
-    if (vk == K_DOWN) {
-        comp_sel = ((comp_sel + 1) % n);
-    } else if (vk == K_UP) {
-        comp_sel = ((comp_sel + n - 1) % n);
-    } else if (vk == K_PGDN) {
-        comp_sel = imin((n - 1), (comp_sel + 8));
-    } else if (vk == K_PGUP) {
-        comp_sel = imax(0, (comp_sel - 8));
-    } else if (vk == K_ENTER || vk == K_TAB) {
-        comp_accept();
-    } else if (vk == K_ESC) {
-        comp_open = false;
+static bool editor__comp_key(int vk, int mods) {
+    int n = (int)((::state__comp_items).size());
+    if (vk == ::state__K_DOWN) {
+        ::state__comp_sel = ((::state__comp_sel + 1) % n);
+    } else if (vk == ::state__K_UP) {
+        ::state__comp_sel = ((::state__comp_sel + n - 1) % n);
+    } else if (vk == ::state__K_PGDN) {
+        ::state__comp_sel = ::draw__imin((n - 1), (::state__comp_sel + 8));
+    } else if (vk == ::state__K_PGUP) {
+        ::state__comp_sel = ::draw__imax(0, (::state__comp_sel - 8));
+    } else if (vk == ::state__K_ENTER || vk == ::state__K_TAB) {
+        ::editor__comp_accept();
+    } else if (vk == ::state__K_ESC) {
+        ::state__comp_open = false;
     } else {
         return false;
     }
-    frame_dirty = true;
+    ::state__frame_dirty = true;
     return true;
 }
 
-static int comp_color(int kind) {
+static int editor__comp_color(int kind) {
     if (kind == 1) {
-        return S_KEYWORD;
+        return ::state__S_KEYWORD;
     }
     if (kind == 2) {
-        return S_TYPE;
+        return ::state__S_TYPE;
     }
     if (kind == 3) {
-        return S_TYPE;
+        return ::state__S_TYPE;
     }
     if (kind == 4 || kind == 6) {
         return 0xB180D7;
     }
-    return S_VAR;
+    return ::state__S_VAR;
 }
 
-static std::string comp_icon(int kind) {
+static std::string editor__comp_icon(int kind) {
     if (kind == 1) {
         return "k";
     }
@@ -7047,53 +7359,53 @@ static std::string comp_icon(int kind) {
     return "ab";
 }
 
-static void draw_completion() {
-    if (!(comp_open) || !(is_file_tab())) {
+static void editor__draw_completion() {
+    if (!(::state__comp_open) || !(::buffer__is_file_tab())) {
         return;
     }
-    int n = (int)((comp_items).size());
-    int rows = imin(n, 12);
-    int rh = px(22);
-    int w = px(360);
+    int n = (int)((::state__comp_items).size());
+    int rows = ::draw__imin(n, 12);
+    int rh = ::draw__px(22);
+    int w = ::draw__px(360);
     int h = ((rows * rh) + 2);
-    int x = (text_x + (vcol(L[cy], (cx - (int)((comp_prefix).size()))) * CW) - sx - px(24));
-    int y = (ed_y + ((cy + 1) * LH) - sy + px(2));
-    if ((y + h) > (ed_y + ed_h) && (y - LH - h - px(4)) > ed_y) {
-        y = (y - LH - h - px(4));
+    int x = (::state__text_x + (::nxtext__vcol(::state__L[::state__cy], (::state__cx - (int)((::state__comp_prefix).size()))) * ::state__CW) - ::state__sx - ::draw__px(24));
+    int y = (::state__ed_y + ((::state__cy + 1) * ::state__LH) - ::state__sy + ::draw__px(2));
+    if ((y + h) > (::state__ed_y + ::state__ed_h) && (y - ::state__LH - h - ::draw__px(4)) > ::state__ed_y) {
+        y = (y - ::state__LH - h - ::draw__px(4));
     }
-    x = clamp(x, ed_x, (win_w - w - px(4)));
-    if (comp_sel < comp_top) {
-        comp_top = comp_sel;
+    x = ::draw__clamp(x, ::state__ed_x, (::state__win_w - w - ::draw__px(4)));
+    if (::state__comp_sel < ::state__comp_top) {
+        ::state__comp_top = ::state__comp_sel;
     }
-    if (comp_sel >= (comp_top + rows)) {
-        comp_top = (comp_sel - rows + 1);
+    if (::state__comp_sel >= (::state__comp_top + rows)) {
+        ::state__comp_top = (::state__comp_sel - rows + 1);
     }
-    fill(x, y, w, h, 0x202020);
-    outline(x, y, w, h, 0x454545);
+    ::draw__fill(x, y, w, h, 0x202020);
+    ::draw__outline(x, y, w, h, 0x454545);
     for (int r = 0; r < rows; r++) {
-        int i = (comp_top + r);
+        int i = (::state__comp_top + r);
         int ry = (y + 1 + (r * rh));
-        if (i == comp_sel) {
-            fill((x + 1), ry, (w - 2), rh, 0x04395E);
-            outline((x + 1), ry, (w - 2), rh, C_ACCENT);
+        if (i == ::state__comp_sel) {
+            ::draw__fill((x + 1), ry, (w - 2), rh, 0x04395E);
+            ::draw__outline((x + 1), ry, (w - 2), rh, ::state__C_ACCENT);
         }
-        int kind = comp_kinds[i];
-        std::string icon = comp_icon(kind);
+        int kind = ::state__comp_kinds[i];
+        std::string icon = ::editor__comp_icon(kind);
         if ((int)((icon).size()) == 0) {
-            draw_glyph("symbol", (x + px(5)), (ry + ((rh - px(16)) / 2)), px(16), comp_color(kind));
+            ::draw__draw_glyph("symbol", (x + ::draw__px(5)), (ry + ((rh - ::draw__px(16)) / 2)), ::draw__px(16), ::editor__comp_color(kind));
         } else {
-            txt_v((x + px(8)), ry, rh, icon, comp_color(kind), UI_SMALL);
+            ::draw__txt_v((x + ::draw__px(8)), ry, rh, icon, ::editor__comp_color(kind), ::state__UI_SMALL);
         }
-        std::string word = comp_items[i];
-        int pl = (int)((comp_prefix).size());
-        int tx = (x + px(30));
-        if (pl > 0 && pl <= (int)((word).size()) && ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(word, 0, pl)) == ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(comp_prefix)) {
-            int wa = txt_v(tx, ry, rh, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(word, 0, pl), 0x2AAAFF, UI);
-            txt_v((tx + wa), ry, rh, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(word, pl, -1), C_TEXT, UI);
+        std::string word = ::state__comp_items[i];
+        int pl = (int)((::state__comp_prefix).size());
+        int tx = (x + ::draw__px(30));
+        if (pl > 0 && pl <= (int)((word).size()) && ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(word, 0, pl)) == ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(::state__comp_prefix)) {
+            int wa = ::draw__txt_v(tx, ry, rh, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(word, 0, pl), 0x2AAAFF, ::state__UI);
+            ::draw__txt_v((tx + wa), ry, rh, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(word, pl, -1), ::state__C_TEXT, ::state__UI);
         } else {
-            txt_v(tx, ry, rh, word, C_TEXT, UI);
+            ::draw__txt_v(tx, ry, rh, word, ::state__C_TEXT, ::state__UI);
         }
-        if (i == comp_sel) {
+        if (i == ::state__comp_sel) {
             std::string d = "";
             if (kind == 1) {
                 d = "keyword";
@@ -7110,71 +7422,71 @@ static void draw_completion() {
             if (kind == 6) {
                 d = "method";
             }
-            int dw = tw(d, UI_SMALL);
-            txt_v((x + w - dw - px(10)), ry, rh, d, C_MUTED, UI_SMALL);
+            int dw = ::draw__tw(d, ::state__UI_SMALL);
+            ::draw__txt_v((x + w - dw - ::draw__px(10)), ry, rh, d, ::state__C_MUTED, ::state__UI_SMALL);
         }
     }
-    comp_box_x = x;
-    comp_box_y = y;
-    comp_box_w = w;
-    comp_box_h = h;
+    ::state__comp_box_x = x;
+    ::state__comp_box_y = y;
+    ::state__comp_box_w = w;
+    ::state__comp_box_h = h;
 }
 
-static bool comp_click(int x, int y) {
-    if (!(comp_open) || !(inside(x, y, comp_box_x, comp_box_y, comp_box_w, comp_box_h))) {
+static bool editor__comp_click(int x, int y) {
+    if (!(::state__comp_open) || !(::draw__inside(x, y, ::state__comp_box_x, ::state__comp_box_y, ::state__comp_box_w, ::state__comp_box_h))) {
         return false;
     }
-    int r = ((y - comp_box_y - 1) / px(22));
-    comp_sel = clamp((comp_top + r), 0, ((int)((comp_items).size()) - 1));
-    comp_accept();
+    int r = ((y - ::state__comp_box_y - 1) / ::draw__px(22));
+    ::state__comp_sel = ::draw__clamp((::state__comp_top + r), 0, ((int)((::state__comp_items).size()) - 1));
+    ::editor__comp_accept();
     return true;
 }
 
-static std::string find_key() {
-    return (std::string("") + std::to_string(doc_ver) + "|" + std::string(find_case ? "true" : "false") + "|" + std::string(find_word ? "true" : "false") + "|" + fld_text[FLD_FIND] + "|" + std::to_string(active));
+static std::string editor__find_key() {
+    return (std::string("") + std::to_string(::state__doc_ver) + "|" + std::string(::state__find_case ? "true" : "false") + "|" + std::string(::state__find_word ? "true" : "false") + "|" + ::state__fld_text[::state__FLD_FIND] + "|" + std::to_string(::state__active));
 }
 
-static void find_update() {
-    std::string key = find_key();
-    if (key == find_hits_key) {
+static void editor__find_update() {
+    std::string key = ::editor__find_key();
+    if (key == ::state__find_hits_key) {
         return;
     }
-    find_hits_key = key;
-    find_hits_y.clear();
-    find_hits_x.clear();
-    std::string pat = fld_text[FLD_FIND];
-    if ((int)((pat).size()) == 0 || !(is_file_tab())) {
+    ::state__find_hits_key = key;
+    ::state__find_hits_y.clear();
+    ::state__find_hits_x.clear();
+    std::string pat = ::state__fld_text[::state__FLD_FIND];
+    if ((int)((pat).size()) == 0 || !(::buffer__is_file_tab())) {
         return;
     }
-    std::string p = ((find_case) ? (pat) : (([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(pat)));
-    for (int y = 0; y < (int)((L).size()); y++) {
-        std::string s = L[y];
-        if (!(find_case)) {
+    std::string p = ((::state__find_case) ? (pat) : (([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(pat)));
+    for (int y = 0; y < (int)((::state__L).size()); y++) {
+        std::string s = __nexa_text(::state__L[y]);
+        if (!(::state__find_case)) {
             s = ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(s);
         }
         int at = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(s, p);
-        while (at >= 0 && (int)((find_hits_y).size()) < 20000) {
+        while (at >= 0 && (int)((::state__find_hits_y).size()) < 20000) {
             bool ok = true;
-            if (find_word) {
-                ok = (!(is_word_at(s, (at - 1))) && !(is_word_at(s, (at + (int)((p).size())))));
+            if (::state__find_word) {
+                ok = (!(::nxtext__is_word_at(s, (at - 1))) && !(::nxtext__is_word_at(s, (at + (int)((p).size())))));
             }
             if (ok) {
-                find_hits_y.push_back(y);
-                find_hits_x.push_back(at);
+                ::state__find_hits_y.push_back(y);
+                ::state__find_hits_x.push_back(at);
             }
-            at = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, p, (at + imax(1, (int)((p).size()))));
+            at = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, p, (at + ::draw__imax(1, (int)((p).size()))));
         }
     }
 }
 
-static int find_pick(int y, int x, int dir) {
-    int n = (int)((find_hits_y).size());
+static int editor__find_pick(int y, int x, int dir) {
+    int n = (int)((::state__find_hits_y).size());
     if (n == 0) {
         return -1;
     }
     if (dir > 0) {
         for (int i = 0; i < n; i++) {
-            if (find_hits_y[i] > y || (find_hits_y[i] == y && find_hits_x[i] >= x)) {
+            if (::state__find_hits_y[i] > y || (::state__find_hits_y[i] == y && ::state__find_hits_x[i] >= x)) {
                 return i;
             }
         }
@@ -7182,7 +7494,7 @@ static int find_pick(int y, int x, int dir) {
     }
     int i = (n - 1);
     while (i >= 0) {
-        if (find_hits_y[i] < y || (find_hits_y[i] == y && find_hits_x[i] < x)) {
+        if (::state__find_hits_y[i] < y || (::state__find_hits_y[i] == y && ::state__find_hits_x[i] < x)) {
             return i;
         }
         i = i - 1;
@@ -7190,260 +7502,260 @@ static int find_pick(int y, int x, int dir) {
     return (n - 1);
 }
 
-static void find_next(int dir) {
-    find_update();
-    int n = (int)((find_hits_y).size());
+static void editor__find_next(int dir) {
+    ::editor__find_update();
+    int n = (int)((::state__find_hits_y).size());
     if (n == 0) {
         return;
     }
-    sel_bounds();
+    ::buffer__sel_bounds();
     int i = 0;
     if (dir > 0) {
-        i = find_pick(sel_y2, ((has_sel()) ? (sel_x2) : (cx)), 1);
+        i = ::editor__find_pick(::state__sel_y2, ((::buffer__has_sel()) ? (::state__sel_x2) : (::state__cx)), 1);
     } else {
-        i = find_pick(sel_y1, sel_x1, -1);
+        i = ::editor__find_pick(::state__sel_y1, ::state__sel_x1, -1);
     }
-    select_hit(i);
+    ::editor__select_hit(i);
 }
 
-static void select_hit(int i) {
-    int plen = (int)((fld_text[FLD_FIND]).size());
-    int hy = find_hits_y[i];
-    int hx = find_hits_x[i];
-    ay = hy;
-    ax = hx;
-    cy = hy;
-    cx = (hx + plen);
-    find_cur = i;
-    reveal(true);
-    frame_dirty = true;
+static void editor__select_hit(int i) {
+    int plen = (int)((::state__fld_text[::state__FLD_FIND]).size());
+    int hy = ::state__find_hits_y[i];
+    int hx = ::state__find_hits_x[i];
+    ::state__ay = hy;
+    ::state__ax = hx;
+    ::state__cy = hy;
+    ::state__cx = (hx + plen);
+    ::state__find_cur = i;
+    ::editor__reveal(true);
+    ::state__frame_dirty = true;
 }
 
-static int current_hit() {
-    if (!(has_sel())) {
+static int editor__current_hit() {
+    if (!(::buffer__has_sel())) {
         return -1;
     }
-    sel_bounds();
-    if (sel_y1 != sel_y2) {
+    ::buffer__sel_bounds();
+    if (::state__sel_y1 != ::state__sel_y2) {
         return -1;
     }
-    for (int i = 0; i < (int)((find_hits_y).size()); i++) {
-        if (find_hits_y[i] == sel_y1 && find_hits_x[i] == sel_x1 && (sel_x2 - sel_x1) == (int)((fld_text[FLD_FIND]).size())) {
+    for (int i = 0; i < (int)((::state__find_hits_y).size()); i++) {
+        if (::state__find_hits_y[i] == ::state__sel_y1 && ::state__find_hits_x[i] == ::state__sel_x1 && (::state__sel_x2 - ::state__sel_x1) == (int)((::state__fld_text[::state__FLD_FIND]).size())) {
             return i;
         }
     }
     return -1;
 }
 
-static void replace_one() {
-    find_update();
-    int i = current_hit();
+static void editor__replace_one() {
+    ::editor__find_update();
+    int i = ::editor__current_hit();
     if (i < 0) {
-        find_next(1);
+        ::editor__find_next(1);
         return;
     }
-    std::string rep = fld_text[FLD_REPLACE];
-    edit_insert(rep, "replace");
-    find_update();
-    find_next(1);
+    std::string rep = ::state__fld_text[::state__FLD_REPLACE];
+    ::buffer__edit_insert(rep, "replace");
+    ::editor__find_update();
+    ::editor__find_next(1);
 }
 
-static void replace_all() {
-    find_update();
-    int n = (int)((find_hits_y).size());
+static void editor__replace_all() {
+    ::editor__find_update();
+    int n = (int)((::state__find_hits_y).size());
     if (n == 0) {
         return;
     }
-    int plen = (int)((fld_text[FLD_FIND]).size());
-    std::string rep = fld_text[FLD_REPLACE];
-    begin_edit("replace-all");
+    int plen = (int)((::state__fld_text[::state__FLD_FIND]).size());
+    std::string rep = ::state__fld_text[::state__FLD_REPLACE];
+    ::buffer__begin_edit("replace-all");
     int i = (n - 1);
     while (i >= 0) {
-        int y = find_hits_y[i];
-        int x = find_hits_x[i];
-        std::string s = L[y];
-        L[y] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, x) + rep + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, (x + plen), -1));
+        int y = ::state__find_hits_y[i];
+        int x = ::state__find_hits_x[i];
+        std::string s = ::state__L[y];
+        ::state__L[y] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 0, x) + rep + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, (x + plen), -1));
         i = i - 1;
     }
-    clamp_cursor();
-    ay = cy;
-    ax = cx;
-    end_edit(0);
-    flash((std::string("Replaced ") + std::to_string(n) + " occurrence" + ((n == 1) ? (std::string("")) : (std::string("s")))));
+    ::buffer__clamp_cursor();
+    ::state__ay = ::state__cy;
+    ::state__ax = ::state__cx;
+    ::buffer__end_edit(0);
+    ::panel__flash((std::string("Replaced ") + std::to_string(n) + " occurrence" + ((n == 1) ? (std::string("")) : (std::string("s")))));
 }
 
-static void open_find(bool replace) {
-    if (!(is_file_tab())) {
+static void editor__open_find(bool replace) {
+    if (!(::buffer__is_file_tab())) {
         return;
     }
-    find_open = true;
-    find_replace = (replace || (find_replace && find_open));
+    ::state__find_open = true;
+    ::state__find_replace = (replace || (::state__find_replace && ::state__find_open));
     if (!(replace)) {
-        find_replace = false;
+        ::state__find_replace = false;
     }
-    std::string t = sel_text();
+    std::string t = ::buffer__sel_text();
     if ((int)((t).size()) > 0 && !(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(t, "\n"))) {
-        fld_set(FLD_FIND, t);
-    } else if (!(has_sel())) {
-        std::string w = word_at(cy, cx);
-        if ((int)((w).size()) > 0 && (int)((fld_text[FLD_FIND]).size()) == 0) {
-            fld_set(FLD_FIND, w);
+        ::nxtext__fld_set(::state__FLD_FIND, t);
+    } else if (!(::buffer__has_sel())) {
+        std::string w = ::editor__word_at(::state__cy, ::state__cx);
+        if ((int)((w).size()) > 0 && (int)((::state__fld_text[::state__FLD_FIND]).size()) == 0) {
+            ::nxtext__fld_set(::state__FLD_FIND, w);
         }
     }
-    fld_select_all(FLD_FIND);
-    focus = F_FIND;
+    ::nxtext__fld_select_all(::state__FLD_FIND);
+    ::state__focus = ::state__F_FIND;
     if (replace) {
-        find_replace = true;
+        ::state__find_replace = true;
     }
-    frame_dirty = true;
+    ::state__frame_dirty = true;
 }
 
-static void find_layout() {
-    fw_w = imin(px(440), (ed_w - px(40)));
-    fw_h = ((find_replace) ? (px(66)) : (px(36)));
-    fw_x = (ed_x + ed_w - fw_w - SCROLL_W - mm_w() - px(6));
-    fw_y = ed_y;
+static void editor__find_layout() {
+    ::state__fw_w = ::draw__imin(::draw__px(440), (::state__ed_w - ::draw__px(40)));
+    ::state__fw_h = ((::state__find_replace) ? (::draw__px(66)) : (::draw__px(36)));
+    ::state__fw_x = (::state__ed_x + ::state__ed_w - ::state__fw_w - ::state__SCROLL_W - ::editor__mm_w() - ::draw__px(6));
+    ::state__fw_y = ::state__ed_y;
 }
 
-static void draw_find() {
-    if (!(find_open) || !(is_file_tab())) {
+static void editor__draw_find() {
+    if (!(::state__find_open) || !(::buffer__is_file_tab())) {
         return;
     }
-    find_update();
-    find_layout();
-    int x = fw_x;
-    int y = fw_y;
-    fill(x, y, fw_w, fw_h, C_WIDGET);
-    outline(x, y, fw_w, fw_h, 0x454545);
-    fill(x, y, px(3), fw_h, ((find_replace) ? (C_ACCENT) : (0x454545)));
-    int tgx = (x + px(6));
-    if (icon_button(tgx, (y + px(8)), ((find_replace) ? (std::string("chevdown")) : (std::string("chevright"))), "Toggle Replace")) {
-        find_replace = (!find_replace);
-        frame_dirty = true;
+    ::editor__find_update();
+    ::editor__find_layout();
+    int x = ::state__fw_x;
+    int y = ::state__fw_y;
+    ::draw__fill(x, y, ::state__fw_w, ::state__fw_h, ::state__C_WIDGET);
+    ::draw__outline(x, y, ::state__fw_w, ::state__fw_h, 0x454545);
+    ::draw__fill(x, y, ::draw__px(3), ::state__fw_h, ((::state__find_replace) ? (::state__C_ACCENT) : (0x454545)));
+    int tgx = (x + ::draw__px(6));
+    if (::workspace__icon_button(tgx, (y + ::draw__px(8)), ((::state__find_replace) ? (std::string("chevdown")) : (std::string("chevright"))), "Toggle Replace")) {
+        ::state__find_replace = (!::state__find_replace);
+        ::state__frame_dirty = true;
     }
-    int fx = (x + px(28));
-    int fwid = (fw_w - px(28) - px(170));
-    fld_draw(FLD_FIND, fx, (y + px(6)), fwid, px(24), (focus == F_FIND), "Find");
-    int tx = (fx + fwid - px(48));
-    if (toggle_box(tx, (y + px(8)), "Aa", find_case)) {
-        find_case = (!find_case);
+    int fx = (x + ::draw__px(28));
+    int fwid = (::state__fw_w - ::draw__px(28) - ::draw__px(170));
+    ::nxtext__fld_draw(::state__FLD_FIND, fx, (y + ::draw__px(6)), fwid, ::draw__px(24), (::state__focus == ::state__F_FIND), "Find");
+    int tx = (fx + fwid - ::draw__px(48));
+    if (::editor__toggle_box(tx, (y + ::draw__px(8)), "Aa", ::state__find_case)) {
+        ::state__find_case = (!::state__find_case);
     }
-    if (toggle_box((tx + px(24)), (y + px(8)), "ab", find_word)) {
-        find_word = (!find_word);
+    if (::editor__toggle_box((tx + ::draw__px(24)), (y + ::draw__px(8)), "ab", ::state__find_word)) {
+        ::state__find_word = (!::state__find_word);
     }
-    int n = (int)((find_hits_y).size());
-    int cur = current_hit();
+    int n = (int)((::state__find_hits_y).size());
+    int cur = ::editor__current_hit();
     std::string label = "No results";
     if (n > 0) {
         label = ((cur >= 0) ? ((std::string("") + std::to_string((cur + 1)) + " of " + std::to_string(n))) : ((std::string("") + std::to_string(n) + " found")));
     }
-    if ((int)((fld_text[FLD_FIND]).size()) == 0) {
+    if ((int)((::state__fld_text[::state__FLD_FIND]).size()) == 0) {
         label = "";
     }
-    int lx = (fx + fwid + px(8));
-    txt_v(lx, (y + px(6)), px(24), label, ((n == 0 && (int)((label).size()) > 0) ? (C_ERROR) : (C_TEXT)), UI_SMALL);
-    int bx = (x + fw_w - px(80));
-    if (icon_button(bx, (y + px(8)), "up", "Previous Match (Shift+Enter)")) {
-        find_next(-1);
+    int lx = (fx + fwid + ::draw__px(8));
+    ::draw__txt_v(lx, (y + ::draw__px(6)), ::draw__px(24), label, ((n == 0 && (int)((label).size()) > 0) ? (::state__C_ERROR) : (::state__C_TEXT)), ::state__UI_SMALL);
+    int bx = (x + ::state__fw_w - ::draw__px(80));
+    if (::workspace__icon_button(bx, (y + ::draw__px(8)), "up", "Previous Match (Shift+Enter)")) {
+        ::editor__find_next(-1);
     }
-    if (icon_button((bx + px(24)), (y + px(8)), "down", "Next Match (Enter)")) {
-        find_next(1);
+    if (::workspace__icon_button((bx + ::draw__px(24)), (y + ::draw__px(8)), "down", "Next Match (Enter)")) {
+        ::editor__find_next(1);
     }
-    if (icon_button((bx + px(50)), (y + px(8)), "close", "Close (Escape)")) {
-        find_open = false;
-        focus = F_EDITOR;
+    if (::workspace__icon_button((bx + ::draw__px(50)), (y + ::draw__px(8)), "close", "Close (Escape)")) {
+        ::state__find_open = false;
+        ::state__focus = ::state__F_EDITOR;
     }
-    if (find_replace) {
-        fld_draw(FLD_REPLACE, fx, (y + px(36)), fwid, px(24), (focus == F_REPLACE), "Replace");
-        if (__nexa_ui_button((fx + fwid + px(6)), (y + px(37)), px(70), px(22), std::string("Replace"), std::string("secondary"))) {
-            replace_one();
+    if (::state__find_replace) {
+        ::nxtext__fld_draw(::state__FLD_REPLACE, fx, (y + ::draw__px(36)), fwid, ::draw__px(24), (::state__focus == ::state__F_REPLACE), "Replace");
+        if (__nexa_ui_button((fx + fwid + ::draw__px(6)), (y + ::draw__px(37)), ::draw__px(70), ::draw__px(22), std::string("Replace"), std::string("secondary"))) {
+            ::editor__replace_one();
         }
-        if (__nexa_ui_button((fx + fwid + px(80)), (y + px(37)), px(46), px(22), std::string("All"), std::string("secondary"))) {
-            replace_all();
+        if (__nexa_ui_button((fx + fwid + ::draw__px(80)), (y + ::draw__px(37)), ::draw__px(46), ::draw__px(22), std::string("All"), std::string("secondary"))) {
+            ::editor__replace_all();
         }
     }
 }
 
-static bool toggle_box(int x, int y, const std::string& label, bool on) {
-    int s = px(20);
-    bool hov = hovered(x, y, s, s);
+static bool editor__toggle_box(int x, int y, const std::string& label, bool on) {
+    int s = ::draw__px(20);
+    bool hov = ::draw__hovered(x, y, s, s);
     if (on) {
-        fill(x, y, s, s, 0x264F78);
-        outline(x, y, s, s, C_ACCENT);
+        ::draw__fill(x, y, s, s, 0x264F78);
+        ::draw__outline(x, y, s, s, ::state__C_ACCENT);
     } else if (hov) {
-        fill(x, y, s, s, 0x3A3D41);
+        ::draw__fill(x, y, s, s, 0x3A3D41);
     }
-    int w = tw(label, UI_SMALL);
-    txt_v((x + ((s - w) / 2)), y, s, label, ((on) ? (C_BRIGHT) : (C_TEXT)), UI_SMALL);
-    return clicked_in(x, y, s, s);
+    int w = ::draw__tw(label, ::state__UI_SMALL);
+    ::draw__txt_v((x + ((s - w) / 2)), y, s, label, ((on) ? (::state__C_BRIGHT) : (::state__C_TEXT)), ::state__UI_SMALL);
+    return ::app__clicked_in(x, y, s, s);
 }
 
-static bool find_mouse(int x, int y, int mods) {
-    if (!(find_open) || !(is_file_tab())) {
+static bool editor__find_mouse(int x, int y, int mods) {
+    if (!(::state__find_open) || !(::buffer__is_file_tab())) {
         return false;
     }
-    find_layout();
-    if (!(inside(x, y, fw_x, fw_y, fw_w, fw_h))) {
+    ::editor__find_layout();
+    if (!(::draw__inside(x, y, ::state__fw_x, ::state__fw_y, ::state__fw_w, ::state__fw_h))) {
         return false;
     }
-    int fx = (fw_x + px(28));
-    int fwid = (fw_w - px(28) - px(170));
-    if (inside(x, y, fx, (fw_y + px(6)), (fwid - px(50)), px(24))) {
-        focus = F_FIND;
-        fld_click(FLD_FIND, (x - fx - px(6)), ((mods & M_SHIFT) != 0));
-    } else if (find_replace && inside(x, y, fx, (fw_y + px(36)), fwid, px(24))) {
-        focus = F_REPLACE;
-        fld_click(FLD_REPLACE, (x - fx - px(6)), ((mods & M_SHIFT) != 0));
+    int fx = (::state__fw_x + ::draw__px(28));
+    int fwid = (::state__fw_w - ::draw__px(28) - ::draw__px(170));
+    if (::draw__inside(x, y, fx, (::state__fw_y + ::draw__px(6)), (fwid - ::draw__px(50)), ::draw__px(24))) {
+        ::state__focus = ::state__F_FIND;
+        ::nxtext__fld_click(::state__FLD_FIND, (x - fx - ::draw__px(6)), ((mods & ::state__M_SHIFT) != 0));
+    } else if (::state__find_replace && ::draw__inside(x, y, fx, (::state__fw_y + ::draw__px(36)), fwid, ::draw__px(24))) {
+        ::state__focus = ::state__F_REPLACE;
+        ::nxtext__fld_click(::state__FLD_REPLACE, (x - fx - ::draw__px(6)), ((mods & ::state__M_SHIFT) != 0));
     }
     return true;
 }
 
-static void find_field_key(int vk, int mods) {
-    int id = ((focus == F_REPLACE) ? (FLD_REPLACE) : (FLD_FIND));
-    if (vk == K_ENTER) {
-        if (id == FLD_REPLACE) {
-            if ((mods & M_CTRL) != 0) {
-                replace_all();
+static void editor__find_field_key(int vk, int mods) {
+    int id = ((::state__focus == ::state__F_REPLACE) ? (::state__FLD_REPLACE) : (::state__FLD_FIND));
+    if (vk == ::state__K_ENTER) {
+        if (id == ::state__FLD_REPLACE) {
+            if ((mods & ::state__M_CTRL) != 0) {
+                ::editor__replace_all();
             } else {
-                replace_one();
+                ::editor__replace_one();
             }
         } else {
-            find_next((((mods & M_SHIFT) != 0) ? (-1) : (1)));
+            ::editor__find_next((((mods & ::state__M_SHIFT) != 0) ? (-1) : (1)));
         }
         return;
     }
-    if (vk == K_ESC) {
-        find_open = false;
-        focus = F_EDITOR;
+    if (vk == ::state__K_ESC) {
+        ::state__find_open = false;
+        ::state__focus = ::state__F_EDITOR;
         return;
     }
-    if (vk == K_TAB) {
-        if (find_replace) {
-            focus = ((focus == F_FIND) ? (F_REPLACE) : (F_FIND));
+    if (vk == ::state__K_TAB) {
+        if (::state__find_replace) {
+            ::state__focus = ((::state__focus == ::state__F_FIND) ? (::state__F_REPLACE) : (::state__F_FIND));
         }
         return;
     }
-    if (vk == K_F3) {
-        find_next((((mods & M_SHIFT) != 0) ? (-1) : (1)));
+    if (vk == ::state__K_F3) {
+        ::editor__find_next((((mods & ::state__M_SHIFT) != 0) ? (-1) : (1)));
         return;
     }
-    int r = fld_key(id, vk, mods);
-    if (r == 2 && id == FLD_FIND) {
-        find_as_you_type();
+    int r = ::nxtext__fld_key(id, vk, mods);
+    if (r == 2 && id == ::state__FLD_FIND) {
+        ::editor__find_as_you_type();
     }
 }
 
-static void find_as_you_type() {
-    find_update();
-    if ((int)((find_hits_y).size()) == 0) {
+static void editor__find_as_you_type() {
+    ::editor__find_update();
+    if ((int)((::state__find_hits_y).size()) == 0) {
         return;
     }
-    sel_bounds();
-    int i = find_pick(sel_y1, sel_x1, 1);
-    select_hit(i);
+    ::buffer__sel_bounds();
+    int i = ::editor__find_pick(::state__sel_y1, ::state__sel_x1, 1);
+    ::editor__select_hit(i);
 }
 
-static int digits(int n) {
+static int editor__digits(int n) {
     int d = 1;
     int v = n;
     while (v >= 10) {
@@ -7453,63 +7765,63 @@ static int digits(int n) {
     return d;
 }
 
-static void collect_doc_diags() {
-    doc_diag_lines.clear();
-    doc_diag_err.clear();
-    doc_diag_msg.clear();
-    if ((int)((doc_path).size()) == 0) {
+static void editor__collect_doc_diags() {
+    ::state__doc_diag_lines.clear();
+    ::state__doc_diag_err.clear();
+    ::state__doc_diag_msg.clear();
+    if ((int)((::state__doc_path).size()) == 0) {
         return;
     }
-    for (int i = 0; i < (int)((prob_file).size()); i++) {
-        if (same_path(prob_file[i], doc_path)) {
-            doc_diag_lines.push_back((prob_line[i] - 1));
-            doc_diag_err.push_back(prob_err[i]);
-            doc_diag_msg.push_back(prob_msg[i]);
+    for (int i = 0; i < (int)((::state__prob_file).size()); i++) {
+        if (::buffer__same_path(::state__prob_file[i], ::state__doc_path)) {
+            ::state__doc_diag_lines.push_back((::state__prob_line[i] - 1));
+            ::state__doc_diag_err.push_back(::state__prob_err[i]);
+            ::state__doc_diag_msg.push_back(::state__prob_msg[i]);
         }
     }
 }
 
-static void draw_squiggle(int x1, int x2, int y, int c) {
+static void editor__draw_squiggle(int x1, int x2, int y, int c) {
     int x = x1;
     bool up = true;
     while (x < x2) {
-        int nx = imin((x + px(3)), x2);
+        int nx = ::draw__imin((x + ::draw__px(3)), x2);
         if (up) {
-            line(x, (y + px(2)), nx, y, c, 1);
+            ::draw__line(x, (y + ::draw__px(2)), nx, y, c, 1);
         } else {
-            line(x, y, nx, (y + px(2)), c, 1);
+            ::draw__line(x, y, nx, (y + ::draw__px(2)), c, 1);
         }
         up = (!up);
         x = nx;
     }
 }
 
-static int mm_w() {
-    if (show_minimap && is_file_tab() && ed_w > px(500)) {
-        return px(70);
+static int editor__mm_w() {
+    if (::state__show_minimap && ::buffer__is_file_tab() && ::state__ed_w > ::draw__px(500)) {
+        return ::draw__px(70);
     }
     return 0;
 }
 
-static int mm_first() {
-    int rows = (ed_h / 2);
-    int max_first = imax(0, ((int)((L).size()) - rows));
-    return (max_first * sy / imax(1, max_sy()));
+static int editor__mm_first() {
+    int rows = (::state__ed_h / 2);
+    int max_first = ::draw__imax(0, ((int)((::state__L).size()) - rows));
+    return (max_first * ::state__sy / ::draw__imax(1, ::editor__max_sy()));
 }
 
-static void draw_minimap() {
-    int w = mm_w();
+static void editor__draw_minimap() {
+    int w = ::editor__mm_w();
     if (w == 0) {
         return;
     }
-    int x = (ed_x + ed_w - SCROLL_W - w);
-    fill(x, ed_y, w, ed_h, C_EDITOR);
-    int first = mm_first();
-    int rows = (ed_h / 2);
+    int x = (::state__ed_x + ::state__ed_w - ::state__SCROLL_W - w);
+    ::draw__fill(x, ::state__ed_y, w, ::state__ed_h, ::state__C_EDITOR);
+    int first = ::editor__mm_first();
+    int rows = (::state__ed_h / 2);
     int k = first;
-    while (k < (int)((L).size()) && k < (first + rows)) {
-        std::string s = L[k];
-        int y = (ed_y + ((k - first) * 2));
+    while (k < (int)((::state__L).size()) && k < (first + rows)) {
+        std::string s = ::state__L[k];
+        int y = (::state__ed_y + ((k - first) * 2));
         std::string t = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(s);
         int c = 0x5A5A5A;
         if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "//") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "#") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "/*") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "*")) {
@@ -7521,11 +7833,11 @@ static void draw_minimap() {
         int v = 0;
         int j = 0;
         int run = -1;
-        while (j < (int)((s).size()) && v < (w - px(6))) {
-            int b = ubyte(s, j);
+        while (j < (int)((s).size()) && v < (w - ::draw__px(6))) {
+            int b = ::nxtext__ubyte(s, j);
             if (b == 32 || b == 9) {
                 if (run >= 0) {
-                    fill((x + px(4) + run), y, (v - run), 1, c);
+                    ::draw__fill((x + ::draw__px(4) + run), y, (v - run), 1, c);
                     run = -1;
                 }
                 if (b == 9) {
@@ -7540,151 +7852,151 @@ static void draw_minimap() {
                 run = v;
             }
             v = v + 1;
-            j = next_i(s, j);
+            j = ::nxtext__next_i(s, j);
         }
         if (run >= 0) {
-            fill((x + px(4) + run), y, (v - run), 1, c);
+            ::draw__fill((x + ::draw__px(4) + run), y, (v - run), 1, c);
         }
         k = k + 1;
     }
-    for (int d = 0; d < (int)((doc_diag_lines).size()); d++) {
-        int dl = doc_diag_lines[d];
+    for (int d = 0; d < (int)((::state__doc_diag_lines).size()); d++) {
+        int dl = ::state__doc_diag_lines[d];
         if (dl >= first && dl < (first + rows)) {
-            fill(x, (ed_y + ((dl - first) * 2)), w, 2, ((doc_diag_err[d]) ? (0x7A2A2A) : (0x6A5A10)));
+            ::draw__fill(x, (::state__ed_y + ((dl - first) * 2)), w, 2, ((::state__doc_diag_err[d]) ? (0x7A2A2A) : (0x6A5A10)));
         }
     }
-    int vy = (ed_y + (((sy / LH) - first) * 2));
-    int vh = (visible_lines() * 2);
-    bool hov = (hovered(x, ed_y, w, ed_h) || drag == 6);
-    fill_a(x, vy, w, vh, 0xFFFFFF, ((hov) ? (30) : (16)));
-    int cyy = (ed_y + ((cy - first) * 2));
-    if (cy >= first && cy < (first + rows)) {
-        fill(x, cyy, w, 2, 0x3A5A80);
+    int vy = (::state__ed_y + (((::state__sy / ::state__LH) - first) * 2));
+    int vh = (::editor__visible_lines() * 2);
+    bool hov = (::draw__hovered(x, ::state__ed_y, w, ::state__ed_h) || ::state__drag == 6);
+    ::draw__fill_a(x, vy, w, vh, 0xFFFFFF, ((hov) ? (30) : (16)));
+    int cyy = (::state__ed_y + ((::state__cy - first) * 2));
+    if (::state__cy >= first && ::state__cy < (first + rows)) {
+        ::draw__fill(x, cyy, w, 2, 0x3A5A80);
     }
 }
 
-static void minimap_drag() {
-    int line_ = (mm_first() + ((my - ed_y) / 2));
-    sy = clamp(((line_ - (visible_lines() / 2)) * LH), 0, max_sy());
-    frame_dirty = true;
+static void editor__minimap_drag() {
+    int line_ = (::editor__mm_first() + ((::state__my - ::state__ed_y) / 2));
+    ::state__sy = ::draw__clamp(((line_ - (::editor__visible_lines() / 2)) * ::state__LH), 0, ::editor__max_sy());
+    ::state__frame_dirty = true;
 }
 
-static void draw_editor() {
-    fill(ed_x, ed_y, ed_w, ed_h, C_EDITOR);
-    clamp_scroll();
-    int first = (sy / LH);
-    int off = (sy % LH);
-    int rows = ((ed_h / LH) + 2);
-    int last = imin((int)((L).size()), (first + rows));
-    hl_ensure(last);
-    sel_bounds();
-    bool sel = has_sel();
-    int ty = ((LH - nx_font_h(CODE_FONT)) / 2);
-    int vmin = ((sx / CW) - 1);
-    int vmax = (((sx + text_w) / CW) + 1);
-    bool focused = (focus == F_EDITOR || focus == F_FIND || focus == F_REPLACE);
-    collect_doc_diags();
+static void editor__draw_editor() {
+    ::draw__fill(::state__ed_x, ::state__ed_y, ::state__ed_w, ::state__ed_h, ::state__C_EDITOR);
+    ::editor__clamp_scroll();
+    int first = (::state__sy / ::state__LH);
+    int off = (::state__sy % ::state__LH);
+    int rows = ((::state__ed_h / ::state__LH) + 2);
+    int last = ::draw__imin((int)((::state__L).size()), (first + rows));
+    ::editor__hl_ensure(last);
+    ::buffer__sel_bounds();
+    bool sel = ::buffer__has_sel();
+    int ty = ((::state__LH - nx_font_h(::state__CODE_FONT)) / 2);
+    int vmin = ((::state__sx / ::state__CW) - 1);
+    int vmax = (((::state__sx + ::state__text_w) / ::state__CW) + 1);
+    bool focused = (::state__focus == ::state__F_EDITOR || ::state__focus == ::state__F_FIND || ::state__focus == ::state__F_REPLACE);
+    ::editor__collect_doc_diags();
     std::string occ = "";
-    if (!(sel) && doc_lang != L_PLAIN && doc_lang != L_MD) {
-        occ = word_at(cy, cx);
-        if ((int)((occ).size()) > 0 && is_digit_b(ubyte(occ, 0))) {
+    if (!(sel) && ::state__doc_lang != ::state__L_PLAIN && ::state__doc_lang != ::state__L_MD) {
+        occ = ::editor__word_at(::state__cy, ::state__cx);
+        if ((int)((occ).size()) > 0 && ::highlight__is_digit_b(::nxtext__ubyte(occ, 0))) {
             occ = "";
         }
-    } else if (sel && sel_y1 == sel_y2 && (sel_x2 - sel_x1) >= 2) {
-        occ = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(L[sel_y1], sel_x1, (sel_x2 - sel_x1));
+    } else if (sel && ::state__sel_y1 == ::state__sel_y2 && (::state__sel_x2 - ::state__sel_x1) >= 2) {
+        occ = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(::state__L[::state__sel_y1], ::state__sel_x1, (::state__sel_x2 - ::state__sel_x1));
         if (([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(occ) != occ) {
             occ = "";
         }
     }
-    if (find_open) {
-        find_update();
+    if (::state__find_open) {
+        ::editor__find_update();
     }
     int hit_i = 0;
-    if (find_open && (int)((find_hits_y).size()) > 0) {
-        hit_i = find_pick(first, 0, 1);
-        if (find_hits_y[hit_i] < first) {
-            hit_i = (int)((find_hits_y).size());
+    if (::state__find_open && (int)((::state__find_hits_y).size()) > 0) {
+        hit_i = ::editor__find_pick(first, 0, 1);
+        if (::state__find_hits_y[hit_i] < first) {
+            hit_i = (int)((::state__find_hits_y).size());
         }
     }
-    int cur_hit = ((find_open) ? (current_hit()) : (-1));
-    match_brackets();
-    nx_clip(text_x, ed_y, (ed_x + ed_w - SCROLL_W - mm_w()), (ed_y + ed_h));
+    int cur_hit = ((::state__find_open) ? (::editor__current_hit()) : (-1));
+    ::editor__match_brackets();
+    nx_clip(::state__text_x, ::state__ed_y, (::state__ed_x + ::state__ed_w - ::state__SCROLL_W - ::editor__mm_w()), (::state__ed_y + ::state__ed_h));
     int k = first;
     while (k < last) {
-        int y = (ed_y + ((k - first) * LH) - off);
-        std::string s = L[k];
-        if (k == cy && !(sel)) {
-            outline((text_x - gutter_w + px(1)), y, (ed_w - px(2)), LH, C_LINE);
-            fill((text_x - gutter_w + px(1)), (y + 1), (ed_w - px(2)), 1, C_LINE);
-            fill((text_x - gutter_w + px(1)), (y + LH - 2), (ed_w - px(2)), 1, C_LINE);
+        int y = (::state__ed_y + ((k - first) * ::state__LH) - off);
+        std::string s = ::state__L[k];
+        if (k == ::state__cy && !(sel)) {
+            ::draw__outline((::state__text_x - ::state__gutter_w + ::draw__px(1)), y, (::state__ed_w - ::draw__px(2)), ::state__LH, ::state__C_LINE);
+            ::draw__fill((::state__text_x - ::state__gutter_w + ::draw__px(1)), (y + 1), (::state__ed_w - ::draw__px(2)), 1, ::state__C_LINE);
+            ::draw__fill((::state__text_x - ::state__gutter_w + ::draw__px(1)), (y + ::state__LH - 2), (::state__ed_w - ::draw__px(2)), 1, ::state__C_LINE);
         }
-        if (sel && k >= sel_y1 && k <= sel_y2) {
-            int a = ((k == sel_y1) ? (vcol(s, sel_x1)) : (0));
-            int b = ((k == sel_y2) ? (vcol(s, sel_x2)) : ((vlen(s) + 1)));
-            fill((text_x + (a * CW) - sx), y, ((b - a) * CW), LH, ((focused) ? (C_SELECTION) : (C_SEL_INACTIVE)));
+        if (sel && k >= ::state__sel_y1 && k <= ::state__sel_y2) {
+            int a = ((k == ::state__sel_y1) ? (::nxtext__vcol(s, ::state__sel_x1)) : (0));
+            int b = ((k == ::state__sel_y2) ? (::nxtext__vcol(s, ::state__sel_x2)) : ((::nxtext__vlen(s) + 1)));
+            ::draw__fill((::state__text_x + (a * ::state__CW) - ::state__sx), y, ((b - a) * ::state__CW), ::state__LH, ((focused) ? (::state__C_SELECTION) : (::state__C_SEL_INACTIVE)));
         }
-        if (find_open) {
-            int plen = (int)((fld_text[FLD_FIND]).size());
-            while (hit_i < (int)((find_hits_y).size()) && find_hits_y[hit_i] == k) {
-                int hx = find_hits_x[hit_i];
-                int a = vcol(s, hx);
-                int b = vcol(s, (hx + plen));
+        if (::state__find_open) {
+            int plen = (int)((::state__fld_text[::state__FLD_FIND]).size());
+            while (hit_i < (int)((::state__find_hits_y).size()) && ::state__find_hits_y[hit_i] == k) {
+                int hx = ::state__find_hits_x[hit_i];
+                int a = ::nxtext__vcol(s, hx);
+                int b = ::nxtext__vcol(s, (hx + plen));
                 if (hit_i == cur_hit) {
-                    fill((text_x + (a * CW) - sx), y, ((b - a) * CW), LH, C_FIND_CUR);
+                    ::draw__fill((::state__text_x + (a * ::state__CW) - ::state__sx), y, ((b - a) * ::state__CW), ::state__LH, ::state__C_FIND_CUR);
                 } else {
-                    fill_a((text_x + (a * CW) - sx), y, ((b - a) * CW), LH, 0xEA5C00, 85);
+                    ::draw__fill_a((::state__text_x + (a * ::state__CW) - ::state__sx), y, ((b - a) * ::state__CW), ::state__LH, 0xEA5C00, 85);
                 }
                 hit_i = hit_i + 1;
             }
         } else if ((int)((occ).size()) > 0) {
             int at = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(s, occ);
             while (at >= 0) {
-                if (!(is_word_at(s, (at - 1))) && !(is_word_at(s, (at + (int)((occ).size())))) && !(sel && k == sel_y1 && at == sel_x1)) {
-                    int a = vcol(s, at);
-                    int b = vcol(s, (at + (int)((occ).size())));
-                    fill_a((text_x + (a * CW) - sx), y, ((b - a) * CW), LH, 0x575757, 150);
+                if (!(::nxtext__is_word_at(s, (at - 1))) && !(::nxtext__is_word_at(s, (at + (int)((occ).size())))) && !(sel && k == ::state__sel_y1 && at == ::state__sel_x1)) {
+                    int a = ::nxtext__vcol(s, at);
+                    int b = ::nxtext__vcol(s, (at + (int)((occ).size())));
+                    ::draw__fill_a((::state__text_x + (a * ::state__CW) - ::state__sx), y, ((b - a) * ::state__CW), ::state__LH, 0x575757, 150);
                 }
                 at = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(s, occ, (at + (int)((occ).size())));
             }
         }
-        int ind = vcol(s, (int)((leading_ws(s)).size()));
-        if (is_blank(s)) {
+        int ind = ::nxtext__vcol(s, (int)((::nxtext__leading_ws(s)).size()));
+        if (::nxtext__is_blank(s)) {
             int j = (k + 1);
-            while (j < (int)((L).size()) && j < (k + 50) && is_blank(L[j])) {
+            while (j < (int)((::state__L).size()) && j < (k + 50) && ::nxtext__is_blank(::state__L[j])) {
                 j = j + 1;
             }
-            int pk = imax((k - 1), 0);
-            if (j < (int)((L).size())) {
-                ind = imin(vcol(L[j], (int)((leading_ws(L[j])).size())), (vcol(L[pk], (int)((leading_ws(L[pk])).size())) + 4));
+            int pk = ::draw__imax((k - 1), 0);
+            if (j < (int)((::state__L).size())) {
+                ind = ::draw__imin(::nxtext__vcol(::state__L[j], (int)((::nxtext__leading_ws(::state__L[j])).size())), (::nxtext__vcol(::state__L[pk], (int)((::nxtext__leading_ws(::state__L[pk])).size())) + 4));
             }
         }
         int g = 4;
         while (g < (ind + 1) && g <= ind) {
-            int gx = (text_x + ((g - 4) * CW) - sx);
-            if (gx >= text_x) {
-                fill(gx, y, 1, LH, 0x404040);
+            int gx = (::state__text_x + ((g - 4) * ::state__CW) - ::state__sx);
+            if (gx >= ::state__text_x) {
+                ::draw__fill(gx, y, 1, ::state__LH, 0x404040);
             }
             g = g + 4;
         }
-        if (br_my >= 0) {
-            if (k == br_y) {
-                outline((text_x + (vcol(s, br_x) * CW) - sx), (y + 1), CW, (LH - 2), 0x888888);
+        if (::state__br_my >= 0) {
+            if (k == ::state__br_y) {
+                ::draw__outline((::state__text_x + (::nxtext__vcol(s, ::state__br_x) * ::state__CW) - ::state__sx), (y + 1), ::state__CW, (::state__LH - 2), 0x888888);
             }
-            if (k == br_my) {
-                outline((text_x + (vcol(s, br_mx) * CW) - sx), (y + 1), CW, (LH - 2), 0x888888);
+            if (k == ::state__br_my) {
+                ::draw__outline((::state__text_x + (::nxtext__vcol(s, ::state__br_mx) * ::state__CW) - ::state__sx), (y + 1), ::state__CW, (::state__LH - 2), 0x888888);
             }
         }
-        std::vector<int> cols = hl_line(doc_lang, s, hl_st[k], hl_dl[k]);
+        std::vector<int> cols = ::highlight__hl_line(::state__doc_lang, s, ::state__hl_st[k], ::state__hl_dl[k]);
         int v = 0;
         int j = 0;
         int n = (int)((s).size());
         int gy = (y + ty);
         while (j < n) {
-            int b = ubyte(s, j);
+            int b = ::nxtext__ubyte(s, j);
             if (b == 9) {
                 int nv = (((v / 4) + 1) * 4);
-                if (show_ws && v >= vmin) {
-                    nx_text_cell(CODE_FONT, (text_x + (v * CW) - sx), gy, CW, "\xE2\x86\x92", 0x3B3B3B);
+                if (::state__show_ws && v >= vmin) {
+                    nx_text_cell(::state__CODE_FONT, (::state__text_x + (v * ::state__CW) - ::state__sx), gy, ::state__CW, "\xE2\x86\x92", 0x3B3B3B);
                 }
                 v = nv;
                 j = j + 1;
@@ -7697,119 +8009,119 @@ static void draw_editor() {
                 if (v >= vmin) {
                     if (b > 32) {
                         int c = cols[j];
-                        nx_text_cell(CODE_FONT, (text_x + (v * CW) - sx), gy, CW, glyph_s[b].c_str(), c);
-                    } else if (b == 32 && show_ws) {
-                        fill((text_x + (v * CW) - sx + (CW / 2)), (y + (LH / 2)), px(2), px(2), 0x3B3B3B);
+                        nx_text_cell(::state__CODE_FONT, (::state__text_x + (v * ::state__CW) - ::state__sx), gy, ::state__CW, ::state__glyph_s[b].c_str(), c);
+                    } else if (b == 32 && ::state__show_ws) {
+                        ::draw__fill((::state__text_x + (v * ::state__CW) - ::state__sx + (::state__CW / 2)), (y + (::state__LH / 2)), ::draw__px(2), ::draw__px(2), 0x3B3B3B);
                     }
                 }
                 j = j + 1;
             } else {
-                int cl = cp_len(s, j);
+                int cl = ::nxtext__cp_len(s, j);
                 if (v >= vmin) {
                     int c = cols[j];
-                    nx_text_cell(CODE_FONT, (text_x + (v * CW) - sx), gy, CW, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, j, cl).c_str(), c);
+                    nx_text_cell(::state__CODE_FONT, (::state__text_x + (v * ::state__CW) - ::state__sx), gy, ::state__CW, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, j, cl).c_str(), c);
                 }
                 j = j + cl;
             }
             v = v + 1;
         }
-        for (int d = 0; d < (int)((doc_diag_lines).size()); d++) {
-            if (doc_diag_lines[d] == k) {
-                int a = vcol(s, (int)((leading_ws(s)).size()));
-                int b = imax((a + 2), vlen(s));
-                draw_squiggle((text_x + (a * CW) - sx), (text_x + (b * CW) - sx), (y + LH - px(4)), ((doc_diag_err[d]) ? (C_ERROR) : (C_WARNING)));
+        for (int d = 0; d < (int)((::state__doc_diag_lines).size()); d++) {
+            if (::state__doc_diag_lines[d] == k) {
+                int a = ::nxtext__vcol(s, (int)((::nxtext__leading_ws(s)).size()));
+                int b = ::draw__imax((a + 2), ::nxtext__vlen(s));
+                ::editor__draw_squiggle((::state__text_x + (a * ::state__CW) - ::state__sx), (::state__text_x + (b * ::state__CW) - ::state__sx), (y + ::state__LH - ::draw__px(4)), ((::state__doc_diag_err[d]) ? (::state__C_ERROR) : (::state__C_WARNING)));
             }
         }
         k = k + 1;
     }
     nx_clip_off();
-    if (focused && is_file_tab() && caret_on()) {
-        int cyp = (ed_y + (cy * LH) - sy);
-        int cxp = (text_x + (vcol(L[cy], cx) * CW) - sx);
-        if ((cyp + LH) > ed_y && cyp < (ed_y + ed_h) && cxp >= text_x) {
-            fill(cxp, cyp, px(2), LH, 0xAEAFAD);
+    if (focused && ::buffer__is_file_tab() && ::nxtext__caret_on()) {
+        int cyp = (::state__ed_y + (::state__cy * ::state__LH) - ::state__sy);
+        int cxp = (::state__text_x + (::nxtext__vcol(::state__L[::state__cy], ::state__cx) * ::state__CW) - ::state__sx);
+        if ((cyp + ::state__LH) > ::state__ed_y && cyp < (::state__ed_y + ::state__ed_h) && cxp >= ::state__text_x) {
+            ::draw__fill(cxp, cyp, ::draw__px(2), ::state__LH, 0xAEAFAD);
         }
     }
-    draw_gutter(first, last, off);
-    draw_minimap();
-    draw_scrollbar();
-    draw_find();
-    draw_hover_diag();
+    ::editor__draw_gutter(first, last, off);
+    ::editor__draw_minimap();
+    ::editor__draw_scrollbar();
+    ::editor__draw_find();
+    ::editor__draw_hover_diag();
 }
 
-static void draw_gutter(int first, int last, int off) {
-    int gx = (text_x - gutter_w);
-    fill(gx, ed_y, gutter_w, ed_h, C_EDITOR);
-    int nw = (digits((int)((L).size())) * CW);
-    int ty = ((LH - nx_font_h(CODE_FONT)) / 2);
+static void editor__draw_gutter(int first, int last, int off) {
+    int gx = (::state__text_x - ::state__gutter_w);
+    ::draw__fill(gx, ::state__ed_y, ::state__gutter_w, ::state__ed_h, ::state__C_EDITOR);
+    int nw = (::editor__digits((int)((::state__L).size())) * ::state__CW);
+    int ty = ((::state__LH - nx_font_h(::state__CODE_FONT)) / 2);
     int k = first;
     while (k < last) {
-        int y = (ed_y + ((k - first) * LH) - off);
+        int y = (::state__ed_y + ((k - first) * ::state__LH) - off);
         std::string label = std::to_string((k + 1));
-        int w = ((int)((label).size()) * CW);
-        bool active_line = (k == cy);
-        int c = ((active_line) ? (0xCCCCCC) : (C_DIM));
-        int x = (gx + px(18) + nw - w);
-        nx_text(CODE_FONT, x, (y + ty), label.c_str(), c);
-        for (int d = 0; d < (int)((doc_diag_lines).size()); d++) {
-            if (doc_diag_lines[d] == k) {
-                disc((gx + px(8)), (y + (LH / 2)), px(4), ((doc_diag_err[d]) ? (C_ERROR) : (C_WARNING)));
+        int w = ((int)((label).size()) * ::state__CW);
+        bool active_line = (k == ::state__cy);
+        int c = ((active_line) ? (0xCCCCCC) : (::state__C_DIM));
+        int x = (gx + ::draw__px(18) + nw - w);
+        nx_text(::state__CODE_FONT, x, (y + ty), label.c_str(), c);
+        for (int d = 0; d < (int)((::state__doc_diag_lines).size()); d++) {
+            if (::state__doc_diag_lines[d] == k) {
+                ::draw__disc((gx + ::draw__px(8)), (y + (::state__LH / 2)), ::draw__px(4), ((::state__doc_diag_err[d]) ? (::state__C_ERROR) : (::state__C_WARNING)));
             }
         }
         k = k + 1;
     }
 }
 
-static void draw_scrollbar() {
-    int x = (ed_x + ed_w - SCROLL_W);
-    int h = code_h();
-    fill(x, ed_y, 1, h, 0x2B2B2B);
-    int total = (((int)((L).size()) * LH) + h);
-    int scale_h = imax(h, 1);
-    for (int d = 0; d < (int)((doc_diag_lines).size()); d++) {
-        int my_ = (ed_y + (doc_diag_lines[d] * scale_h / imax((int)((L).size()), 1)));
-        fill((x + (SCROLL_W / 2)), my_, (SCROLL_W / 2), px(3), ((doc_diag_err[d]) ? (C_ERROR) : (C_WARNING)));
+static void editor__draw_scrollbar() {
+    int x = (::state__ed_x + ::state__ed_w - ::state__SCROLL_W);
+    int h = ::editor__code_h();
+    ::draw__fill(x, ::state__ed_y, 1, h, 0x2B2B2B);
+    int total = (((int)((::state__L).size()) * ::state__LH) + h);
+    int scale_h = ::draw__imax(h, 1);
+    for (int d = 0; d < (int)((::state__doc_diag_lines).size()); d++) {
+        int my_ = (::state__ed_y + (::state__doc_diag_lines[d] * scale_h / ::draw__imax((int)((::state__L).size()), 1)));
+        ::draw__fill((x + (::state__SCROLL_W / 2)), my_, (::state__SCROLL_W / 2), ::draw__px(3), ((::state__doc_diag_err[d]) ? (::state__C_ERROR) : (::state__C_WARNING)));
     }
-    if (find_open) {
-        int step = imax(1, ((int)((find_hits_y).size()) / 400));
+    if (::state__find_open) {
+        int step = ::draw__imax(1, ((int)((::state__find_hits_y).size()) / 400));
         int i = 0;
-        while (i < (int)((find_hits_y).size())) {
-            int hy = (ed_y + (find_hits_y[i] * scale_h / imax((int)((L).size()), 1)));
-            fill((x + px(3)), hy, (SCROLL_W / 2), px(2), 0xD18616);
+        while (i < (int)((::state__find_hits_y).size())) {
+            int hy = (::state__ed_y + (::state__find_hits_y[i] * scale_h / ::draw__imax((int)((::state__L).size()), 1)));
+            ::draw__fill((x + ::draw__px(3)), hy, (::state__SCROLL_W / 2), ::draw__px(2), 0xD18616);
             i = i + step;
         }
     }
-    int cyy = (ed_y + (cy * scale_h / imax((int)((L).size()), 1)));
-    fill((x + 1), cyy, (SCROLL_W - 1), px(2), 0xA0A0A0);
-    if (total <= (h + LH)) {
+    int cyy = (::state__ed_y + (::state__cy * scale_h / ::draw__imax((int)((::state__L).size()), 1)));
+    ::draw__fill((x + 1), cyy, (::state__SCROLL_W - 1), ::draw__px(2), 0xA0A0A0);
+    if (total <= (h + ::state__LH)) {
         return;
     }
-    int th = imax(px(20), (h * h / total));
-    int tyy = (ed_y + ((h - th) * sy / imax(max_sy(), 1)));
-    bool hov = (hovered(x, ed_y, SCROLL_W, h) || drag == 4);
-    fill_a((x + 1), tyy, (SCROLL_W - 1), th, 0x797979, ((hov) ? (130) : (80)));
+    int th = ::draw__imax(::draw__px(20), (h * h / total));
+    int tyy = (::state__ed_y + ((h - th) * ::state__sy / ::draw__imax(::editor__max_sy(), 1)));
+    bool hov = (::draw__hovered(x, ::state__ed_y, ::state__SCROLL_W, h) || ::state__drag == 4);
+    ::draw__fill_a((x + 1), tyy, (::state__SCROLL_W - 1), th, 0x797979, ((hov) ? (130) : (80)));
 }
 
-static void draw_hover_diag() {
-    if (drag != 0 || !(hovered(ed_x, ed_y, (ed_w - SCROLL_W), ed_h)) || (int)((doc_diag_lines).size()) == 0) {
+static void editor__draw_hover_diag() {
+    if (::state__drag != 0 || !(::draw__hovered(::state__ed_x, ::state__ed_y, (::state__ed_w - ::state__SCROLL_W), ::state__ed_h)) || (int)((::state__doc_diag_lines).size()) == 0) {
         return;
     }
-    int k = ((my - ed_y + sy) / LH);
-    for (int d = 0; d < (int)((doc_diag_lines).size()); d++) {
-        if (doc_diag_lines[d] == k) {
-            std::string msg = doc_diag_msg[d];
-            int w = imin((tw(msg, UI) + px(20)), px(640));
-            int x = clamp(mx, ed_x, (win_w - w - px(8)));
-            int y = (ed_y + ((k + 1) * LH) - sy + px(2));
-            fill(x, y, w, px(28), 0x252526);
-            outline(x, y, w, px(28), 0x454545);
-            txt_v((x + px(10)), y, px(28), fit(msg, (w - px(20)), UI), ((doc_diag_err[d]) ? (0xF48771) : (0xCCA700)), UI);
+    int k = ((::state__my - ::state__ed_y + ::state__sy) / ::state__LH);
+    for (int d = 0; d < (int)((::state__doc_diag_lines).size()); d++) {
+        if (::state__doc_diag_lines[d] == k) {
+            std::string msg = __nexa_text(::state__doc_diag_msg[d]);
+            int w = ::draw__imin((::draw__tw(msg, ::state__UI) + ::draw__px(20)), ::draw__px(640));
+            int x = ::draw__clamp(::state__mx, ::state__ed_x, (::state__win_w - w - ::draw__px(8)));
+            int y = (::state__ed_y + ((k + 1) * ::state__LH) - ::state__sy + ::draw__px(2));
+            ::draw__fill(x, y, w, ::draw__px(28), 0x252526);
+            ::draw__outline(x, y, w, ::draw__px(28), 0x454545);
+            ::draw__txt_v((x + ::draw__px(10)), y, ::draw__px(28), ::draw__fit(msg, (w - ::draw__px(20)), ::state__UI), ((::state__doc_diag_err[d]) ? (0xF48771) : (0xCCA700)), ::state__UI);
             return;
         }
     }
 }
 
-static std::string path_join(const std::string& a, const std::string& b) {
+static std::string workspace__path_join(const std::string& a, const std::string& b) {
     if ((int)((a).size()) == 0) {
         return b;
     }
@@ -7819,9 +8131,9 @@ static std::string path_join(const std::string& a, const std::string& b) {
     return (a + "\\" + b);
 }
 
-static std::string rel_path(const std::string& p) {
-    if ((int)((folder).size()) > 0 && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(p), ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(folder))) {
-        std::string r = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(p, (int)((folder).size()), -1);
+static std::string workspace__rel_path(const std::string& p) {
+    if ((int)((::state__folder).size()) > 0 && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(p), ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(::state__folder))) {
+        std::string r = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(p, (int)((::state__folder).size()), -1);
         while (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(r, "\\") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(r, "/")) {
             r = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(r, 1, -1);
         }
@@ -7830,13 +8142,13 @@ static std::string rel_path(const std::string& p) {
     return p;
 }
 
-static bool skip_dir(const std::string& name) {
+static bool workspace__skip_dir(const std::string& name) {
     return (name == ".git" || name == "node_modules" || name == ".nexa" || name == "__pycache__" || name == ".vs");
 }
 
-static std::vector<std::string> list_dir(std::string dir) {
-    if (((dir_cache).find(dir) != (dir_cache).end())) {
-        return dir_cache[dir];
+static std::vector<std::string> workspace__list_dir(std::string dir) {
+    if (((::state__dir_cache).find(dir) != (::state__dir_cache).end())) {
+        return ::state__dir_cache[dir];
     }
     std::vector<std::string> dirs;
     std::vector<std::string> files;
@@ -7847,7 +8159,7 @@ static std::vector<std::string> list_dir(std::string dir) {
             if (nm == "." || nm == ".." || nm == ".git") {
                 continue;
             }
-            if (__nexa_file_isdir((path_join(dir, nm)).c_str())) {
+            if (__nexa_file_isdir((::workspace__path_join(dir, nm)).c_str())) {
                 dirs.push_back((([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(nm) + "|" + nm));
             } else {
                 files.push_back((([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(nm) + "|" + nm));
@@ -7869,333 +8181,333 @@ static std::vector<std::string> list_dir(std::string dir) {
             out.push_back((std::string("f|") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(f, (([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(f, "|") + 1), -1)));
         }
     }
-    dir_cache[dir] = out;
+    ::state__dir_cache[dir] = out;
     return out;
 }
 
-static void refresh_tree() {
-    dir_cache.clear();
-    files_index_ms = 0;
-    read_git_branch();
-    frame_dirty = true;
+static void workspace__refresh_tree() {
+    ::state__dir_cache.clear();
+    ::state__files_index_ms = 0;
+    ::workspace__read_git_branch();
+    ::state__frame_dirty = true;
 }
 
-static void tree_walk(std::string dir, int depth) {
-    std::vector<std::string> entries = list_dir(dir);
+static void workspace__tree_walk(std::string dir, int depth) {
+    std::vector<std::string> entries = ::workspace__list_dir(dir);
     {
         const std::vector<std::string>& __nexa_forin_2 = entries;
         for (const std::string& e : __nexa_forin_2) {
             bool isdir = ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(e, "d|");
-            std::string p = path_join(dir, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(e, 2, -1));
-            tree_rows.push_back(p);
-            tree_depth.push_back(depth);
-            tree_dir.push_back(isdir);
-            if (isdir && ((expanded).find(p) != (expanded).end()) && expanded[p]) {
-                if (rename_mode > 0 && rename_mode < 3 && same_path(rename_parent, p)) {
-                    push_rename_row((depth + 1));
+            std::string p = ::workspace__path_join(dir, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(e, 2, -1));
+            ::state__tree_rows.push_back(p);
+            ::state__tree_depth.push_back(depth);
+            ::state__tree_dir.push_back(isdir);
+            if (isdir && ((::state__expanded).find(p) != (::state__expanded).end()) && ::state__expanded[p]) {
+                if (::state__rename_mode > 0 && ::state__rename_mode < 3 && ::buffer__same_path(::state__rename_parent, p)) {
+                    ::workspace__push_rename_row((depth + 1));
                 }
-                tree_walk(p, (depth + 1));
+                ::workspace__tree_walk(p, (depth + 1));
             }
         }
     }
 }
 
-static void push_rename_row(int depth) {
-    tree_rows.push_back("\x01new");
-    tree_depth.push_back(depth);
-    tree_dir.push_back((rename_mode == 2));
+static void workspace__push_rename_row(int depth) {
+    ::state__tree_rows.push_back("\x01new");
+    ::state__tree_depth.push_back(depth);
+    ::state__tree_dir.push_back((::state__rename_mode == 2));
 }
 
-static void build_tree() {
-    tree_rows.clear();
-    tree_depth.clear();
-    tree_dir.clear();
-    if ((int)((folder).size()) == 0 || tree_collapsed) {
+static void workspace__build_tree() {
+    ::state__tree_rows.clear();
+    ::state__tree_depth.clear();
+    ::state__tree_dir.clear();
+    if ((int)((::state__folder).size()) == 0 || ::state__tree_collapsed) {
         return;
     }
-    if (rename_mode > 0 && rename_mode < 3 && same_path(rename_parent, folder)) {
-        push_rename_row(0);
+    if (::state__rename_mode > 0 && ::state__rename_mode < 3 && ::buffer__same_path(::state__rename_parent, ::state__folder)) {
+        ::workspace__push_rename_row(0);
     }
-    tree_walk(folder, 0);
+    ::workspace__tree_walk(::state__folder, 0);
 }
 
-static void set_folder(std::string p) {
+static void workspace__set_folder(std::string p) {
     if ((int)((p).size()) == 0 || !(__nexa_file_isdir((p).c_str()))) {
         return;
     }
-    folder = __nexa_file_abspath((p).c_str());
-    while (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(folder, "\\") && (int)((folder).size()) > 3) {
-        folder = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(folder, 0, ((int)((folder).size()) - 1));
+    ::state__folder = __nexa_file_abspath((p).c_str());
+    while (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(::state__folder, "\\") && (int)((::state__folder).size()) > 3) {
+        ::state__folder = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(::state__folder, 0, ((int)((::state__folder).size()) - 1));
     }
-    expanded.clear();
-    tree_scroll = 0;
-    tree_collapsed = false;
-    refresh_tree();
+    ::state__expanded.clear();
+    ::state__tree_scroll = 0;
+    ::state__tree_collapsed = false;
+    ::workspace__refresh_tree();
     std::vector<std::string> keep;
-    keep.push_back(folder);
+    keep.push_back(::state__folder);
     {
-        const std::vector<std::string>& __nexa_forin_1 = recent;
+        const std::vector<std::string>& __nexa_forin_1 = ::state__recent;
         for (const std::string& r : __nexa_forin_1) {
-            if (!(same_path(r, folder)) && (int)((keep).size()) < 10) {
+            if (!(::buffer__same_path(r, ::state__folder)) && (int)((keep).size()) < 10) {
                 keep.push_back(r);
             }
         }
     }
-    recent = keep;
-    if (term_proc >= 0) {
-        nx_proc_free(term_proc);
-        term_proc = -1;
+    ::state__recent = keep;
+    if (::state__term_proc >= 0) {
+        nx_proc_free(::state__term_proc);
+        ::state__term_proc = -1;
     }
-    show_sidebar = true;
-    view = 0;
-    save_settings();
-    update_title();
+    ::state__show_sidebar = true;
+    ::state__view = 0;
+    ::app__save_settings();
+    ::app__update_title();
 }
 
-static void open_folder_dialog() {
-    std::string p = nx_pick_folder();
+static void workspace__open_folder_dialog() {
+    std::string p = __nexa_text(nx_pick_folder());
     if ((int)((p).size()) > 0) {
-        set_folder(p);
+        ::workspace__set_folder(p);
     }
 }
 
-static void open_file_dialog() {
-    std::string p = nx_pick_file();
+static void workspace__open_file_dialog() {
+    std::string p = __nexa_text(nx_pick_file());
     if ((int)((p).size()) > 0) {
-        open_file(p, false);
-        focus = F_EDITOR;
+        ::buffer__open_file(p, false);
+        ::state__focus = ::state__F_EDITOR;
     }
 }
 
-static void read_git_branch() {
-    git_branch = "";
-    if ((int)((folder).size()) == 0) {
+static void workspace__read_git_branch() {
+    ::state__git_branch = "";
+    if ((int)((::state__folder).size()) == 0) {
         return;
     }
-    std::string head = path_join(folder, ".git\\HEAD");
+    std::string head = ::workspace__path_join(::state__folder, ".git\\HEAD");
     if (!(__nexa_file_isfile((head).c_str()))) {
         return;
     }
     std::string raw = __nexa_file_read((head).c_str());
     std::string t = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(raw);
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "ref: refs/heads/")) {
-        git_branch = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 16, -1);
+        ::state__git_branch = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 16, -1);
     } else if ((int)((t).size()) >= 7) {
-        git_branch = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, 7);
+        ::state__git_branch = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, 7);
     }
 }
 
-static void index_walk(std::string dir, int depth) {
-    if (depth > 12 || (int)((files_index).size()) >= 20000) {
+static void workspace__index_walk(std::string dir, int depth) {
+    if (depth > 12 || (int)((::state__files_index).size()) >= 20000) {
         return;
     }
-    std::vector<std::string> entries = list_dir(dir);
+    std::vector<std::string> entries = ::workspace__list_dir(dir);
     {
         const std::vector<std::string>& __nexa_forin_2 = entries;
         for (const std::string& e : __nexa_forin_2) {
             std::string nm = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(e, 2, -1);
-            std::string p = path_join(dir, nm);
+            std::string p = ::workspace__path_join(dir, nm);
             if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(e, "d|")) {
-                if (!(skip_dir(nm))) {
-                    index_walk(p, (depth + 1));
+                if (!(::workspace__skip_dir(nm))) {
+                    ::workspace__index_walk(p, (depth + 1));
                 }
             } else {
-                files_index.push_back(p);
+                ::state__files_index.push_back(p);
             }
         }
     }
 }
 
-static void ensure_files_index() {
-    if ((int)((folder).size()) == 0) {
-        files_index.clear();
+static void workspace__ensure_files_index() {
+    if ((int)((::state__folder).size()) == 0) {
+        ::state__files_index.clear();
         return;
     }
-    if (files_index_ms != 0 && (now_ms - files_index_ms) < 5000) {
+    if (::state__files_index_ms != 0 && (::state__now_ms - ::state__files_index_ms) < 5000) {
         return;
     }
-    files_index.clear();
-    index_walk(folder, 0);
-    files_index_ms = now_ms;
+    ::state__files_index.clear();
+    ::workspace__index_walk(::state__folder, 0);
+    ::state__files_index_ms = ::state__now_ms;
 }
 
-static bool is_text_file(const std::string& p) {
+static bool workspace__is_text_file(const std::string& p) {
     std::string ext = __nexa_file_extension((p).c_str());
     std::string e = ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(ext);
     std::vector<std::string> bin = std::vector<std::string>{".exe", ".dll", ".o", ".obj", ".a", ".lib", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".res", ".zip", ".7z", ".pdf", ".wav", ".mp3", ".ogg", ".ttf", ".otf", ".woff", ".pdb", ".bin", ".dat", ".so", ".dylib", ".wasm"};
     return (!([&](){ const auto& __nexa_v = bin; const auto& __nexa_x = e; for (const auto& __nexa_e : __nexa_v) { if (__nexa_e == __nexa_x) return true; } return false; })());
 }
 
-static void chevron(int x, int y, bool down, int c) {
-    int s = px(3);
+static void workspace__chevron(int x, int y, bool down, int c) {
+    int s = ::draw__px(3);
     if (down) {
-        line((x - s), (y - (s / 2)), x, (y + (s / 2)), c, 1);
-        line(x, (y + (s / 2)), (x + s), (y - (s / 2)), c, 1);
+        ::draw__line((x - s), (y - (s / 2)), x, (y + (s / 2)), c, 1);
+        ::draw__line(x, (y + (s / 2)), (x + s), (y - (s / 2)), c, 1);
     } else {
-        line((x - (s / 2)), (y - s), (x + (s / 2)), y, c, 1);
-        line((x + (s / 2)), y, (x - (s / 2)), (y + s), c, 1);
+        ::draw__line((x - (s / 2)), (y - s), (x + (s / 2)), y, c, 1);
+        ::draw__line((x + (s / 2)), y, (x - (s / 2)), (y + s), c, 1);
     }
 }
 
-static int tree_row_y(int i) {
-    return (side_y + HEADER_H + ROW_H + (i * ROW_H) - tree_scroll);
+static int workspace__tree_row_y(int i) {
+    return (::state__side_y + ::state__HEADER_H + ::state__ROW_H + (i * ::state__ROW_H) - ::state__tree_scroll);
 }
 
-static void draw_explorer() {
-    int x = side_x;
-    int w = sidebar_w;
-    section_title(x, side_y, w, "EXPLORER");
-    int hy = (side_y + HEADER_H);
-    if ((int)((folder).size()) == 0) {
-        int tx = (x + px(20));
-        int ty = (hy + px(12));
-        ty = ty + (para(tx, ty, (w - px(40)), "You have not yet opened a folder.", C_TEXT, UI) + px(12));
-        if (__nexa_ui_button(tx, ty, (w - px(40)), px(28), std::string("Open Folder"), std::string("primary"))) {
-            open_folder_dialog();
+static void workspace__draw_explorer() {
+    int x = ::state__side_x;
+    int w = ::state__sidebar_w;
+    ::chrome__section_title(x, ::state__side_y, w, "EXPLORER");
+    int hy = (::state__side_y + ::state__HEADER_H);
+    if ((int)((::state__folder).size()) == 0) {
+        int tx = (x + ::draw__px(20));
+        int ty = (hy + ::draw__px(12));
+        ty = ty + (::chrome__para(tx, ty, (w - ::draw__px(40)), "You have not yet opened a folder.", ::state__C_TEXT, ::state__UI) + ::draw__px(12));
+        if (__nexa_ui_button(tx, ty, (w - ::draw__px(40)), ::draw__px(28), std::string("Open Folder"), std::string("primary"))) {
+            ::workspace__open_folder_dialog();
         }
-        ty = ty + px(44);
-        ty = ty + (para(tx, ty, (w - px(40)), "Opening a folder lets you browse its files, search them and build the Nexa project in it.", C_MUTED, UI) + px(12));
-        if (__nexa_ui_button(tx, ty, (w - px(40)), px(28), std::string("Open File"), std::string("secondary"))) {
-            open_file_dialog();
+        ty = ty + ::draw__px(44);
+        ty = ty + (::chrome__para(tx, ty, (w - ::draw__px(40)), "Opening a folder lets you browse its files, search them and build the Nexa project in it.", ::state__C_MUTED, ::state__UI) + ::draw__px(12));
+        if (__nexa_ui_button(tx, ty, (w - ::draw__px(40)), ::draw__px(28), std::string("Open File"), std::string("secondary"))) {
+            ::workspace__open_file_dialog();
         }
         return;
     }
-    build_tree();
-    int body_top = (hy + ROW_H);
-    int body_h = (side_y + side_h - body_top);
-    int content = ((int)((tree_rows).size()) * ROW_H);
-    tree_scroll = clamp(tree_scroll, 0, imax(0, (content - body_h + ROW_H)));
-    int first = (tree_scroll / ROW_H);
+    ::workspace__build_tree();
+    int body_top = (hy + ::state__ROW_H);
+    int body_h = (::state__side_y + ::state__side_h - body_top);
+    int content = ((int)((::state__tree_rows).size()) * ::state__ROW_H);
+    ::state__tree_scroll = ::draw__clamp(::state__tree_scroll, 0, ::draw__imax(0, (content - body_h + ::state__ROW_H)));
+    int first = (::state__tree_scroll / ::state__ROW_H);
     int i = first;
-    bool tree_focus = (focus == F_TREE);
-    while (i < (int)((tree_rows).size())) {
-        int y = tree_row_y(i);
-        if (y >= (side_y + side_h)) {
+    bool tree_focus = (::state__focus == ::state__F_TREE);
+    while (i < (int)((::state__tree_rows).size())) {
+        int y = ::workspace__tree_row_y(i);
+        if (y >= (::state__side_y + ::state__side_h)) {
             break;
         }
-        std::string p = tree_rows[i];
-        int d = tree_depth[i];
-        bool isdir = tree_dir[i];
-        int ind = (px(8) + (d * px(8)));
-        bool rename_here = (p == "\x01new" || (rename_mode == 3 && same_path(p, rename_path)));
-        if (p == tree_sel && !(rename_here)) {
-            fill(x, y, w, ROW_H, ((tree_focus) ? (0x04395E) : (C_ACTIVE)));
+        std::string p = ::state__tree_rows[i];
+        int d = ::state__tree_depth[i];
+        bool isdir = ::state__tree_dir[i];
+        int ind = (::draw__px(8) + (d * ::draw__px(8)));
+        bool rename_here = (p == "\x01new" || (::state__rename_mode == 3 && ::buffer__same_path(p, ::state__rename_path)));
+        if (p == ::state__tree_sel && !(rename_here)) {
+            ::draw__fill(x, y, w, ::state__ROW_H, ((tree_focus) ? (0x04395E) : (::state__C_ACTIVE)));
             if (tree_focus) {
-                outline(x, y, w, ROW_H, C_ACCENT);
+                ::draw__outline(x, y, w, ::state__ROW_H, ::state__C_ACCENT);
             }
-        } else if (hovered(x, y, w, ROW_H) && drag == 0 && !(rename_here)) {
-            fill(x, y, w, ROW_H, C_HOVER);
+        } else if (::draw__hovered(x, y, w, ::state__ROW_H) && ::state__drag == 0 && !(rename_here)) {
+            ::draw__fill(x, y, w, ::state__ROW_H, ::state__C_HOVER);
         }
         for (int g = 0; g < d; g++) {
-            vline((x + px(8) + (g * px(8)) + px(8)), y, ROW_H, 0x3A3A3A);
+            ::draw__vline((x + ::draw__px(8) + (g * ::draw__px(8)) + ::draw__px(8)), y, ::state__ROW_H, 0x3A3A3A);
         }
-        int cxp = (x + ind + px(8));
+        int cxp = (x + ind + ::draw__px(8));
         if (isdir) {
-            bool open = (((expanded).find(p) != (expanded).end()) && expanded[p]);
-            chevron(cxp, (y + (ROW_H / 2)), open, C_TEXT);
+            bool open_ = (((::state__expanded).find(p) != (::state__expanded).end()) && ::state__expanded[p]);
+            ::workspace__chevron(cxp, (y + (::state__ROW_H / 2)), open_, ::state__C_TEXT);
         }
-        int ix = (x + ind + px(18));
+        int ix = (x + ind + ::draw__px(18));
         std::string name = __nexa_file_basename((p).c_str());
         if (rename_here) {
-            fld_draw(FLD_RENAME, ix, (y + 1), (w - (ix - x) - px(6)), (ROW_H - 2), (focus == F_RENAME), ((isdir) ? (std::string("Folder name")) : (std::string("File name"))));
+            ::nxtext__fld_draw(::state__FLD_RENAME, ix, (y + 1), (w - (ix - x) - ::draw__px(6)), (::state__ROW_H - 2), (::state__focus == ::state__F_RENAME), ((isdir) ? (std::string("Folder name")) : (std::string("File name"))));
             i = i + 1;
             continue;
         }
-        int tc = C_TEXT;
+        int tc = ::state__C_TEXT;
         if (!(isdir)) {
-            draw_badge(ix, y, ROW_H, name);
-            if (active >= 0 && same_path(p, doc_path)) {
-                tc = C_BRIGHT;
+            ::highlight__draw_badge(ix, y, ::state__ROW_H, name);
+            if (::state__active >= 0 && ::buffer__same_path(p, ::state__doc_path)) {
+                tc = ::state__C_BRIGHT;
             }
         } else {
-            ix = ix - px(2);
-            fill((ix + px(1)), (y + px(6)), px(6), px(2), 0xC09553);
-            fill((ix + px(1)), (y + px(8)), px(13), px(8), 0xC09553);
+            ix = ix - ::draw__px(2);
+            ::draw__fill((ix + ::draw__px(1)), (y + ::draw__px(6)), ::draw__px(6), ::draw__px(2), 0xC09553);
+            ::draw__fill((ix + ::draw__px(1)), (y + ::draw__px(8)), ::draw__px(13), ::draw__px(8), 0xC09553);
         }
         bool dirty_mark = false;
-        int bi = find_buf(p);
-        if (bi >= 0 && buf_dirty(bi)) {
+        int bi = ::buffer__find_buf(p);
+        if (bi >= 0 && ::buffer__buf_dirty(bi)) {
             dirty_mark = true;
         }
-        txt_v((ix + px(20)), y, ROW_H, fit(name, (w - (ix - x) - px(34)), UI), tc, UI);
+        ::draw__txt_v((ix + ::draw__px(20)), y, ::state__ROW_H, ::draw__fit(name, (w - (ix - x) - ::draw__px(34)), ::state__UI), tc, ::state__UI);
         if (dirty_mark) {
-            disc((x + w - px(14)), (y + (ROW_H / 2)), px(4), C_TEXT);
+            ::draw__disc((x + w - ::draw__px(14)), (y + (::state__ROW_H / 2)), ::draw__px(4), ::state__C_TEXT);
         }
         i = i + 1;
     }
-    fill(x, hy, w, ROW_H, C_SIDEBAR);
-    chevron((x + px(10)), (hy + (ROW_H / 2)), (!tree_collapsed), C_TEXT);
-    txt_bold((x + px(20)), hy, ROW_H, fit(upper_s(__nexa_file_basename((folder).c_str())), (w - px(120)), UI_SMALL), UI_SMALL);
-    if (hovered(x, side_y, w, side_h)) {
-        int ax_ = (x + w - px(92));
-        if (icon_button(ax_, (hy + 1), "newfile", "New File")) {
-            start_new(folder, 1);
+    ::draw__fill(x, hy, w, ::state__ROW_H, ::state__C_SIDEBAR);
+    ::workspace__chevron((x + ::draw__px(10)), (hy + (::state__ROW_H / 2)), (!::state__tree_collapsed), ::state__C_TEXT);
+    ::draw__txt_bold((x + ::draw__px(20)), hy, ::state__ROW_H, ::draw__fit(::nxtext__upper_s(__nexa_file_basename((::state__folder).c_str())), (w - ::draw__px(120)), ::state__UI_SMALL), ::state__UI_SMALL);
+    if (::draw__hovered(x, ::state__side_y, w, ::state__side_h)) {
+        int ax_ = (x + w - ::draw__px(92));
+        if (::workspace__icon_button(ax_, (hy + 1), "newfile", "New File")) {
+            ::workspace__start_new(::state__folder, 1);
         }
-        if (icon_button((ax_ + px(22)), (hy + 1), "newfolder", "New Folder")) {
-            start_new(folder, 2);
+        if (::workspace__icon_button((ax_ + ::draw__px(22)), (hy + 1), "newfolder", "New Folder")) {
+            ::workspace__start_new(::state__folder, 2);
         }
-        if (icon_button((ax_ + px(44)), (hy + 1), "refresh", "Refresh")) {
-            refresh_tree();
+        if (::workspace__icon_button((ax_ + ::draw__px(44)), (hy + 1), "refresh", "Refresh")) {
+            ::workspace__refresh_tree();
         }
-        if (icon_button((ax_ + px(66)), (hy + 1), "collapse", "Collapse Folders")) {
-            expanded.clear();
+        if (::workspace__icon_button((ax_ + ::draw__px(66)), (hy + 1), "collapse", "Collapse Folders")) {
+            ::state__expanded.clear();
         }
     }
     if (content > body_h) {
-        int th = imax(px(20), (body_h * body_h / content));
-        int ty = (body_top + ((body_h - th) * tree_scroll / imax(1, (content - body_h + ROW_H))));
-        fill_a((x + w - px(10)), ty, px(10), th, 0x797979, 70);
+        int th = ::draw__imax(::draw__px(20), (body_h * body_h / content));
+        int ty = (body_top + ((body_h - th) * ::state__tree_scroll / ::draw__imax(1, (content - body_h + ::state__ROW_H))));
+        ::draw__fill_a((x + w - ::draw__px(10)), ty, ::draw__px(10), th, 0x797979, 70);
     }
 }
 
-static bool icon_button(int x, int y, std::string label, std::string tip) {
-    int s = px(20);
-    bool hov = hovered(x, y, s, s);
+static bool workspace__icon_button(int x, int y, std::string label, std::string tip) {
+    int s = ::draw__px(20);
+    bool hov = ::draw__hovered(x, y, s, s);
     if (hov) {
-        rrect(x, y, s, s, px(4), 0x3A3D41);
-        tooltip(tip);
+        ::draw__rrect(x, y, s, s, ::draw__px(4), 0x3A3D41);
+        ::chrome__tooltip(tip);
     }
-    draw_glyph(label, x, y, s, C_TEXT);
-    return clicked_in(x, y, s, s);
+    ::draw__draw_glyph(label, x, y, s, ::state__C_TEXT);
+    return ::app__clicked_in(x, y, s, s);
 }
 
-static void start_new(std::string parent, int mode) {
-    rename_mode = mode;
-    rename_parent = parent;
-    expanded[parent] = true;
-    fld_set(FLD_RENAME, "");
-    focus = F_RENAME;
-    tree_collapsed = false;
-    frame_dirty = true;
+static void workspace__start_new(std::string parent, int mode) {
+    ::state__rename_mode = mode;
+    ::state__rename_parent = parent;
+    ::state__expanded[parent] = true;
+    ::nxtext__fld_set(::state__FLD_RENAME, "");
+    ::state__focus = ::state__F_RENAME;
+    ::state__tree_collapsed = false;
+    ::state__frame_dirty = true;
 }
 
-static void start_rename(std::string p) {
-    rename_mode = 3;
-    rename_path = p;
-    rename_parent = __nexa_file_dirname((p).c_str());
+static void workspace__start_rename(std::string p) {
+    ::state__rename_mode = 3;
+    ::state__rename_path = p;
+    ::state__rename_parent = __nexa_file_dirname((p).c_str());
     std::string nm = __nexa_file_basename((p).c_str());
-    fld_set(FLD_RENAME, nm);
+    ::nxtext__fld_set(::state__FLD_RENAME, nm);
     int dot = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.rfind(__p); return __n == std::string::npos ? -1 : (int)__n; })(nm, ".");
     if (dot > 0) {
-        fld_anchor[FLD_RENAME] = 0;
-        fld_caret[FLD_RENAME] = dot;
+        ::state__fld_anchor[::state__FLD_RENAME] = 0;
+        ::state__fld_caret[::state__FLD_RENAME] = dot;
     } else {
-        fld_select_all(FLD_RENAME);
+        ::nxtext__fld_select_all(::state__FLD_RENAME);
     }
-    focus = F_RENAME;
+    ::state__focus = ::state__F_RENAME;
 }
 
-static void finish_rename(bool commit) {
-    std::string name = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(fld_text[FLD_RENAME]);
-    int mode = rename_mode;
-    rename_mode = 0;
-    focus = F_TREE;
+static void workspace__finish_rename(bool commit) {
+    std::string name = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(::state__fld_text[::state__FLD_RENAME]);
+    int mode = ::state__rename_mode;
+    ::state__rename_mode = 0;
+    ::state__focus = ::state__F_TREE;
     if (!(commit) || (int)((name).size()) == 0) {
-        frame_dirty = true;
+        ::state__frame_dirty = true;
         return;
     }
     if (mode == 1 || mode == 2) {
-        std::string p = path_join(rename_parent, name);
+        std::string p = ::workspace__path_join(::state__rename_parent, name);
         if (__nexa_file_exists((p).c_str())) {
             nx_message((std::string("A file or folder named ") + name + " already exists here.").c_str());
         } else if (mode == 1) {
@@ -8204,42 +8516,42 @@ static void finish_rename(bool commit) {
                 (void)__nexa_file_mkdir((dir).c_str());
             }
             __nexa_file_write((p).c_str(), "", 0, 0);
-            refresh_tree();
-            open_file(p, false);
-            tree_sel = p;
-            focus = F_EDITOR;
+            ::workspace__refresh_tree();
+            ::buffer__open_file(p, false);
+            ::state__tree_sel = p;
+            ::state__focus = ::state__F_EDITOR;
         } else {
             (void)__nexa_file_mkdir((p).c_str());
-            expanded[p] = true;
-            tree_sel = p;
+            ::state__expanded[p] = true;
+            ::state__tree_sel = p;
         }
     } else if (mode == 3) {
-        std::string np = path_join(rename_parent, name);
-        if (!(same_path(np, rename_path))) {
-            if (__nexa_file_rename((rename_path).c_str(), (np).c_str())) {
-                doc_store();
-                for (int i = 0; i < (int)((bufs).size()); i++) {
-                    std::string bp = bufs[i].path;
-                    if ((int)((bp).size()) > 0 && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(bp), ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(rename_path))) {
-                        std::string nbp = (np + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(bp, (int)((rename_path).size()), -1));
-                        bufs[i].path = nbp;
-                        bufs[i].name = __nexa_file_basename((nbp).c_str());
-                        bufs[i].lang = lang_for(nbp);
+        std::string np = ::workspace__path_join(::state__rename_parent, name);
+        if (!(::buffer__same_path(np, ::state__rename_path))) {
+            if (__nexa_file_rename((::state__rename_path).c_str(), (np).c_str())) {
+                ::buffer__doc_store();
+                for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+                    std::string bp = __nexa_text(::state__bufs[i].path);
+                    if ((int)((bp).size()) > 0 && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(bp), ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(::state__rename_path))) {
+                        std::string nbp = (np + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(bp, (int)((::state__rename_path).size()), -1));
+                        ::state__bufs[i].path = nbp;
+                        ::state__bufs[i].name = __nexa_file_basename((nbp).c_str());
+                        ::state__bufs[i].lang = ::highlight__lang_for(nbp);
                     }
                 }
-                int keep = active;
-                active = -1;
-                doc_load(keep);
-                tree_sel = np;
+                int keep = ::state__active;
+                ::state__active = -1;
+                ::buffer__doc_load(keep);
+                ::state__tree_sel = np;
             } else {
-                nx_message((std::string("Could not rename ") + __nexa_file_basename((rename_path).c_str()) + ".").c_str());
+                nx_message((std::string("Could not rename ") + __nexa_file_basename((::state__rename_path).c_str()) + ".").c_str());
             }
         }
     }
-    refresh_tree();
+    ::workspace__refresh_tree();
 }
 
-static void delete_path(std::string p) {
+static void workspace__delete_path(std::string p) {
     std::string nm = __nexa_file_basename((p).c_str());
     bool isdir = (__nexa_file_isdir((p).c_str()) == 1);
     std::string what = ((isdir) ? ((std::string("the folder '") + nm + "' and everything in it")) : ((std::string("'") + nm + "'")));
@@ -8250,201 +8562,201 @@ static void delete_path(std::string p) {
     if (!(ok)) {
         nx_message((std::string("Could not delete ") + nm + ".").c_str());
     }
-    int i = ((int)((bufs).size()) - 1);
+    int i = ((int)((::state__bufs).size()) - 1);
     while (i >= 0) {
-        std::string bp = bufs[i].path;
+        std::string bp = ::state__bufs[i].path;
         if ((int)((bp).size()) > 0 && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(bp), ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(p)) && !(__nexa_file_exists((bp).c_str()))) {
-            doc_store();
-            bufs[i].ver = bufs[i].saved;
-            if (i == active) {
-                doc_saved = doc_ver;
+            ::buffer__doc_store();
+            ::state__bufs[i].ver = ::state__bufs[i].saved;
+            if (i == ::state__active) {
+                ::state__doc_saved = ::state__doc_ver;
             }
-            close_tab(i);
+            ::buffer__close_tab(i);
         }
         i = i - 1;
     }
-    refresh_tree();
+    ::workspace__refresh_tree();
 }
 
-static void explorer_mouse(int x, int y, int btn, int clicks) {
-    if ((int)((folder).size()) == 0) {
+static void workspace__explorer_mouse(int x, int y, int btn, int clicks) {
+    if ((int)((::state__folder).size()) == 0) {
         return;
     }
-    int hy = (side_y + HEADER_H);
+    int hy = (::state__side_y + ::state__HEADER_H);
     if (y < hy) {
         return;
     }
-    if (y < (hy + ROW_H)) {
-        if (x < (side_x + sidebar_w - px(96)) || !(hovered(side_x, side_y, sidebar_w, side_h))) {
-            tree_collapsed = (!tree_collapsed);
+    if (y < (hy + ::state__ROW_H)) {
+        if (x < (::state__side_x + ::state__sidebar_w - ::draw__px(96)) || !(::draw__hovered(::state__side_x, ::state__side_y, ::state__sidebar_w, ::state__side_h))) {
+            ::state__tree_collapsed = (!::state__tree_collapsed);
         }
         return;
     }
-    int i = ((y - hy - ROW_H + tree_scroll) / ROW_H);
-    if (i < 0 || i >= (int)((tree_rows).size())) {
+    int i = ((y - hy - ::state__ROW_H + ::state__tree_scroll) / ::state__ROW_H);
+    if (i < 0 || i >= (int)((::state__tree_rows).size())) {
         if (btn == 1) {
-            ctx_path = folder;
-            ctx_isdir = true;
-            open_ctx_menu(x, y);
+            ::state__ctx_path = ::state__folder;
+            ::state__ctx_isdir = true;
+            ::commands__open_ctx_menu(x, y);
         }
-        tree_sel = "";
-        focus = F_TREE;
+        ::state__tree_sel = "";
+        ::state__focus = ::state__F_TREE;
         return;
     }
-    std::string p = tree_rows[i];
-    if (p == "\x01new" || (rename_mode == 3 && same_path(p, rename_path))) {
-        focus = F_RENAME;
+    std::string p = ::state__tree_rows[i];
+    if (p == "\x01new" || (::state__rename_mode == 3 && ::buffer__same_path(p, ::state__rename_path))) {
+        ::state__focus = ::state__F_RENAME;
         return;
     }
-    if (rename_mode > 0) {
-        finish_rename(true);
+    if (::state__rename_mode > 0) {
+        ::workspace__finish_rename(true);
     }
-    tree_sel = p;
-    focus = F_TREE;
-    bool isdir = tree_dir[i];
+    ::state__tree_sel = p;
+    ::state__focus = ::state__F_TREE;
+    bool isdir = ::state__tree_dir[i];
     if (btn == 1) {
-        ctx_path = p;
-        ctx_isdir = isdir;
-        open_ctx_menu(x, y);
+        ::state__ctx_path = p;
+        ::state__ctx_isdir = isdir;
+        ::commands__open_ctx_menu(x, y);
         return;
     }
     if (isdir) {
-        expanded[p] = (!(((expanded).find(p) != (expanded).end()) && expanded[p]));
+        ::state__expanded[p] = (!(((::state__expanded).find(p) != (::state__expanded).end()) && ::state__expanded[p]));
     } else {
-        open_file(p, (clicks < 2));
+        ::buffer__open_file(p, (clicks < 2));
         if (clicks >= 2) {
-            if (active >= 0) {
-                bufs[active].preview = false;
+            if (::state__active >= 0) {
+                ::state__bufs[::state__active].preview = false;
             }
-            focus = F_EDITOR;
+            ::state__focus = ::state__F_EDITOR;
         }
     }
-    frame_dirty = true;
+    ::state__frame_dirty = true;
 }
 
-static void tree_key(int vk, int mods) {
-    build_tree();
-    int n = (int)((tree_rows).size());
+static void workspace__tree_key(int vk, int mods) {
+    ::workspace__build_tree();
+    int n = (int)((::state__tree_rows).size());
     if (n == 0) {
         return;
     }
-    int i = ([&](){ const auto& __nexa_v = tree_rows; const auto& __nexa_x = tree_sel; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
-    if (vk == K_DOWN) {
-        i = imin((n - 1), (i + 1));
-    } else if (vk == K_UP) {
-        i = imax(0, (i - 1));
-    } else if (vk == K_HOME) {
+    int i = ([&](){ const auto& __nexa_v = ::state__tree_rows; const auto& __nexa_x = ::state__tree_sel; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
+    if (vk == ::state__K_DOWN) {
+        i = ::draw__imin((n - 1), (i + 1));
+    } else if (vk == ::state__K_UP) {
+        i = ::draw__imax(0, (i - 1));
+    } else if (vk == ::state__K_HOME) {
         i = 0;
-    } else if (vk == K_END) {
+    } else if (vk == ::state__K_END) {
         i = (n - 1);
-    } else if (vk == K_RIGHT && i >= 0 && tree_dir[i]) {
-        expanded[tree_rows[i]] = true;
-    } else if (vk == K_LEFT && i >= 0) {
-        if (tree_dir[i] && ((expanded).find(tree_rows[i]) != (expanded).end()) && expanded[tree_rows[i]]) {
-            expanded[tree_rows[i]] = false;
+    } else if (vk == ::state__K_RIGHT && i >= 0 && ::state__tree_dir[i]) {
+        ::state__expanded[::state__tree_rows[i]] = true;
+    } else if (vk == ::state__K_LEFT && i >= 0) {
+        if (::state__tree_dir[i] && ((::state__expanded).find(::state__tree_rows[i]) != (::state__expanded).end()) && ::state__expanded[::state__tree_rows[i]]) {
+            ::state__expanded[::state__tree_rows[i]] = false;
         } else {
-            std::string par = __nexa_file_dirname((tree_rows[i]).c_str());
-            int pi = ([&](){ const auto& __nexa_v = tree_rows; const auto& __nexa_x = par; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
+            std::string par = __nexa_file_dirname((::state__tree_rows[i]).c_str());
+            int pi = ([&](){ const auto& __nexa_v = ::state__tree_rows; const auto& __nexa_x = par; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
             if (pi >= 0) {
                 i = pi;
             }
         }
-    } else if (vk == K_ENTER && i >= 0) {
-        if (tree_dir[i]) {
-            expanded[tree_rows[i]] = (!(((expanded).find(tree_rows[i]) != (expanded).end()) && expanded[tree_rows[i]]));
+    } else if (vk == ::state__K_ENTER && i >= 0) {
+        if (::state__tree_dir[i]) {
+            ::state__expanded[::state__tree_rows[i]] = (!(((::state__expanded).find(::state__tree_rows[i]) != (::state__expanded).end()) && ::state__expanded[::state__tree_rows[i]]));
         } else {
-            open_file(tree_rows[i], false);
-            focus = F_EDITOR;
+            ::buffer__open_file(::state__tree_rows[i], false);
+            ::state__focus = ::state__F_EDITOR;
         }
-    } else if (vk == K_F2 && i >= 0) {
-        start_rename(tree_rows[i]);
-    } else if (vk == K_DELETE && i >= 0) {
-        delete_path(tree_rows[i]);
+    } else if (vk == ::state__K_F2 && i >= 0) {
+        ::workspace__start_rename(::state__tree_rows[i]);
+    } else if (vk == ::state__K_DELETE && i >= 0) {
+        ::workspace__delete_path(::state__tree_rows[i]);
         return;
-    } else if (vk == K_ESC) {
-        focus = F_EDITOR;
+    } else if (vk == ::state__K_ESC) {
+        ::state__focus = ::state__F_EDITOR;
     }
     if (i >= 0 && i < n) {
-        tree_sel = tree_rows[i];
-        int top = (i * ROW_H);
-        int body_h = (side_h - HEADER_H - ROW_H);
-        if (top < tree_scroll) {
-            tree_scroll = top;
+        ::state__tree_sel = ::state__tree_rows[i];
+        int top = (i * ::state__ROW_H);
+        int body_h = (::state__side_h - ::state__HEADER_H - ::state__ROW_H);
+        if (top < ::state__tree_scroll) {
+            ::state__tree_scroll = top;
         }
-        if ((top + ROW_H) > (tree_scroll + body_h)) {
-            tree_scroll = (top + ROW_H - body_h);
+        if ((top + ::state__ROW_H) > (::state__tree_scroll + body_h)) {
+            ::state__tree_scroll = (top + ::state__ROW_H - body_h);
         }
     }
-    frame_dirty = true;
+    ::state__frame_dirty = true;
 }
 
-static void rename_key(int vk, int mods) {
-    if (vk == K_ENTER) {
-        finish_rename(true);
+static void workspace__rename_key(int vk, int mods) {
+    if (vk == ::state__K_ENTER) {
+        ::workspace__finish_rename(true);
         return;
     }
-    if (vk == K_ESC) {
-        finish_rename(false);
+    if (vk == ::state__K_ESC) {
+        ::workspace__finish_rename(false);
         return;
     }
-    fld_key(FLD_RENAME, vk, mods);
+    ::nxtext__fld_key(::state__FLD_RENAME, vk, mods);
 }
 
-static void run_search() {
-    search_files.clear();
-    search_lines.clear();
-    search_cols.clear();
-    search_text.clear();
-    search_scroll = 0;
-    std::string pat = fld_text[FLD_SEARCH];
-    if ((int)((pat).size()) == 0 || (int)((folder).size()) == 0) {
-        search_summary = "";
+static void workspace__run_search() {
+    ::state__search_files.clear();
+    ::state__search_lines.clear();
+    ::state__search_cols.clear();
+    ::state__search_text.clear();
+    ::state__search_scroll = 0;
+    std::string pat = ::state__fld_text[::state__FLD_SEARCH];
+    if ((int)((pat).size()) == 0 || (int)((::state__folder).size()) == 0) {
+        ::state__search_summary = "";
         return;
     }
-    doc_store();
-    ensure_files_index();
-    std::string p = ((search_case) ? (pat) : (([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(pat)));
+    ::buffer__doc_store();
+    ::workspace__ensure_files_index();
+    std::string p = ((::state__search_case) ? (pat) : (([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(pat)));
     int nfiles = 0;
     int nhits = 0;
     {
-        const std::vector<std::string>& __nexa_forin_0 = files_index;
+        const std::vector<std::string>& __nexa_forin_0 = ::state__files_index;
         for (const std::string& f : __nexa_forin_0) {
-            if (!(is_text_file(f))) {
+            if (!(::workspace__is_text_file(f))) {
                 continue;
             }
-            int size = __nexa_file_size((f).c_str());
+            int size = __nexa_file_size64((f).c_str());
             if (size > (4 * 1024 * 1024)) {
                 continue;
             }
             std::vector<std::string> lines;
-            int bi = find_buf(f);
+            int bi = ::buffer__find_buf(f);
             if (bi >= 0) {
-                lines = bufs[bi].lines;
+                lines = ::state__bufs[bi].lines;
             } else {
                 std::string t = __nexa_file_read((f).c_str());
                 if (([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, 4096), std::string("\x00", 1))) {
                     continue;
                 }
-                lines = split_lines(t);
+                lines = ::nxtext__split_lines(t);
             }
             bool found = false;
             for (int k = 0; k < (int)((lines).size()); k++) {
-                std::string s = lines[k];
-                std::string hay = ((search_case) ? (s) : (([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(s)));
+                std::string s = __nexa_text(lines[k]);
+                std::string hay = ((::state__search_case) ? (s) : (([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(s)));
                 int at = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(hay, p);
                 if (at >= 0) {
                     if (!(found)) {
                         found = true;
                         nfiles = nfiles + 1;
-                        search_files.push_back(f);
-                        search_lines.push_back(-1);
-                        search_cols.push_back(0);
-                        search_text.push_back("");
+                        ::state__search_files.push_back(f);
+                        ::state__search_lines.push_back(-1);
+                        ::state__search_cols.push_back(0);
+                        ::state__search_text.push_back("");
                     }
-                    search_files.push_back(f);
-                    search_lines.push_back(k);
-                    search_cols.push_back(at);
-                    search_text.push_back(s);
+                    ::state__search_files.push_back(f);
+                    ::state__search_lines.push_back(k);
+                    ::state__search_cols.push_back(at);
+                    ::state__search_text.push_back(s);
                     nhits = nhits + 1;
                     if (nhits >= 5000) {
                         break;
@@ -8457,61 +8769,61 @@ static void run_search() {
         }
     }
     if (nhits == 0) {
-        search_summary = "No results found.";
+        ::state__search_summary = "No results found.";
     } else {
-        search_summary = (std::string("") + std::to_string(nhits) + " result" + ((nhits == 1) ? (std::string("")) : (std::string("s"))) + " in " + std::to_string(nfiles) + " file" + ((nfiles == 1) ? (std::string("")) : (std::string("s"))));
+        ::state__search_summary = (std::string("") + std::to_string(nhits) + " result" + ((nhits == 1) ? (std::string("")) : (std::string("s"))) + " in " + std::to_string(nfiles) + " file" + ((nfiles == 1) ? (std::string("")) : (std::string("s"))));
     }
-    frame_dirty = true;
+    ::state__frame_dirty = true;
 }
 
-static void draw_search_view() {
-    int x = side_x;
-    int w = sidebar_w;
-    section_title(x, side_y, w, "SEARCH");
-    int fy = (side_y + HEADER_H);
-    int fx = (x + px(12));
-    int fwid = (w - px(24));
-    fld_draw(FLD_SEARCH, fx, fy, fwid, px(26), (focus == F_SEARCH), "Search");
-    if (toggle_box((fx + fwid - px(24)), (fy + px(3)), "Aa", search_case)) {
-        search_case = (!search_case);
-        run_search();
+static void workspace__draw_search_view() {
+    int x = ::state__side_x;
+    int w = ::state__sidebar_w;
+    ::chrome__section_title(x, ::state__side_y, w, "SEARCH");
+    int fy = (::state__side_y + ::state__HEADER_H);
+    int fx = (x + ::draw__px(12));
+    int fwid = (w - ::draw__px(24));
+    ::nxtext__fld_draw(::state__FLD_SEARCH, fx, fy, fwid, ::draw__px(26), (::state__focus == ::state__F_SEARCH), "Search");
+    if (::editor__toggle_box((fx + fwid - ::draw__px(24)), (fy + ::draw__px(3)), "Aa", ::state__search_case)) {
+        ::state__search_case = (!::state__search_case);
+        ::workspace__run_search();
     }
-    int ry = (fy + px(34));
-    if ((int)((search_summary).size()) > 0) {
-        txt(fx, ry, search_summary, C_MUTED, UI_SMALL);
-        ry = ry + px(20);
+    int ry = (fy + ::draw__px(34));
+    if ((int)((::state__search_summary).size()) > 0) {
+        ::draw__txt(fx, ry, ::state__search_summary, ::state__C_MUTED, ::state__UI_SMALL);
+        ry = ry + ::draw__px(20);
     }
     int top = ry;
-    int body_h = (side_y + side_h - top);
-    int content = ((int)((search_files).size()) * ROW_H);
-    search_scroll = clamp(search_scroll, 0, imax(0, (content - body_h)));
-    int i = (search_scroll / ROW_H);
-    std::string pat = fld_text[FLD_SEARCH];
-    while (i < (int)((search_files).size())) {
-        int y = (top + (i * ROW_H) - search_scroll);
-        if (y >= (side_y + side_h)) {
+    int body_h = (::state__side_y + ::state__side_h - top);
+    int content = ((int)((::state__search_files).size()) * ::state__ROW_H);
+    ::state__search_scroll = ::draw__clamp(::state__search_scroll, 0, ::draw__imax(0, (content - body_h)));
+    int i = (::state__search_scroll / ::state__ROW_H);
+    std::string pat = ::state__fld_text[::state__FLD_SEARCH];
+    while (i < (int)((::state__search_files).size())) {
+        int y = (top + (i * ::state__ROW_H) - ::state__search_scroll);
+        if (y >= (::state__side_y + ::state__side_h)) {
             break;
         }
-        if ((y + ROW_H) <= top) {
+        if ((y + ::state__ROW_H) <= top) {
             i = i + 1;
             continue;
         }
-        std::string f = search_files[i];
-        int ln = search_lines[i];
-        if (hovered(x, y, w, ROW_H) && y >= top) {
-            fill(x, y, w, ROW_H, C_HOVER);
+        std::string f = ::state__search_files[i];
+        int ln = ::state__search_lines[i];
+        if (::draw__hovered(x, y, w, ::state__ROW_H) && y >= top) {
+            ::draw__fill(x, y, w, ::state__ROW_H, ::state__C_HOVER);
         }
         if (ln < 0) {
-            chevron((x + px(12)), (y + (ROW_H / 2)), true, C_TEXT);
+            ::workspace__chevron((x + ::draw__px(12)), (y + (::state__ROW_H / 2)), true, ::state__C_TEXT);
             std::string nm = __nexa_file_basename((f).c_str());
-            draw_badge((x + px(20)), y, ROW_H, nm);
-            int nw = txt_v((x + px(38)), y, ROW_H, nm, C_TEXT, UI);
-            std::string dir = rel_path(__nexa_file_dirname((f).c_str()));
-            txt_v((x + px(44) + nw), y, ROW_H, fit(dir, (w - nw - px(60)), UI_SMALL), C_MUTED, UI_SMALL);
+            ::highlight__draw_badge((x + ::draw__px(20)), y, ::state__ROW_H, nm);
+            int nw = ::draw__txt_v((x + ::draw__px(38)), y, ::state__ROW_H, nm, ::state__C_TEXT, ::state__UI);
+            std::string dir = ::workspace__rel_path(__nexa_file_dirname((f).c_str()));
+            ::draw__txt_v((x + ::draw__px(44) + nw), y, ::state__ROW_H, ::draw__fit(dir, (w - nw - ::draw__px(60)), ::state__UI_SMALL), ::state__C_MUTED, ::state__UI_SMALL);
         } else {
-            std::string s = search_text[i];
-            int col = search_cols[i];
-            int start = imax(0, (col - 20));
+            std::string s = ::state__search_text[i];
+            int col = ::state__search_cols[i];
+            int start = ::draw__imax(0, (col - 20));
             std::string before = ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, start, (col - start)), "\t", " ");
             if (start == 0) {
                 before = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(before);
@@ -8520,106 +8832,106 @@ static void draw_search_view() {
             }
             std::string hit = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, col, (int)((pat).size()));
             std::string after = ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, (col + (int)((pat).size())), -1), "\t", " ");
-            int tx = (x + px(36));
-            int bw = txt_v(tx, y, ROW_H, before, C_TEXT, UI);
-            int hw = tw(hit, UI);
-            fill_a((tx + bw), (y + px(3)), hw, (ROW_H - px(6)), 0xEA5C00, 90);
-            txt_v((tx + bw), y, ROW_H, hit, C_BRIGHT, UI);
-            txt_v((tx + bw + hw), y, ROW_H, fit(after, (w - (tx - x) - bw - hw - px(8)), UI), C_TEXT, UI);
+            int tx = (x + ::draw__px(36));
+            int bw = ::draw__txt_v(tx, y, ::state__ROW_H, before, ::state__C_TEXT, ::state__UI);
+            int hw = ::draw__tw(hit, ::state__UI);
+            ::draw__fill_a((tx + bw), (y + ::draw__px(3)), hw, (::state__ROW_H - ::draw__px(6)), 0xEA5C00, 90);
+            ::draw__txt_v((tx + bw), y, ::state__ROW_H, hit, ::state__C_BRIGHT, ::state__UI);
+            ::draw__txt_v((tx + bw + hw), y, ::state__ROW_H, ::draw__fit(after, (w - (tx - x) - bw - hw - ::draw__px(8)), ::state__UI), ::state__C_TEXT, ::state__UI);
         }
         i = i + 1;
     }
-    search_top = top;
+    ::state__search_top = top;
 }
 
-static void search_mouse(int x, int y, int mods) {
-    int fy = (side_y + HEADER_H);
-    if (y >= fy && y < (fy + px(26))) {
-        if (x < (side_x + sidebar_w - px(36))) {
-            focus = F_SEARCH;
-            fld_click(FLD_SEARCH, (x - side_x - px(18)), ((mods & M_SHIFT) != 0));
+static void workspace__search_mouse(int x, int y, int mods) {
+    int fy = (::state__side_y + ::state__HEADER_H);
+    if (y >= fy && y < (fy + ::draw__px(26))) {
+        if (x < (::state__side_x + ::state__sidebar_w - ::draw__px(36))) {
+            ::state__focus = ::state__F_SEARCH;
+            ::nxtext__fld_click(::state__FLD_SEARCH, (x - ::state__side_x - ::draw__px(18)), ((mods & ::state__M_SHIFT) != 0));
         }
         return;
     }
-    if (y < search_top) {
+    if (y < ::state__search_top) {
         return;
     }
-    int i = ((y - search_top + search_scroll) / ROW_H);
-    if (i < 0 || i >= (int)((search_files).size())) {
+    int i = ((y - ::state__search_top + ::state__search_scroll) / ::state__ROW_H);
+    if (i < 0 || i >= (int)((::state__search_files).size())) {
         return;
     }
-    int ln = search_lines[i];
+    int ln = ::state__search_lines[i];
     if (ln < 0) {
         return;
     }
-    std::string f = search_files[i];
-    if (open_file(f, false)) {
-        int col = search_cols[i];
-        ay = ln;
-        ax = col;
-        cy = ln;
-        cx = (col + (int)((fld_text[FLD_SEARCH]).size()));
-        clamp_cursor();
-        reveal(true);
-        focus = F_EDITOR;
+    std::string f = ::state__search_files[i];
+    if (::buffer__open_file(f, false)) {
+        int col = ::state__search_cols[i];
+        ::state__ay = ln;
+        ::state__ax = col;
+        ::state__cy = ln;
+        ::state__cx = (col + (int)((::state__fld_text[::state__FLD_SEARCH]).size()));
+        ::buffer__clamp_cursor();
+        ::editor__reveal(true);
+        ::state__focus = ::state__F_EDITOR;
     }
 }
 
-static void search_key(int vk, int mods) {
-    if (vk == K_ENTER) {
-        run_search();
+static void workspace__search_key(int vk, int mods) {
+    if (vk == ::state__K_ENTER) {
+        ::workspace__run_search();
         return;
     }
-    if (vk == K_ESC) {
-        focus = F_EDITOR;
+    if (vk == ::state__K_ESC) {
+        ::state__focus = ::state__F_EDITOR;
         return;
     }
-    fld_key(FLD_SEARCH, vk, mods);
+    ::nxtext__fld_key(::state__FLD_SEARCH, vk, mods);
 }
 
-static void open_quick(std::string prefix) {
-    quick_open = true;
-    fld_set(FLD_QUICK, prefix);
-    quick_last = "~";
-    quick_sel = 0;
-    quick_top = 0;
-    focus = F_QUICK;
-    comp_open = false;
-    menu_open = -1;
-    frame_dirty = true;
+static void workspace__open_quick(std::string prefix) {
+    ::state__quick_open = true;
+    ::nxtext__fld_set(::state__FLD_QUICK, prefix);
+    ::state__quick_last = "~";
+    ::state__quick_sel = 0;
+    ::state__quick_top = 0;
+    ::state__focus = ::state__F_QUICK;
+    ::state__comp_open = false;
+    ::state__menu_open = -1;
+    ::state__frame_dirty = true;
 }
 
-static void close_quick() {
-    quick_open = false;
-    focus = F_EDITOR;
-    frame_dirty = true;
+static void workspace__close_quick() {
+    ::state__quick_open = false;
+    ::state__focus = ::state__F_EDITOR;
+    ::state__frame_dirty = true;
 }
 
-static void quick_add(std::string label, std::string detail, int kind, std::string key) {
-    quick_items.push_back(label);
-    quick_detail.push_back(detail);
-    quick_kind.push_back(kind);
-    quick_key.push_back(key);
+static void workspace__quick_add(std::string label, std::string detail, int kind, std::string key) {
+    ::state__quick_items.push_back(label);
+    ::state__quick_detail.push_back(detail);
+    ::state__quick_kind.push_back(kind);
+    ::state__quick_key.push_back(key);
 }
 
-static void quick_refresh() {
-    std::string q = fld_text[FLD_QUICK];
-    if (q == quick_last) {
+static void workspace__quick_refresh() {
+    std::string q = ::state__fld_text[::state__FLD_QUICK];
+    if (q == ::state__quick_last) {
         return;
     }
-    quick_last = q;
-    quick_items.clear();
-    quick_detail.clear();
-    quick_kind.clear();
-    quick_key.clear();
-    quick_sel = 0;
-    quick_top = 0;
+    ::state__quick_last = q;
+    ::state__quick_items.clear();
+    ::state__quick_detail.clear();
+    ::state__quick_kind.clear();
+    ::state__quick_key.clear();
+    ::state__quick_sel = 0;
+    ::state__quick_top = 0;
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(q, ">")) {
         std::string pat = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(q, 1, -1));
         std::vector<std::string> scored;
-        for (int i = 0; i < (int)((cmd_ids).size()); i++) {
-            std::string lab = cmd_labels[i];
-            int sc = fuzzy(lab, pat);
+        for (int i = 0; i < (int)((::state__cmd_ids).size()); i++) {
+            std::string lab = __nexa_text(::state__cmd_labels[i]);
+            int sc = ::nxtext__fuzzy(lab, pat);
             if (sc >= 0) {
                 scored.push_back((std::string("") + __nexa_fmt_i(static_cast<long long>((9999 - sc)), "0", '=', 0, 5, false, 0) + __nexa_fmt_i(static_cast<long long>(i), "0", '=', 0, 4, false, 0)));
             }
@@ -8629,73 +8941,63 @@ static void quick_refresh() {
             const std::vector<std::string>& __nexa_forin_0 = scored;
             for (const std::string& s : __nexa_forin_0) {
                 int i = ([](const std::string& __s){ char* __e=nullptr; long __v=std::strtol(__s.c_str(),&__e,10); return (__e==__s.c_str())?0:static_cast<int>(__v); })(std::string(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 5, 4)));
-                quick_add(cmd_labels[i], cmd_keys[i], 2, cmd_ids[i]);
+                ::workspace__quick_add(::state__cmd_labels[i], ::state__cmd_keys[i], 2, ::state__cmd_ids[i]);
             }
         }
-        if ((int)((quick_items).size()) == 0) {
-            quick_add("No matching commands", "", 5, "");
+        if ((int)((::state__quick_items).size()) == 0) {
+            ::workspace__quick_add("No matching commands", "", 5, "");
         }
         return;
     }
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(q, ":")) {
         int n = ([](const std::string& __s){ char* __e=nullptr; long __v=std::strtol(__s.c_str(),&__e,10); return (__e==__s.c_str())?0:static_cast<int>(__v); })(std::string(([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(q, 1, -1))));
-        if (!(is_file_tab())) {
-            quick_add("Open a file to go to a line", "", 5, "");
+        if (!(::buffer__is_file_tab())) {
+            ::workspace__quick_add("Open a file to go to a line", "", 5, "");
         } else if (n > 0) {
-            quick_add((std::string("Go to line ") + std::to_string(n)), (std::string("of ") + std::to_string((int)((L).size()))), 4, std::to_string(n));
+            ::workspace__quick_add((std::string("Go to line ") + std::to_string(n)), (std::string("of ") + std::to_string((int)((::state__L).size()))), 4, std::to_string(n));
         } else {
-            quick_add((std::string("Type a line number between 1 and ") + std::to_string((int)((L).size()))), (std::string("current line ") + std::to_string((cy + 1))), 5, "");
+            ::workspace__quick_add((std::string("Type a line number between 1 and ") + std::to_string((int)((::state__L).size()))), (std::string("current line ") + std::to_string((::state__cy + 1))), 5, "");
         }
         return;
     }
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(q, "@")) {
         std::string pat = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(q, 1, -1));
-        if (!(is_file_tab())) {
-            quick_add("Open a file to see its symbols", "", 5, "");
+        if (!(::buffer__is_file_tab())) {
+            ::workspace__quick_add("Open a file to see its symbols", "", 5, "");
             return;
         }
-        collect_symbols();
-        for (int i = 0; i < (int)((sym_names).size()); i++) {
-            std::string nm = sym_names[i];
-            if (fuzzy(nm, pat) >= 0) {
-                int kind = sym_kinds[i];
-                std::string kn = "variable";
-                if (kind == 1) {
-                    kn = "function";
-                }
-                if (kind == 2) {
-                    kn = "struct";
-                }
-                if (kind == 3) {
-                    kn = "enum";
-                }
-                quick_add(nm, (std::string("") + kn + " \xC2\xB7 line " + std::to_string((sym_lines[i] + 1))), 3, std::to_string(sym_lines[i]));
+        ::editor__collect_symbols();
+        for (int i = 0; i < (int)((::state__sym_names).size()); i++) {
+            std::string nm = __nexa_text(::state__sym_names[i]);
+            if (::nxtext__fuzzy(nm, pat) >= 0) {
+                int kind = ::state__sym_kinds[i];
+                ::workspace__quick_add(nm, (std::string("") + ::workspace__sym_kind_name(kind) + " \xC2\xB7 line " + __nexa_text((::state__sym_lines[i] + 1))), 3, std::to_string(::state__sym_lines[i]));
             }
         }
-        if ((int)((quick_items).size()) == 0) {
-            quick_add("No symbols found", "", 5, "");
+        if ((int)((::state__quick_items).size()) == 0) {
+            ::workspace__quick_add("No symbols found", "", 5, "");
         }
         return;
     }
-    ensure_files_index();
+    ::workspace__ensure_files_index();
     std::string pat = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(q);
     if ((int)((pat).size()) == 0) {
-        for (int i = 0; i < (int)((bufs).size()); i++) {
-            std::string p = bufs[i].path;
-            if (bufs[i].kind == 0 && (int)((p).size()) > 0) {
-                quick_add(__nexa_file_basename((p).c_str()), rel_path(__nexa_file_dirname((p).c_str())), 1, p);
+        for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+            std::string p = __nexa_text(::state__bufs[i].path);
+            if (::state__bufs[i].kind == 0 && (int)((p).size()) > 0) {
+                ::workspace__quick_add(__nexa_file_basename((p).c_str()), ::workspace__rel_path(__nexa_file_dirname((p).c_str())), 1, p);
             }
         }
     }
     std::vector<std::string> scored;
-    for (int i = 0; i < (int)((files_index).size()); i++) {
-        std::string p = files_index[i];
-        std::string rp = rel_path(p);
-        int sc = fuzzy(__nexa_file_basename((p).c_str()), pat);
+    for (int i = 0; i < (int)((::state__files_index).size()); i++) {
+        std::string p = __nexa_text(::state__files_index[i]);
+        std::string rp = ::workspace__rel_path(p);
+        int sc = ::nxtext__fuzzy(__nexa_file_basename((p).c_str()), pat);
         if (sc >= 0) {
             sc = sc + 100;
         } else {
-            sc = fuzzy(rp, pat);
+            sc = ::nxtext__fuzzy(rp, pat);
         }
         if (sc >= 0) {
             scored.push_back((std::string("") + __nexa_fmt_i(static_cast<long long>((99999 - sc)), "0", '=', 0, 6, false, 0) + __nexa_fmt_i(static_cast<long long>(i), "0", '=', 0, 6, false, 0)));
@@ -8705,190 +9007,190 @@ static void quick_refresh() {
     {
         const std::vector<std::string>& __nexa_forin_1 = scored;
         for (const std::string& s : __nexa_forin_1) {
-            if ((int)((quick_items).size()) >= 200) {
+            if ((int)((::state__quick_items).size()) >= 200) {
                 break;
             }
             int i = ([](const std::string& __s){ char* __e=nullptr; long __v=std::strtol(__s.c_str(),&__e,10); return (__e==__s.c_str())?0:static_cast<int>(__v); })(std::string(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, 6, 6)));
-            std::string p = files_index[i];
-            if (([&](){ const auto& __nexa_v = quick_key; const auto& __nexa_x = p; for (const auto& __nexa_e : __nexa_v) { if (__nexa_e == __nexa_x) return true; } return false; })()) {
+            std::string p = ::state__files_index[i];
+            if (([&](){ const auto& __nexa_v = ::state__quick_key; const auto& __nexa_x = p; for (const auto& __nexa_e : __nexa_v) { if (__nexa_e == __nexa_x) return true; } return false; })()) {
                 continue;
             }
-            quick_add(__nexa_file_basename((p).c_str()), rel_path(__nexa_file_dirname((p).c_str())), 1, p);
+            ::workspace__quick_add(__nexa_file_basename((p).c_str()), ::workspace__rel_path(__nexa_file_dirname((p).c_str())), 1, p);
         }
     }
-    if ((int)((quick_items).size()) == 0) {
-        if ((int)((folder).size()) == 0) {
-            quick_add("Open a folder to search its files", "", 5, "");
+    if ((int)((::state__quick_items).size()) == 0) {
+        if ((int)((::state__folder).size()) == 0) {
+            ::workspace__quick_add("Open a folder to search its files", "", 5, "");
         } else {
-            quick_add("No matching files", "", 5, "");
+            ::workspace__quick_add("No matching files", "", 5, "");
         }
     }
 }
 
-static void quick_accept() {
-    if (quick_sel < 0 || quick_sel >= (int)((quick_items).size())) {
+static void workspace__quick_accept() {
+    if (::state__quick_sel < 0 || ::state__quick_sel >= (int)((::state__quick_items).size())) {
         return;
     }
-    int kind = quick_kind[quick_sel];
-    std::string key = quick_key[quick_sel];
+    int kind = ::state__quick_kind[::state__quick_sel];
+    std::string key = ::state__quick_key[::state__quick_sel];
     if (kind == 5) {
         return;
     }
-    close_quick();
+    ::workspace__close_quick();
     if (kind == 1) {
-        open_file(key, false);
-        focus = F_EDITOR;
+        ::buffer__open_file(key, false);
+        ::state__focus = ::state__F_EDITOR;
     } else if (kind == 2) {
-        run_cmd(key);
+        ::commands__run_cmd(key);
     } else if (kind == 3 || kind == 4) {
         int n = ([](const std::string& __s){ char* __e=nullptr; long __v=std::strtol(__s.c_str(),&__e,10); return (__e==__s.c_str())?0:static_cast<int>(__v); })(std::string(key));
         if (kind == 4) {
             n = n - 1;
         }
-        n = clamp(n, 0, ((int)((L).size()) - 1));
-        set_cursor(n, (int)((leading_ws(L[n])).size()), false);
-        reveal(true);
-        focus = F_EDITOR;
+        n = ::draw__clamp(n, 0, ((int)((::state__L).size()) - 1));
+        ::buffer__set_cursor(n, (int)((::nxtext__leading_ws(::state__L[n])).size()), false);
+        ::editor__reveal(true);
+        ::state__focus = ::state__F_EDITOR;
     }
 }
 
-static void quick_key_press(int vk, int mods) {
-    int n = (int)((quick_items).size());
-    if (vk == K_ESC) {
-        close_quick();
+static void workspace__quick_key_press(int vk, int mods) {
+    int n = (int)((::state__quick_items).size());
+    if (vk == ::state__K_ESC) {
+        ::workspace__close_quick();
         return;
     }
-    if (vk == K_ENTER) {
-        quick_refresh();
-        quick_accept();
+    if (vk == ::state__K_ENTER) {
+        ::workspace__quick_refresh();
+        ::workspace__quick_accept();
         return;
     }
-    if (vk == K_DOWN) {
+    if (vk == ::state__K_DOWN) {
         if (n > 0) {
-            quick_sel = ((quick_sel + 1) % n);
+            ::state__quick_sel = ((::state__quick_sel + 1) % n);
         }
         return;
     }
-    if (vk == K_UP) {
+    if (vk == ::state__K_UP) {
         if (n > 0) {
-            quick_sel = ((quick_sel + n - 1) % n);
+            ::state__quick_sel = ((::state__quick_sel + n - 1) % n);
         }
         return;
     }
-    if (vk == K_PGDN) {
-        quick_sel = imin((n - 1), (quick_sel + 10));
+    if (vk == ::state__K_PGDN) {
+        ::state__quick_sel = ::draw__imin((n - 1), (::state__quick_sel + 10));
         return;
     }
-    if (vk == K_PGUP) {
-        quick_sel = imax(0, (quick_sel - 10));
+    if (vk == ::state__K_PGUP) {
+        ::state__quick_sel = ::draw__imax(0, (::state__quick_sel - 10));
         return;
     }
-    fld_key(FLD_QUICK, vk, mods);
-    std::string q = fld_text[FLD_QUICK];
-    if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(q, ":") && is_file_tab()) {
+    ::nxtext__fld_key(::state__FLD_QUICK, vk, mods);
+    std::string q = ::state__fld_text[::state__FLD_QUICK];
+    if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(q, ":") && ::buffer__is_file_tab()) {
         int ln = ([](const std::string& __s){ char* __e=nullptr; long __v=std::strtol(__s.c_str(),&__e,10); return (__e==__s.c_str())?0:static_cast<int>(__v); })(std::string(([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(q, 1, -1))));
         if (ln > 0) {
-            cy = clamp((ln - 1), 0, ((int)((L).size()) - 1));
-            cx = 0;
-            ay = cy;
-            ax = 0;
-            reveal(true);
+            ::state__cy = ::draw__clamp((ln - 1), 0, ((int)((::state__L).size()) - 1));
+            ::state__cx = 0;
+            ::state__ay = ::state__cy;
+            ::state__ax = 0;
+            ::editor__reveal(true);
         }
     }
 }
 
-static void draw_quick() {
-    if (!(quick_open)) {
+static void workspace__draw_quick() {
+    if (!(::state__quick_open)) {
         return;
     }
-    quick_refresh();
-    int w = imin(px(620), (win_w - px(40)));
-    int x = ((win_w - w) / 2);
-    int y = (TOOLBAR_H + px(2));
-    int rh = px(24);
-    int rows = imin((int)((quick_items).size()), 14);
-    int h = (px(40) + (rows * rh) + px(6));
-    qk_x = x;
-    qk_y = y;
-    qk_w = w;
-    qk_h = h;
-    qk_row = rh;
+    ::workspace__quick_refresh();
+    int w = ::draw__imin(::draw__px(620), (::state__win_w - ::draw__px(40)));
+    int x = ((::state__win_w - w) / 2);
+    int y = (::state__TOOLBAR_H + ::draw__px(2));
+    int rh = ::draw__px(24);
+    int rows = ::draw__imin((int)((::state__quick_items).size()), 14);
+    int h = (::draw__px(40) + (rows * rh) + ::draw__px(6));
+    ::state__qk_x = x;
+    ::state__qk_y = y;
+    ::state__qk_w = w;
+    ::state__qk_h = h;
+    ::state__qk_row = rh;
     __nexa_ui_panel(x, y, w, h, std::string());
-    fill((x + 1), (y + 1), (w - 2), (h - 2), 0x222222);
-    outline(x, y, w, h, 0x454545);
-    fld_draw(FLD_QUICK, (x + px(8)), (y + px(7)), (w - px(16)), px(26), true, "Search files by name (> for commands, @ for symbols, : for a line)");
-    if (quick_sel < quick_top) {
-        quick_top = quick_sel;
+    ::draw__fill((x + 1), (y + 1), (w - 2), (h - 2), 0x222222);
+    ::draw__outline(x, y, w, h, 0x454545);
+    ::nxtext__fld_draw(::state__FLD_QUICK, (x + ::draw__px(8)), (y + ::draw__px(7)), (w - ::draw__px(16)), ::draw__px(26), true, "Search files by name (> for commands, @ for symbols, : for a line)");
+    if (::state__quick_sel < ::state__quick_top) {
+        ::state__quick_top = ::state__quick_sel;
     }
-    if (quick_sel >= (quick_top + rows)) {
-        quick_top = (quick_sel - rows + 1);
+    if (::state__quick_sel >= (::state__quick_top + rows)) {
+        ::state__quick_top = (::state__quick_sel - rows + 1);
     }
-    int ly = (y + px(40));
-    qk_list_y = ly;
-    std::string q = fld_text[FLD_QUICK];
+    int ly = (y + ::draw__px(40));
+    ::state__qk_list_y = ly;
+    std::string q = ::state__fld_text[::state__FLD_QUICK];
     for (int r = 0; r < rows; r++) {
-        int i = (quick_top + r);
-        if (i >= (int)((quick_items).size())) {
+        int i = (::state__quick_top + r);
+        if (i >= (int)((::state__quick_items).size())) {
             break;
         }
         int ry = (ly + (r * rh));
-        int kind = quick_kind[i];
-        if (i == quick_sel && kind != 5) {
-            fill((x + px(4)), ry, (w - px(8)), rh, 0x04395E);
-        } else if (hovered(x, ry, w, rh) && kind != 5) {
-            fill((x + px(4)), ry, (w - px(8)), rh, C_HOVER);
+        int kind = ::state__quick_kind[i];
+        if (i == ::state__quick_sel && kind != 5) {
+            ::draw__fill((x + ::draw__px(4)), ry, (w - ::draw__px(8)), rh, 0x04395E);
+        } else if (::draw__hovered(x, ry, w, rh) && kind != 5) {
+            ::draw__fill((x + ::draw__px(4)), ry, (w - ::draw__px(8)), rh, ::state__C_HOVER);
         }
-        std::string label = quick_items[i];
-        std::string detail = quick_detail[i];
-        int tx = (x + px(14));
+        std::string label = ::state__quick_items[i];
+        std::string detail = ::state__quick_detail[i];
+        int tx = (x + ::draw__px(14));
         if (kind == 1) {
-            draw_badge(tx, ry, rh, label);
-            tx = tx + px(20);
+            ::highlight__draw_badge(tx, ry, rh, label);
+            tx = tx + ::draw__px(20);
         } else if (kind == 3) {
-            draw_glyph("symbol", (tx - px(2)), (ry + ((rh - px(16)) / 2)), px(16), 0xB180D7);
-            tx = tx + px(20);
+            ::draw__draw_glyph("symbol", (tx - ::draw__px(2)), (ry + ((rh - ::draw__px(16)) / 2)), ::draw__px(16), 0xB180D7);
+            tx = tx + ::draw__px(20);
         }
-        int lc = ((kind == 5) ? (C_MUTED) : (C_TEXT));
-        int lw = txt_v(tx, ry, rh, fit(label, (w - px(200)), UI), lc, UI);
+        int lc = ((kind == 5) ? (::state__C_MUTED) : (::state__C_TEXT));
+        int lw = ::draw__txt_v(tx, ry, rh, ::draw__fit(label, (w - ::draw__px(200)), ::state__UI), lc, ::state__UI);
         if (kind == 2) {
             if ((int)((detail).size()) > 0) {
-                int kw = (tw(detail, UI_SMALL) + px(10));
-                keycap((x + w - kw - px(14)), (ry + px(2)), detail);
+                int kw = (::draw__tw(detail, ::state__UI_SMALL) + ::draw__px(10));
+                ::draw__keycap((x + w - kw - ::draw__px(14)), (ry + ::draw__px(2)), detail);
             }
         } else if ((int)((detail).size()) > 0) {
-            txt_v((tx + lw + px(8)), ry, rh, fit(detail, (w - (tx - x) - lw - px(24)), UI_SMALL), C_MUTED, UI_SMALL);
+            ::draw__txt_v((tx + lw + ::draw__px(8)), ry, rh, ::draw__fit(detail, (w - (tx - x) - lw - ::draw__px(24)), ::state__UI_SMALL), ::state__C_MUTED, ::state__UI_SMALL);
         }
     }
 }
 
-static bool quick_mouse(int x, int y) {
-    if (!(inside(x, y, qk_x, qk_y, qk_w, qk_h))) {
-        close_quick();
+static bool workspace__quick_mouse(int x, int y) {
+    if (!(::draw__inside(x, y, ::state__qk_x, ::state__qk_y, ::state__qk_w, ::state__qk_h))) {
+        ::workspace__close_quick();
         return false;
     }
-    if (y >= qk_list_y) {
-        int i = (quick_top + ((y - qk_list_y) / qk_row));
-        if (i >= 0 && i < (int)((quick_items).size())) {
-            quick_sel = i;
-            quick_accept();
+    if (y >= ::state__qk_list_y) {
+        int i = (::state__quick_top + ((y - ::state__qk_list_y) / ::state__qk_row));
+        if (i >= 0 && i < (int)((::state__quick_items).size())) {
+            ::state__quick_sel = i;
+            ::workspace__quick_accept();
         }
     } else {
-        fld_click(FLD_QUICK, (x - qk_x - px(14)), false);
+        ::nxtext__fld_click(::state__FLD_QUICK, (x - ::state__qk_x - ::draw__px(14)), false);
     }
     return true;
 }
 
-static int sym_color(int kind) {
+static int workspace__sym_color(int kind) {
     if (kind == 1) {
         return 0xB180D7;
     }
-    if (kind == 2 || kind == 3) {
+    if (kind == 2 || kind == 3 || kind == 5 || kind == 6) {
         return 0xEE9D28;
     }
     return 0x75BEFF;
 }
 
-static std::string sym_kind_name(int kind) {
+static std::string workspace__sym_kind_name(int kind) {
     if (kind == 1) {
         return "function";
     }
@@ -8898,159 +9200,165 @@ static std::string sym_kind_name(int kind) {
     if (kind == 3) {
         return "enum";
     }
+    if (kind == 5) {
+        return "type";
+    }
+    if (kind == 6) {
+        return "shape";
+    }
     return "variable";
 }
 
-static void draw_outline() {
-    int x = side_x;
-    int w = sidebar_w;
-    section_title(x, side_y, w, "OUTLINE");
-    int top = (side_y + HEADER_H);
-    if (!(is_file_tab())) {
-        txt((x + px(20)), (top + px(6)), "The active editor has no symbols.", C_MUTED, UI);
+static void workspace__draw_outline() {
+    int x = ::state__side_x;
+    int w = ::state__sidebar_w;
+    ::chrome__section_title(x, ::state__side_y, w, "OUTLINE");
+    int top = (::state__side_y + ::state__HEADER_H);
+    if (!(::buffer__is_file_tab())) {
+        ::draw__txt((x + ::draw__px(20)), (top + ::draw__px(6)), "The active editor has no symbols.", ::state__C_MUTED, ::state__UI);
         return;
     }
-    collect_symbols();
-    if ((int)((sym_names).size()) == 0) {
-        txt((x + px(20)), (top + px(6)), "No symbols found in this file.", C_MUTED, UI);
+    ::editor__collect_symbols();
+    if ((int)((::state__sym_names).size()) == 0) {
+        ::draw__txt((x + ::draw__px(20)), (top + ::draw__px(6)), "No symbols found in this file.", ::state__C_MUTED, ::state__UI);
         return;
     }
     int cur = -1;
-    for (int i = 0; i < (int)((sym_lines).size()); i++) {
-        if (sym_lines[i] <= cy) {
+    for (int i = 0; i < (int)((::state__sym_lines).size()); i++) {
+        if (::state__sym_lines[i] <= ::state__cy) {
             cur = i;
         }
     }
-    int body_h = (side_y + side_h - top);
-    outline_scroll = clamp(outline_scroll, 0, imax(0, (((int)((sym_names).size()) * ROW_H) - body_h)));
-    int i = (outline_scroll / ROW_H);
-    while (i < (int)((sym_names).size())) {
-        int y = (top + (i * ROW_H) - outline_scroll);
-        if (y >= (side_y + side_h)) {
+    int body_h = (::state__side_y + ::state__side_h - top);
+    ::state__outline_scroll = ::draw__clamp(::state__outline_scroll, 0, ::draw__imax(0, (((int)((::state__sym_names).size()) * ::state__ROW_H) - body_h)));
+    int i = (::state__outline_scroll / ::state__ROW_H);
+    while (i < (int)((::state__sym_names).size())) {
+        int y = (top + (i * ::state__ROW_H) - ::state__outline_scroll);
+        if (y >= (::state__side_y + ::state__side_h)) {
             break;
         }
         if (i == cur) {
-            fill(x, y, w, ROW_H, C_ACTIVE);
-        } else if (hovered(x, y, w, ROW_H)) {
-            fill(x, y, w, ROW_H, C_HOVER);
+            ::draw__fill(x, y, w, ::state__ROW_H, ::state__C_ACTIVE);
+        } else if (::draw__hovered(x, y, w, ::state__ROW_H)) {
+            ::draw__fill(x, y, w, ::state__ROW_H, ::state__C_HOVER);
         }
-        int kind = sym_kinds[i];
-        draw_glyph("symbol", (x + px(14)), (y + ((ROW_H - px(16)) / 2)), px(16), sym_color(kind));
-        int nw = txt_v((x + px(36)), y, ROW_H, fit(sym_names[i], (w - px(110)), UI), C_TEXT, UI);
-        txt_v((x + px(44) + nw), y, ROW_H, sym_kind_name(kind), C_DIM, UI_SMALL);
-        std::string ln = (std::string("") + std::to_string((sym_lines[i] + 1)));
-        txt_v((x + w - tw(ln, UI_SMALL) - px(14)), y, ROW_H, ln, C_DIM, UI_SMALL);
+        int kind = ::state__sym_kinds[i];
+        ::draw__draw_glyph("symbol", (x + ::draw__px(14)), (y + ((::state__ROW_H - ::draw__px(16)) / 2)), ::draw__px(16), ::workspace__sym_color(kind));
+        int nw = ::draw__txt_v((x + ::draw__px(36)), y, ::state__ROW_H, ::draw__fit(::state__sym_names[i], (w - ::draw__px(110)), ::state__UI), ::state__C_TEXT, ::state__UI);
+        ::draw__txt_v((x + ::draw__px(44) + nw), y, ::state__ROW_H, ::workspace__sym_kind_name(kind), ::state__C_DIM, ::state__UI_SMALL);
+        std::string ln = (std::string("") + std::to_string((::state__sym_lines[i] + 1)));
+        ::draw__txt_v((x + w - ::draw__tw(ln, ::state__UI_SMALL) - ::draw__px(14)), y, ::state__ROW_H, ln, ::state__C_DIM, ::state__UI_SMALL);
         i = i + 1;
     }
 }
 
-static void outline_mouse(int x, int y) {
-    int top = (side_y + HEADER_H);
-    if (!(is_file_tab()) || y < top) {
+static void workspace__outline_mouse(int x, int y) {
+    int top = (::state__side_y + ::state__HEADER_H);
+    if (!(::buffer__is_file_tab()) || y < top) {
         return;
     }
-    collect_symbols();
-    int i = ((y - top + outline_scroll) / ROW_H);
-    if (i < 0 || i >= (int)((sym_names).size())) {
+    ::editor__collect_symbols();
+    int i = ((y - top + ::state__outline_scroll) / ::state__ROW_H);
+    if (i < 0 || i >= (int)((::state__sym_names).size())) {
         return;
     }
-    int ln = sym_lines[i];
-    int col = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(L[ln], sym_names[i]);
-    set_cursor(ln, imax(col, 0), false);
-    reveal(true);
-    focus = F_EDITOR;
+    int ln = ::state__sym_lines[i];
+    int col = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(::state__L[ln], ::state__sym_names[i]);
+    ::buffer__set_cursor(ln, ::draw__imax(col, 0), false);
+    ::editor__reveal(true);
+    ::state__focus = ::state__F_EDITOR;
 }
 
-static void cmd(std::string id, std::string label, std::string keys) {
-    cmd_ids.push_back(id);
-    cmd_labels.push_back(label);
-    cmd_keys.push_back(keys);
+static void commands__cmd(std::string id, std::string label, std::string keys) {
+    ::state__cmd_ids.push_back(id);
+    ::state__cmd_labels.push_back(label);
+    ::state__cmd_keys.push_back(keys);
 }
 
-static void cmd_init() {
-    cmd("file.new", "File: New File", "Ctrl+N");
-    cmd("file.open", "File: Open File...", "Ctrl+O");
-    cmd("file.openFolder", "File: Open Folder...", "Ctrl+K Ctrl+O");
-    cmd("file.save", "File: Save", "Ctrl+S");
-    cmd("file.saveAs", "File: Save As...", "Ctrl+Shift+S");
-    cmd("file.saveAll", "File: Save All", "Ctrl+K S");
-    cmd("file.close", "View: Close Editor", "Ctrl+W");
-    cmd("file.closeAll", "View: Close All Editors", "Ctrl+K W");
-    cmd("file.closeFolder", "File: Close Folder", "");
-    cmd("file.revert", "File: Revert File", "");
-    cmd("file.reveal", "File: Reveal Active File in File Explorer", "");
-    cmd("file.copyPath", "File: Copy Path of Active File", "");
-    cmd("app.settings", "Preferences: Open Settings", "Ctrl+,");
-    cmd("app.exit", "File: Exit", "Alt+F4");
-    cmd("edit.undo", "Edit: Undo", "Ctrl+Z");
-    cmd("edit.redo", "Edit: Redo", "Ctrl+Y");
-    cmd("edit.cut", "Edit: Cut", "Ctrl+X");
-    cmd("edit.copy", "Edit: Copy", "Ctrl+C");
-    cmd("edit.paste", "Edit: Paste", "Ctrl+V");
-    cmd("edit.find", "Edit: Find", "Ctrl+F");
-    cmd("edit.replace", "Edit: Replace", "Ctrl+H");
-    cmd("edit.findNext", "Edit: Find Next", "F3");
-    cmd("edit.findPrev", "Edit: Find Previous", "Shift+F3");
-    cmd("edit.findInFiles", "Search: Find in Files", "Ctrl+Shift+F");
-    cmd("edit.comment", "Edit: Toggle Line Comment", "Ctrl+/");
-    cmd("edit.trim", "Edit: Trim Trailing Whitespace", "");
-    cmd("edit.upper", "Edit: Transform to Uppercase", "");
-    cmd("edit.lower", "Edit: Transform to Lowercase", "");
-    cmd("sel.all", "Selection: Select All", "Ctrl+A");
-    cmd("sel.line", "Selection: Expand Line Selection", "Ctrl+L");
-    cmd("sel.copyUp", "Selection: Copy Line Up", "Shift+Alt+Up");
-    cmd("sel.copyDown", "Selection: Copy Line Down", "Shift+Alt+Down");
-    cmd("sel.moveUp", "Selection: Move Line Up", "Alt+Up");
-    cmd("sel.moveDown", "Selection: Move Line Down", "Alt+Down");
-    cmd("sel.duplicate", "Selection: Duplicate Line", "Ctrl+D");
-    cmd("sel.deleteLine", "Selection: Delete Line", "Ctrl+Shift+K");
-    cmd("sel.indent", "Selection: Indent Line", "Ctrl+]");
-    cmd("sel.outdent", "Selection: Outdent Line", "Ctrl+[");
-    cmd("view.palette", "View: Command Palette", "Ctrl+Shift+P");
-    cmd("view.quickOpen", "Go: Go to File...", "Ctrl+P");
-    cmd("view.explorer", "View: Show Explorer", "Ctrl+Shift+E");
-    cmd("view.search", "View: Show Search", "Ctrl+Shift+F");
-    cmd("view.sidebar", "View: Toggle Primary Side Bar", "Ctrl+B");
-    cmd("view.panel", "View: Toggle Panel", "Ctrl+J");
-    cmd("view.problems", "View: Show Problems", "Ctrl+Shift+M");
-    cmd("view.output", "View: Show Output", "Ctrl+Shift+U");
-    cmd("view.terminal", "View: Toggle Terminal", "Ctrl+`");
-    cmd("view.agent", "View: Toggle Agent", "Ctrl+Shift+L");
-    cmd("agent.new", "Agent: New Chat", "");
-    cmd("view.outline", "View: Show Outline", "");
-    cmd("view.minimap", "View: Toggle Minimap", "");
-    cmd("view.zoomIn", "View: Increase Font Size", "Ctrl+=");
-    cmd("view.zoomOut", "View: Decrease Font Size", "Ctrl+-");
-    cmd("view.zoomReset", "View: Reset Font Size", "Ctrl+0");
-    cmd("view.whitespace", "View: Toggle Render Whitespace", "");
-    cmd("go.line", "Go: Go to Line...", "Ctrl+G");
-    cmd("go.symbol", "Go: Go to Symbol in Editor...", "Ctrl+Shift+O");
-    cmd("go.definition", "Go: Go to Definition", "F12");
-    cmd("go.bracket", "Go: Go to Bracket", "Ctrl+Shift+\\");
-    cmd("go.nextTab", "View: Open Next Editor", "Ctrl+Tab");
-    cmd("go.prevTab", "View: Open Previous Editor", "Ctrl+Shift+Tab");
-    cmd("run.run", "Run: Build and Run", "F5");
-    cmd("run.build", "Run: Build", "Ctrl+Shift+B");
-    cmd("run.stop", "Run: Stop", "Shift+F5");
-    cmd("run.check", "Run: Check Active File", "");
-    cmd("term.new", "Terminal: Restart Terminal", "");
-    cmd("term.clear", "Terminal: Clear", "");
-    cmd("help.welcome", "Help: Welcome", "");
-    cmd("help.docs", "Help: Nexa Documentation", "");
-    cmd("help.repo", "Help: Nexium on GitHub", "");
-    cmd("help.about", "Help: About", "");
+static void commands__cmd_init() {
+    ::commands__cmd("file.new", "File: New File", "Ctrl+N");
+    ::commands__cmd("file.open", "File: Open File...", "Ctrl+O");
+    ::commands__cmd("file.openFolder", "File: Open Folder...", "Ctrl+K Ctrl+O");
+    ::commands__cmd("file.save", "File: Save", "Ctrl+S");
+    ::commands__cmd("file.saveAs", "File: Save As...", "Ctrl+Shift+S");
+    ::commands__cmd("file.saveAll", "File: Save All", "Ctrl+K S");
+    ::commands__cmd("file.close", "View: Close Editor", "Ctrl+W");
+    ::commands__cmd("file.closeAll", "View: Close All Editors", "Ctrl+K W");
+    ::commands__cmd("file.closeFolder", "File: Close Folder", "");
+    ::commands__cmd("file.revert", "File: Revert File", "");
+    ::commands__cmd("file.reveal", "File: Reveal Active File in File Explorer", "");
+    ::commands__cmd("file.copyPath", "File: Copy Path of Active File", "");
+    ::commands__cmd("app.settings", "Preferences: Open Settings", "Ctrl+,");
+    ::commands__cmd("app.exit", "File: Exit", "Alt+F4");
+    ::commands__cmd("edit.undo", "Edit: Undo", "Ctrl+Z");
+    ::commands__cmd("edit.redo", "Edit: Redo", "Ctrl+Y");
+    ::commands__cmd("edit.cut", "Edit: Cut", "Ctrl+X");
+    ::commands__cmd("edit.copy", "Edit: Copy", "Ctrl+C");
+    ::commands__cmd("edit.paste", "Edit: Paste", "Ctrl+V");
+    ::commands__cmd("edit.find", "Edit: Find", "Ctrl+F");
+    ::commands__cmd("edit.replace", "Edit: Replace", "Ctrl+H");
+    ::commands__cmd("edit.findNext", "Edit: Find Next", "F3");
+    ::commands__cmd("edit.findPrev", "Edit: Find Previous", "Shift+F3");
+    ::commands__cmd("edit.findInFiles", "Search: Find in Files", "Ctrl+Shift+F");
+    ::commands__cmd("edit.comment", "Edit: Toggle Line Comment", "Ctrl+/");
+    ::commands__cmd("edit.trim", "Edit: Trim Trailing Whitespace", "");
+    ::commands__cmd("edit.upper", "Edit: Transform to Uppercase", "");
+    ::commands__cmd("edit.lower", "Edit: Transform to Lowercase", "");
+    ::commands__cmd("sel.all", "Selection: Select All", "Ctrl+A");
+    ::commands__cmd("sel.line", "Selection: Expand Line Selection", "Ctrl+L");
+    ::commands__cmd("sel.copyUp", "Selection: Copy Line Up", "Shift+Alt+Up");
+    ::commands__cmd("sel.copyDown", "Selection: Copy Line Down", "Shift+Alt+Down");
+    ::commands__cmd("sel.moveUp", "Selection: Move Line Up", "Alt+Up");
+    ::commands__cmd("sel.moveDown", "Selection: Move Line Down", "Alt+Down");
+    ::commands__cmd("sel.duplicate", "Selection: Duplicate Line", "Ctrl+D");
+    ::commands__cmd("sel.deleteLine", "Selection: Delete Line", "Ctrl+Shift+K");
+    ::commands__cmd("sel.indent", "Selection: Indent Line", "Ctrl+]");
+    ::commands__cmd("sel.outdent", "Selection: Outdent Line", "Ctrl+[");
+    ::commands__cmd("view.palette", "View: Command Palette", "Ctrl+Shift+P");
+    ::commands__cmd("view.quickOpen", "Go: Go to File...", "Ctrl+P");
+    ::commands__cmd("view.explorer", "View: Show Explorer", "Ctrl+Shift+E");
+    ::commands__cmd("view.search", "View: Show Search", "Ctrl+Shift+F");
+    ::commands__cmd("view.sidebar", "View: Toggle Primary Side Bar", "Ctrl+B");
+    ::commands__cmd("view.panel", "View: Toggle Panel", "Ctrl+J");
+    ::commands__cmd("view.problems", "View: Show Problems", "Ctrl+Shift+M");
+    ::commands__cmd("view.output", "View: Show Output", "Ctrl+Shift+U");
+    ::commands__cmd("view.terminal", "View: Toggle Terminal", "Ctrl+`");
+    ::commands__cmd("view.agent", "View: Toggle Agent", "Ctrl+Shift+L");
+    ::commands__cmd("agent.new", "Agent: New Chat", "");
+    ::commands__cmd("view.outline", "View: Show Outline", "");
+    ::commands__cmd("view.minimap", "View: Toggle Minimap", "");
+    ::commands__cmd("view.zoomIn", "View: Increase Font Size", "Ctrl+=");
+    ::commands__cmd("view.zoomOut", "View: Decrease Font Size", "Ctrl+-");
+    ::commands__cmd("view.zoomReset", "View: Reset Font Size", "Ctrl+0");
+    ::commands__cmd("view.whitespace", "View: Toggle Render Whitespace", "");
+    ::commands__cmd("go.line", "Go: Go to Line...", "Ctrl+G");
+    ::commands__cmd("go.symbol", "Go: Go to Symbol in Editor...", "Ctrl+Shift+O");
+    ::commands__cmd("go.definition", "Go: Go to Definition", "F12");
+    ::commands__cmd("go.bracket", "Go: Go to Bracket", "Ctrl+Shift+\\");
+    ::commands__cmd("go.nextTab", "View: Open Next Editor", "Ctrl+Tab");
+    ::commands__cmd("go.prevTab", "View: Open Previous Editor", "Ctrl+Shift+Tab");
+    ::commands__cmd("run.run", "Run: Build and Run", "F5");
+    ::commands__cmd("run.build", "Run: Build", "Ctrl+Shift+B");
+    ::commands__cmd("run.stop", "Run: Stop", "Shift+F5");
+    ::commands__cmd("run.check", "Run: Check Active File", "");
+    ::commands__cmd("term.new", "Terminal: Restart Terminal", "");
+    ::commands__cmd("term.clear", "Terminal: Clear", "");
+    ::commands__cmd("help.welcome", "Help: Welcome", "");
+    ::commands__cmd("help.docs", "Help: Nexa Documentation", "");
+    ::commands__cmd("help.repo", "Help: Nexium on GitHub", "");
+    ::commands__cmd("help.about", "Help: About", "");
 }
 
-static int cmd_index(const std::string& id) {
-    return ([&](){ const auto& __nexa_v = cmd_ids; const auto& __nexa_x = id; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
+static int commands__cmd_index(const std::string& id) {
+    return ([&](){ const auto& __nexa_v = ::state__cmd_ids; const auto& __nexa_x = id; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
 }
 
-static std::string cmd_short_label(const std::string& id) {
-    int i = cmd_index(id);
+static std::string commands__cmd_short_label(const std::string& id) {
+    int i = ::commands__cmd_index(id);
     if (i < 0) {
         return id;
     }
-    std::string l = cmd_labels[i];
+    std::string l = ::state__cmd_labels[i];
     int c = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(l, ": ");
     if (c >= 0) {
         return ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(l, (c + 2), -1);
@@ -9058,359 +9366,508 @@ static std::string cmd_short_label(const std::string& id) {
     return l;
 }
 
-static std::string cmd_shortcut(const std::string& id) {
-    int i = cmd_index(id);
+static std::string commands__cmd_shortcut(const std::string& id) {
+    int i = ::commands__cmd_index(id);
     if (i < 0) {
         return "";
     }
-    return cmd_keys[i];
+    return ::state__cmd_keys[i];
 }
 
-static void run_cmd(std::string id) {
-    menu_open = -1;
-    ctx_open = false;
-    frame_dirty = true;
-    bool file_tab = is_file_tab();
-    if (id == "file.new") {
-        new_untitled();
-    }
-    else if (id == "file.open") {
-        open_file_dialog();
-    }
-    else if (id == "file.openFolder") {
-        open_folder_dialog();
-    }
-    else if (id == "file.save") {
-        save_doc();
-    }
-    else if (id == "file.saveAs") {
-        save_doc_as();
-    }
-    else if (id == "file.saveAll") {
-        save_all();
-    }
-    else if (id == "file.close") {
-        close_tab(active);
-    }
-    else if (id == "file.closeAll") {
-        close_all();
-    }
-    else if (id == "file.closeFolder") {
-        if (close_all()) {
-            folder = "";
-            refresh_tree();
-            save_settings();
-            update_title();
+static void commands__run_cmd(std::string id) {
+    ::state__menu_open = -1;
+    ::state__ctx_open = false;
+    ::state__frame_dirty = true;
+    bool file_tab = ::buffer__is_file_tab();
+    {
+        const std::string& __nexa_sws_1 = id;
+        int __nexa_swi_2 = -1;
+        if (__nexa_sws_1 == "file.new") __nexa_swi_2 = 1;
+        else if (__nexa_sws_1 == "file.open") __nexa_swi_2 = 2;
+        else if (__nexa_sws_1 == "file.openFolder") __nexa_swi_2 = 3;
+        else if (__nexa_sws_1 == "file.save") __nexa_swi_2 = 4;
+        else if (__nexa_sws_1 == "file.saveAs") __nexa_swi_2 = 5;
+        else if (__nexa_sws_1 == "file.saveAll") __nexa_swi_2 = 6;
+        else if (__nexa_sws_1 == "file.close") __nexa_swi_2 = 7;
+        else if (__nexa_sws_1 == "file.closeAll") __nexa_swi_2 = 8;
+        else if (__nexa_sws_1 == "file.closeFolder") __nexa_swi_2 = 9;
+        else if (__nexa_sws_1 == "file.revert") __nexa_swi_2 = 10;
+        else if (__nexa_sws_1 == "file.reveal") __nexa_swi_2 = 11;
+        else if (__nexa_sws_1 == "file.copyPath") __nexa_swi_2 = 12;
+        else if (__nexa_sws_1 == "app.settings") __nexa_swi_2 = 13;
+        else if (__nexa_sws_1 == "app.exit") __nexa_swi_2 = 14;
+        else if (__nexa_sws_1 == "edit.undo") __nexa_swi_2 = 15;
+        else if (__nexa_sws_1 == "edit.redo") __nexa_swi_2 = 16;
+        else if (__nexa_sws_1 == "edit.cut") __nexa_swi_2 = 17;
+        else if (__nexa_sws_1 == "edit.copy") __nexa_swi_2 = 18;
+        else if (__nexa_sws_1 == "edit.paste") __nexa_swi_2 = 19;
+        else if (__nexa_sws_1 == "edit.find") __nexa_swi_2 = 20;
+        else if (__nexa_sws_1 == "edit.replace") __nexa_swi_2 = 21;
+        else if (__nexa_sws_1 == "edit.findNext") __nexa_swi_2 = 22;
+        else if (__nexa_sws_1 == "edit.findPrev") __nexa_swi_2 = 23;
+        else if (__nexa_sws_1 == "edit.findInFiles") __nexa_swi_2 = 24;
+        else if (__nexa_sws_1 == "edit.comment") __nexa_swi_2 = 25;
+        else if (__nexa_sws_1 == "edit.trim") __nexa_swi_2 = 26;
+        else if (__nexa_sws_1 == "edit.upper") __nexa_swi_2 = 27;
+        else if (__nexa_sws_1 == "edit.lower") __nexa_swi_2 = 28;
+        else if (__nexa_sws_1 == "sel.all") __nexa_swi_2 = 29;
+        else if (__nexa_sws_1 == "sel.line") __nexa_swi_2 = 30;
+        else if (__nexa_sws_1 == "sel.copyUp") __nexa_swi_2 = 31;
+        else if (__nexa_sws_1 == "sel.copyDown") __nexa_swi_2 = 32;
+        else if (__nexa_sws_1 == "sel.moveUp") __nexa_swi_2 = 33;
+        else if (__nexa_sws_1 == "sel.moveDown") __nexa_swi_2 = 34;
+        else if (__nexa_sws_1 == "sel.duplicate") __nexa_swi_2 = 35;
+        else if (__nexa_sws_1 == "sel.deleteLine") __nexa_swi_2 = 36;
+        else if (__nexa_sws_1 == "sel.indent") __nexa_swi_2 = 37;
+        else if (__nexa_sws_1 == "sel.outdent") __nexa_swi_2 = 38;
+        else if (__nexa_sws_1 == "view.palette") __nexa_swi_2 = 39;
+        else if (__nexa_sws_1 == "view.quickOpen") __nexa_swi_2 = 40;
+        else if (__nexa_sws_1 == "view.explorer") __nexa_swi_2 = 41;
+        else if (__nexa_sws_1 == "view.search") __nexa_swi_2 = 42;
+        else if (__nexa_sws_1 == "view.sidebar") __nexa_swi_2 = 43;
+        else if (__nexa_sws_1 == "view.panel") __nexa_swi_2 = 44;
+        else if (__nexa_sws_1 == "view.problems") __nexa_swi_2 = 45;
+        else if (__nexa_sws_1 == "view.output") __nexa_swi_2 = 46;
+        else if (__nexa_sws_1 == "view.terminal") __nexa_swi_2 = 47;
+        else if (__nexa_sws_1 == "view.agent") __nexa_swi_2 = 48;
+        else if (__nexa_sws_1 == "agent.new") __nexa_swi_2 = 49;
+        else if (__nexa_sws_1 == "view.outline") __nexa_swi_2 = 50;
+        else if (__nexa_sws_1 == "view.minimap") __nexa_swi_2 = 51;
+        else if (__nexa_sws_1 == "view.zoomIn") __nexa_swi_2 = 52;
+        else if (__nexa_sws_1 == "view.zoomOut") __nexa_swi_2 = 53;
+        else if (__nexa_sws_1 == "view.zoomReset") __nexa_swi_2 = 54;
+        else if (__nexa_sws_1 == "view.whitespace") __nexa_swi_2 = 55;
+        else if (__nexa_sws_1 == "go.line") __nexa_swi_2 = 56;
+        else if (__nexa_sws_1 == "go.symbol") __nexa_swi_2 = 57;
+        else if (__nexa_sws_1 == "go.definition") __nexa_swi_2 = 58;
+        else if (__nexa_sws_1 == "go.bracket") __nexa_swi_2 = 59;
+        else if (__nexa_sws_1 == "go.nextTab") __nexa_swi_2 = 60;
+        else if (__nexa_sws_1 == "go.prevTab") __nexa_swi_2 = 61;
+        else if (__nexa_sws_1 == "run.run") __nexa_swi_2 = 62;
+        else if (__nexa_sws_1 == "run.build") __nexa_swi_2 = 63;
+        else if (__nexa_sws_1 == "run.stop") __nexa_swi_2 = 64;
+        else if (__nexa_sws_1 == "run.check") __nexa_swi_2 = 65;
+        else if (__nexa_sws_1 == "term.new") __nexa_swi_2 = 66;
+        else if (__nexa_sws_1 == "term.clear") __nexa_swi_2 = 67;
+        else if (__nexa_sws_1 == "help.welcome") __nexa_swi_2 = 68;
+        else if (__nexa_sws_1 == "help.docs") __nexa_swi_2 = 69;
+        else if (__nexa_sws_1 == "help.repo") __nexa_swi_2 = 70;
+        else if (__nexa_sws_1 == "help.about") __nexa_swi_2 = 71;
+        switch (__nexa_swi_2) {
+        case 1: {
+            ::buffer__new_untitled();
+            break;
+        }
+        case 2: {
+            ::workspace__open_file_dialog();
+            break;
+        }
+        case 3: {
+            ::workspace__open_folder_dialog();
+            break;
+        }
+        case 4: {
+            ::buffer__save_doc();
+            break;
+        }
+        case 5: {
+            ::buffer__save_doc_as();
+            break;
+        }
+        case 6: {
+            ::buffer__save_all();
+            break;
+        }
+        case 7: {
+            ::buffer__close_tab(::state__active);
+            break;
+        }
+        case 8: {
+            ::buffer__close_all();
+            break;
+        }
+        case 9: {
+            if (::buffer__close_all()) {
+                ::state__folder = "";
+                ::workspace__refresh_tree();
+                ::app__save_settings();
+                ::app__update_title();
+            }
+            break;
+        }
+        case 10: {
+            if (file_tab && (int)((::state__doc_path).size()) > 0) {
+                ::state__doc_saved = -1;
+                ::state__bufs[::state__active].mtime = 0;
+                ::state__doc_ver = 0;
+                ::state__doc_saved = 0;
+                ::buffer__doc_store();
+                ::state__bufs[::state__active].saved = ::state__bufs[::state__active].ver;
+                ::buffer__check_disk_changes();
+            }
+            break;
+        }
+        case 11: {
+            if ((int)((::state__doc_path).size()) > 0) {
+                nx_reveal(::state__doc_path.c_str());
+            }
+            break;
+        }
+        case 12: {
+            if ((int)((::state__doc_path).size()) > 0) {
+                nx_clip_set(::state__doc_path.c_str());
+            }
+            break;
+        }
+        case 13: {
+            ::buffer__open_special(1);
+            break;
+        }
+        case 14: {
+            ::state__quit_requested = true;
+            break;
+        }
+        case 15: {
+            if (file_tab) {
+                ::buffer__undo();
+            }
+            break;
+        }
+        case 16: {
+            if (file_tab) {
+                ::buffer__redo();
+            }
+            break;
+        }
+        case 17: {
+            if (file_tab) {
+                ::editor__copy_sel(true);
+            }
+            break;
+        }
+        case 18: {
+            if (file_tab) {
+                ::editor__copy_sel(false);
+            }
+            break;
+        }
+        case 19: {
+            if (file_tab) {
+                ::editor__paste();
+            }
+            break;
+        }
+        case 20: {
+            ::editor__open_find(false);
+            break;
+        }
+        case 21: {
+            ::editor__open_find(true);
+            break;
+        }
+        case 22: {
+            if (file_tab) {
+                ::state__find_open = true;
+                ::editor__find_next(1);
+            }
+            break;
+        }
+        case 23: {
+            if (file_tab) {
+                ::state__find_open = true;
+                ::editor__find_next(-1);
+            }
+            break;
+        }
+        case 24: {
+            ::commands__show_search();
+            break;
+        }
+        case 25: {
+            if (file_tab) {
+                ::editor__toggle_comment();
+            }
+            break;
+        }
+        case 26: {
+            if (file_tab) {
+                ::editor__trim_trailing();
+            }
+            break;
+        }
+        case 27: {
+            if (file_tab) {
+                ::editor__change_case(true);
+            }
+            break;
+        }
+        case 28: {
+            if (file_tab) {
+                ::editor__change_case(false);
+            }
+            break;
+        }
+        case 29: {
+            if (file_tab) {
+                ::state__ay = 0;
+                ::state__ax = 0;
+                ::state__cy = ((int)((::state__L).size()) - 1);
+                ::state__cx = (int)((::state__L[::state__cy]).size());
+            }
+            break;
+        }
+        case 30: {
+            if (file_tab) {
+                ::editor__select_line();
+            }
+            break;
+        }
+        case 31: {
+            if (file_tab) {
+                ::editor__copy_lines(-1);
+            }
+            break;
+        }
+        case 32: {
+            if (file_tab) {
+                ::editor__copy_lines(1);
+            }
+            break;
+        }
+        case 33: {
+            if (file_tab) {
+                ::editor__move_lines(-1);
+            }
+            break;
+        }
+        case 34: {
+            if (file_tab) {
+                ::editor__move_lines(1);
+            }
+            break;
+        }
+        case 35: {
+            if (file_tab) {
+                ::editor__copy_lines(1);
+            }
+            break;
+        }
+        case 36: {
+            if (file_tab) {
+                ::editor__delete_lines();
+            }
+            break;
+        }
+        case 37: {
+            if (file_tab) {
+                ::editor__indent_lines(false);
+            }
+            break;
+        }
+        case 38: {
+            if (file_tab) {
+                ::editor__indent_lines(true);
+            }
+            break;
+        }
+        case 39: {
+            ::workspace__open_quick(">");
+            break;
+        }
+        case 40: {
+            ::workspace__open_quick("");
+            break;
+        }
+        case 41: {
+            ::state__show_sidebar = true;
+            ::state__view = 0;
+            ::state__focus = ::state__F_TREE;
+            break;
+        }
+        case 42: {
+            ::commands__show_search();
+            break;
+        }
+        case 43: {
+            ::state__show_sidebar = (!::state__show_sidebar);
+            break;
+        }
+        case 44: {
+            ::state__show_panel = (!::state__show_panel);
+            break;
+        }
+        case 45: {
+            ::commands__show_panel_tab(0);
+            break;
+        }
+        case 46: {
+            ::commands__show_panel_tab(1);
+            break;
+        }
+        case 47: {
+            if (::state__show_panel && ::state__panel_tab == 2 && ::state__focus == ::state__F_TERM) {
+                ::state__show_panel = false;
+                ::state__focus = ::state__F_EDITOR;
+            } else {
+                ::commands__show_panel_tab(2);
+                ::state__focus = ::state__F_TERM;
+            }
+            break;
+        }
+        case 48: {
+            ::state__show_agent = (!::state__show_agent);
+            ::state__focus = ((::state__show_agent) ? (::state__F_AGENT) : (::state__F_EDITOR));
+            ::app__save_settings();
+            break;
+        }
+        case 49: {
+            ::state__show_agent = true;
+            ::agent__agent_new_chat();
+            ::state__focus = ::state__F_AGENT;
+            break;
+        }
+        case 50: {
+            ::state__show_sidebar = true;
+            ::state__view = 2;
+            break;
+        }
+        case 51: {
+            ::state__show_minimap = (!::state__show_minimap);
+            ::app__save_settings();
+            break;
+        }
+        case 52: {
+            ::commands__set_font_size((::state__font_size + 1));
+            break;
+        }
+        case 53: {
+            ::commands__set_font_size((::state__font_size - 1));
+            break;
+        }
+        case 54: {
+            ::commands__set_font_size(14);
+            break;
+        }
+        case 55: {
+            ::state__show_ws = (!::state__show_ws);
+            break;
+        }
+        case 56: {
+            ::workspace__open_quick(":");
+            break;
+        }
+        case 57: {
+            ::workspace__open_quick("@");
+            break;
+        }
+        case 58: {
+            if (file_tab) {
+                ::editor__goto_definition(::editor__word_at(::state__cy, ::state__cx));
+            }
+            break;
+        }
+        case 59: {
+            if (file_tab) {
+                ::editor__jump_bracket();
+            }
+            break;
+        }
+        case 60: {
+            if ((int)((::state__bufs).size()) > 0) {
+                ::buffer__switch_to(((::state__active + 1) % (int)((::state__bufs).size())));
+            }
+            break;
+        }
+        case 61: {
+            if ((int)((::state__bufs).size()) > 0) {
+                ::buffer__switch_to(((::state__active + (int)((::state__bufs).size()) - 1) % (int)((::state__bufs).size())));
+            }
+            break;
+        }
+        case 62: {
+            ::commands__run_task(true);
+            break;
+        }
+        case 63: {
+            ::commands__run_task(false);
+            break;
+        }
+        case 64: {
+            ::commands__stop_task();
+            break;
+        }
+        case 65: {
+            ::state__check_due = ::state__now_ms;
+            break;
+        }
+        case 66: {
+            if (::state__term_proc >= 0) {
+                nx_proc_free(::state__term_proc);
+                ::state__term_proc = -1;
+            }
+            ::state__term_lines.clear();
+            ::state__term_partial = "";
+            ::commands__show_panel_tab(2);
+            ::state__focus = ::state__F_TERM;
+            break;
+        }
+        case 67: {
+            ::state__term_lines.clear();
+            break;
+        }
+        case 68: {
+            ::buffer__open_special(2);
+            break;
+        }
+        case 69: {
+            __nexa_os_open(std::string("https://github.com/Bobism-2009/Nexa-Lang/tree/main/SYNTAX"));
+            break;
+        }
+        case 70: {
+            __nexa_os_open(std::string("https://github.com/Bobism-2009/Nexium"));
+            break;
+        }
+        case 71: {
+            nx_message((std::string("Nexium ") + ::state__VERSION + "\n\nA code editor for the Nexa language, written in Nexa and drawn with std/ui.\n\nCompiler: " + (((int)((::state__nexac_version).size()) > 0) ? (::state__nexac_version) : (std::string("not found")))).c_str());
+            break;
+        }
+        default: {
+            break;
+        }
         }
     }
-    else if (id == "file.revert") {
-        if (file_tab && (int)((doc_path).size()) > 0) {
-            doc_saved = -1;
-            bufs[active].mtime = 0;
-            doc_ver = 0;
-            doc_saved = 0;
-            doc_store();
-            bufs[active].saved = bufs[active].ver;
-            check_disk_changes();
-        }
-    }
-    else if (id == "file.reveal") {
-        if ((int)((doc_path).size()) > 0) {
-            nx_reveal(doc_path.c_str());
-        }
-    }
-    else if (id == "file.copyPath") {
-        if ((int)((doc_path).size()) > 0) {
-            nx_clip_set(doc_path.c_str());
-        }
-    }
-    else if (id == "app.settings") {
-        open_special(1);
-    }
-    else if (id == "app.exit") {
-        quit_requested = true;
-    }
-    else if (id == "edit.undo") {
-        if (file_tab) {
-            undo();
-        }
-    }
-    else if (id == "edit.redo") {
-        if (file_tab) {
-            redo();
-        }
-    }
-    else if (id == "edit.cut") {
-        if (file_tab) {
-            copy_sel(true);
-        }
-    }
-    else if (id == "edit.copy") {
-        if (file_tab) {
-            copy_sel(false);
-        }
-    }
-    else if (id == "edit.paste") {
-        if (file_tab) {
-            paste();
-        }
-    }
-    else if (id == "edit.find") {
-        open_find(false);
-    }
-    else if (id == "edit.replace") {
-        open_find(true);
-    }
-    else if (id == "edit.findNext") {
-        if (file_tab) {
-            find_open = true;
-            find_next(1);
-        }
-    }
-    else if (id == "edit.findPrev") {
-        if (file_tab) {
-            find_open = true;
-            find_next(-1);
-        }
-    }
-    else if (id == "edit.findInFiles") {
-        show_search();
-    }
-    else if (id == "edit.comment") {
-        if (file_tab) {
-            toggle_comment();
-        }
-    }
-    else if (id == "edit.trim") {
-        if (file_tab) {
-            trim_trailing();
-        }
-    }
-    else if (id == "edit.upper") {
-        if (file_tab) {
-            change_case(true);
-        }
-    }
-    else if (id == "edit.lower") {
-        if (file_tab) {
-            change_case(false);
-        }
-    }
-    else if (id == "sel.all") {
-        if (file_tab) {
-            ay = 0;
-            ax = 0;
-            cy = ((int)((L).size()) - 1);
-            cx = (int)((L[cy]).size());
-        }
-    }
-    else if (id == "sel.line") {
-        if (file_tab) {
-            select_line();
-        }
-    }
-    else if (id == "sel.copyUp") {
-        if (file_tab) {
-            copy_lines(-1);
-        }
-    }
-    else if (id == "sel.copyDown") {
-        if (file_tab) {
-            copy_lines(1);
-        }
-    }
-    else if (id == "sel.moveUp") {
-        if (file_tab) {
-            move_lines(-1);
-        }
-    }
-    else if (id == "sel.moveDown") {
-        if (file_tab) {
-            move_lines(1);
-        }
-    }
-    else if (id == "sel.duplicate") {
-        if (file_tab) {
-            copy_lines(1);
-        }
-    }
-    else if (id == "sel.deleteLine") {
-        if (file_tab) {
-            delete_lines();
-        }
-    }
-    else if (id == "sel.indent") {
-        if (file_tab) {
-            indent_lines(false);
-        }
-    }
-    else if (id == "sel.outdent") {
-        if (file_tab) {
-            indent_lines(true);
-        }
-    }
-    else if (id == "view.palette") {
-        open_quick(">");
-    }
-    else if (id == "view.quickOpen") {
-        open_quick("");
-    }
-    else if (id == "view.explorer") {
-        show_sidebar = true;
-        view = 0;
-        focus = F_TREE;
-    }
-    else if (id == "view.search") {
-        show_search();
-    }
-    else if (id == "view.sidebar") {
-        show_sidebar = (!show_sidebar);
-    }
-    else if (id == "view.panel") {
-        show_panel = (!show_panel);
-    }
-    else if (id == "view.problems") {
-        show_panel_tab(0);
-    }
-    else if (id == "view.output") {
-        show_panel_tab(1);
-    }
-    else if (id == "view.terminal") {
-        if (show_panel && panel_tab == 2 && focus == F_TERM) {
-            show_panel = false;
-            focus = F_EDITOR;
-        } else {
-            show_panel_tab(2);
-            focus = F_TERM;
-        }
-    }
-    else if (id == "view.agent") {
-        show_agent = (!show_agent);
-        focus = ((show_agent) ? (F_AGENT) : (F_EDITOR));
-        save_settings();
-    }
-    else if (id == "agent.new") {
-        show_agent = true;
-        agent_new_chat();
-        focus = F_AGENT;
-    }
-    else if (id == "view.outline") {
-        show_sidebar = true;
-        view = 2;
-    }
-    else if (id == "view.minimap") {
-        show_minimap = (!show_minimap);
-        save_settings();
-    }
-    else if (id == "view.zoomIn") {
-        set_font_size((font_size + 1));
-    }
-    else if (id == "view.zoomOut") {
-        set_font_size((font_size - 1));
-    }
-    else if (id == "view.zoomReset") {
-        set_font_size(14);
-    }
-    else if (id == "view.whitespace") {
-        show_ws = (!show_ws);
-    }
-    else if (id == "go.line") {
-        open_quick(":");
-    }
-    else if (id == "go.symbol") {
-        open_quick("@");
-    }
-    else if (id == "go.definition") {
-        if (file_tab) {
-            goto_definition(word_at(cy, cx));
-        }
-    }
-    else if (id == "go.bracket") {
-        if (file_tab) {
-            jump_bracket();
-        }
-    }
-    else if (id == "go.nextTab") {
-        if ((int)((bufs).size()) > 0) {
-            switch_to(((active + 1) % (int)((bufs).size())));
-        }
-    }
-    else if (id == "go.prevTab") {
-        if ((int)((bufs).size()) > 0) {
-            switch_to(((active + (int)((bufs).size()) - 1) % (int)((bufs).size())));
-        }
-    }
-    else if (id == "run.run") {
-        run_task(true);
-    }
-    else if (id == "run.build") {
-        run_task(false);
-    }
-    else if (id == "run.stop") {
-        stop_task();
-    }
-    else if (id == "run.check") {
-        check_due = now_ms;
-    }
-    else if (id == "term.new") {
-        if (term_proc >= 0) {
-            nx_proc_free(term_proc);
-            term_proc = -1;
-        }
-        term_lines.clear();
-        term_partial = "";
-        show_panel_tab(2);
-        focus = F_TERM;
-    }
-    else if (id == "term.clear") {
-        term_lines.clear();
-    }
-    else if (id == "help.welcome") {
-        open_special(2);
-    }
-    else if (id == "help.docs") {
-        __nexa_os_open(std::string("https://github.com/Bobism-2009/Nexa-Lang/tree/main/SYNTAX"));
-    }
-    else if (id == "help.repo") {
-        __nexa_os_open(std::string("https://github.com/Bobism-2009/Nexium"));
-    }
-    else if (id == "help.about") {
-        nx_message((std::string("Nexium ") + VERSION + "\n\nA code editor for the Nexa language, written in Nexa and drawn with std/ui.\n\nCompiler: " + (((int)((nexac_version).size()) > 0) ? (nexac_version) : (std::string("not found")))).c_str());
-    }
-    else {
-    }
-    if (active >= 0 && file_tab) {
-        clamp_cursor();
+    if (::state__active >= 0 && file_tab) {
+        ::buffer__clamp_cursor();
     }
 }
 
-static void show_search() {
-    show_sidebar = true;
-    view = 1;
-    focus = F_SEARCH;
-    std::string t = sel_text();
-    if (is_file_tab() && (int)((t).size()) > 0 && !(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(t, "\n"))) {
-        fld_set(FLD_SEARCH, t);
+static void commands__show_search() {
+    ::state__show_sidebar = true;
+    ::state__view = 1;
+    ::state__focus = ::state__F_SEARCH;
+    std::string t = ::buffer__sel_text();
+    if (::buffer__is_file_tab() && (int)((t).size()) > 0 && !(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(t, "\n"))) {
+        ::nxtext__fld_set(::state__FLD_SEARCH, t);
     }
-    fld_select_all(FLD_SEARCH);
+    ::nxtext__fld_select_all(::state__FLD_SEARCH);
 }
 
-static void show_panel_tab(int t) {
-    show_panel = true;
-    panel_tab = t;
+static void commands__show_panel_tab(int t) {
+    ::state__show_panel = true;
+    ::state__panel_tab = t;
     if (t == 2) {
-        ensure_terminal();
+        ::panel__ensure_terminal();
     }
 }
 
-static void set_font_size(int n) {
-    font_size = clamp(n, 8, 32);
-    metrics_init();
-    frame_dirty = true;
-    save_settings();
+static void commands__set_font_size(int n) {
+    ::state__font_size = ::draw__clamp(n, 8, 32);
+    ::draw__metrics_init();
+    ::state__frame_dirty = true;
+    ::app__save_settings();
 }
 
-static std::vector<std::string> menu_items(int m) {
+static std::vector<std::string> commands__menu_items(int m) {
     if (m == 0) {
         return std::vector<std::string>{"file.new", "file.open", "file.openFolder", "-", "file.save", "file.saveAs", "file.saveAll", "-", "file.revert", "file.close", "file.closeAll", "file.closeFolder", "-", "app.settings", "-", "app.exit"};
     }
@@ -9436,7 +9893,7 @@ static std::vector<std::string> menu_items(int m) {
         return std::vector<std::string>{"help.welcome", "view.palette", "-", "help.docs", "help.repo", "-", "help.about"};
     }
     if (m == 100) {
-        if (ctx_isdir) {
+        if (::state__ctx_isdir) {
             return std::vector<std::string>{"ctx.newFile", "ctx.newFolder", "-", "ctx.reveal", "ctx.copyPath", "ctx.copyRel", "-", "ctx.terminal", "-", "ctx.rename", "ctx.delete"};
         }
         return std::vector<std::string>{"ctx.open", "-", "ctx.reveal", "ctx.copyPath", "ctx.copyRel", "-", "ctx.rename", "ctx.delete"};
@@ -9450,55 +9907,76 @@ static std::vector<std::string> menu_items(int m) {
     return std::vector<std::string>{};
 }
 
-static std::string ctx_label(const std::string& id) {
-    if (id == "ctx.newFile") {
-        return "New File...";
+static std::string commands__ctx_label(const std::string& id) {
+    {
+        const std::string& __nexa_sws_1 = id;
+        int __nexa_swi_2 = -1;
+        if (__nexa_sws_1 == "ctx.newFile") __nexa_swi_2 = 1;
+        else if (__nexa_sws_1 == "ctx.newFolder") __nexa_swi_2 = 2;
+        else if (__nexa_sws_1 == "ctx.open") __nexa_swi_2 = 3;
+        else if (__nexa_sws_1 == "ctx.reveal") __nexa_swi_2 = 4;
+        else if (__nexa_sws_1 == "ctx.copyPath") __nexa_swi_2 = 5;
+        else if (__nexa_sws_1 == "ctx.copyRel") __nexa_swi_2 = 6;
+        else if (__nexa_sws_1 == "ctx.terminal") __nexa_swi_2 = 7;
+        else if (__nexa_sws_1 == "ctx.rename") __nexa_swi_2 = 8;
+        else if (__nexa_sws_1 == "ctx.delete") __nexa_swi_2 = 9;
+        else if (__nexa_sws_1 == "tab.close") __nexa_swi_2 = 10;
+        else if (__nexa_sws_1 == "tab.closeOthers") __nexa_swi_2 = 11;
+        else if (__nexa_sws_1 == "tab.closeAll") __nexa_swi_2 = 12;
+        else if (__nexa_sws_1 == "tab.copyPath") __nexa_swi_2 = 13;
+        else if (__nexa_sws_1 == "tab.reveal") __nexa_swi_2 = 14;
+        switch (__nexa_swi_2) {
+        case 1: {
+            return "New File...";
+        }
+        case 2: {
+            return "New Folder...";
+        }
+        case 3: {
+            return "Open";
+        }
+        case 4: {
+            return "Reveal in File Explorer";
+        }
+        case 5: {
+            return "Copy Path";
+        }
+        case 6: {
+            return "Copy Relative Path";
+        }
+        case 7: {
+            return "Open in Integrated Terminal";
+        }
+        case 8: {
+            return "Rename...";
+        }
+        case 9: {
+            return "Delete";
+        }
+        case 10: {
+            return "Close";
+        }
+        case 11: {
+            return "Close Others";
+        }
+        case 12: {
+            return "Close All";
+        }
+        case 13: {
+            return "Copy Path";
+        }
+        case 14: {
+            return "Reveal in File Explorer";
+        }
+        default: {
+            break;
+        }
+        }
     }
-    else if (id == "ctx.newFolder") {
-        return "New Folder...";
-    }
-    else if (id == "ctx.open") {
-        return "Open";
-    }
-    else if (id == "ctx.reveal") {
-        return "Reveal in File Explorer";
-    }
-    else if (id == "ctx.copyPath") {
-        return "Copy Path";
-    }
-    else if (id == "ctx.copyRel") {
-        return "Copy Relative Path";
-    }
-    else if (id == "ctx.terminal") {
-        return "Open in Integrated Terminal";
-    }
-    else if (id == "ctx.rename") {
-        return "Rename...";
-    }
-    else if (id == "ctx.delete") {
-        return "Delete";
-    }
-    else if (id == "tab.close") {
-        return "Close";
-    }
-    else if (id == "tab.closeOthers") {
-        return "Close Others";
-    }
-    else if (id == "tab.closeAll") {
-        return "Close All";
-    }
-    else if (id == "tab.copyPath") {
-        return "Copy Path";
-    }
-    else if (id == "tab.reveal") {
-        return "Reveal in File Explorer";
-    }
-    else {
-    }
-    return cmd_short_label(id);
+    return ::commands__cmd_short_label(id);
 }
 
-static std::string ctx_keys(const std::string& id) {
+static std::string commands__ctx_keys(const std::string& id) {
     if (id == "ctx.rename") {
         return "F2";
     }
@@ -9511,195 +9989,230 @@ static std::string ctx_keys(const std::string& id) {
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(id, "ctx.") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(id, "tab.")) {
         return "";
     }
-    return cmd_shortcut(id);
+    return ::commands__cmd_shortcut(id);
 }
 
-static void run_ctx(std::string id) {
-    menu_open = -1;
-    std::string p = ctx_path;
-    if (id == "ctx.newFile") {
-        start_new(p, 1);
-    }
-    else if (id == "ctx.newFolder") {
-        start_new(p, 2);
-    }
-    else if (id == "ctx.open") {
-        open_file(p, false);
-        focus = F_EDITOR;
-    }
-    else if (id == "ctx.reveal") {
-        nx_reveal(p.c_str());
-    }
-    else if (id == "ctx.copyPath") {
-        nx_clip_set(p.c_str());
-    }
-    else if (id == "ctx.copyRel") {
-        nx_clip_set(rel_path(p).c_str());
-    }
-    else if (id == "ctx.terminal") {
-        show_panel_tab(2);
-        nx_proc_write(term_proc, (std::string("cd /d \"") + p + "\"\r\n").c_str());
-        focus = F_TERM;
-    }
-    else if (id == "ctx.rename") {
-        start_rename(p);
-    }
-    else if (id == "ctx.delete") {
-        delete_path(p);
-    }
-    else if (id == "tab.close") {
-        close_tab(tab_ctx);
-    }
-    else if (id == "tab.closeOthers") {
-        close_others(tab_ctx);
-    }
-    else if (id == "tab.closeAll") {
-        close_all();
-    }
-    else if (id == "tab.copyPath") {
-        if (tab_ctx >= 0 && tab_ctx < (int)((bufs).size())) {
-            nx_clip_set(bufs[tab_ctx].path.c_str());
+static void commands__run_ctx(std::string id) {
+    ::state__menu_open = -1;
+    std::string p = ::state__ctx_path;
+    {
+        const std::string& __nexa_sws_1 = id;
+        int __nexa_swi_2 = -1;
+        if (__nexa_sws_1 == "ctx.newFile") __nexa_swi_2 = 1;
+        else if (__nexa_sws_1 == "ctx.newFolder") __nexa_swi_2 = 2;
+        else if (__nexa_sws_1 == "ctx.open") __nexa_swi_2 = 3;
+        else if (__nexa_sws_1 == "ctx.reveal") __nexa_swi_2 = 4;
+        else if (__nexa_sws_1 == "ctx.copyPath") __nexa_swi_2 = 5;
+        else if (__nexa_sws_1 == "ctx.copyRel") __nexa_swi_2 = 6;
+        else if (__nexa_sws_1 == "ctx.terminal") __nexa_swi_2 = 7;
+        else if (__nexa_sws_1 == "ctx.rename") __nexa_swi_2 = 8;
+        else if (__nexa_sws_1 == "ctx.delete") __nexa_swi_2 = 9;
+        else if (__nexa_sws_1 == "tab.close") __nexa_swi_2 = 10;
+        else if (__nexa_sws_1 == "tab.closeOthers") __nexa_swi_2 = 11;
+        else if (__nexa_sws_1 == "tab.closeAll") __nexa_swi_2 = 12;
+        else if (__nexa_sws_1 == "tab.copyPath") __nexa_swi_2 = 13;
+        else if (__nexa_sws_1 == "tab.reveal") __nexa_swi_2 = 14;
+        switch (__nexa_swi_2) {
+        case 1: {
+            ::workspace__start_new(p, 1);
+            break;
         }
-    }
-    else if (id == "tab.reveal") {
-        if (tab_ctx >= 0 && tab_ctx < (int)((bufs).size())) {
-            std::string bp = bufs[tab_ctx].path;
-            if ((int)((bp).size()) > 0) {
-                nx_reveal(bp.c_str());
+        case 2: {
+            ::workspace__start_new(p, 2);
+            break;
+        }
+        case 3: {
+            ::buffer__open_file(p, false);
+            ::state__focus = ::state__F_EDITOR;
+            break;
+        }
+        case 4: {
+            nx_reveal(p.c_str());
+            break;
+        }
+        case 5: {
+            nx_clip_set(p.c_str());
+            break;
+        }
+        case 6: {
+            nx_clip_set(::workspace__rel_path(p).c_str());
+            break;
+        }
+        case 7: {
+            ::commands__show_panel_tab(2);
+            nx_proc_write(::state__term_proc, (std::string("cd /d \"") + p + "\"\r\n").c_str());
+            ::state__focus = ::state__F_TERM;
+            break;
+        }
+        case 8: {
+            ::workspace__start_rename(p);
+            break;
+        }
+        case 9: {
+            ::workspace__delete_path(p);
+            break;
+        }
+        case 10: {
+            ::buffer__close_tab(::state__tab_ctx);
+            break;
+        }
+        case 11: {
+            ::buffer__close_others(::state__tab_ctx);
+            break;
+        }
+        case 12: {
+            ::buffer__close_all();
+            break;
+        }
+        case 13: {
+            if (::state__tab_ctx >= 0 && ::state__tab_ctx < (int)((::state__bufs).size())) {
+                nx_clip_set(::state__bufs[::state__tab_ctx].path.c_str());
             }
+            break;
+        }
+        case 14: {
+            if (::state__tab_ctx >= 0 && ::state__tab_ctx < (int)((::state__bufs).size())) {
+                std::string bp = ::state__bufs[::state__tab_ctx].path;
+                if ((int)((bp).size()) > 0) {
+                    nx_reveal(bp.c_str());
+                }
+            }
+            break;
+        }
+        default: {
+            break;
+        }
         }
     }
-    else {
-    }
 }
 
-static void open_ctx_menu(int x, int y) {
-    menu_open = 100;
-    menu_x = x;
-    menu_y = y;
-    menu_hover = -1;
+static void commands__open_ctx_menu(int x, int y) {
+    ::state__menu_open = 100;
+    ::state__menu_x = x;
+    ::state__menu_y = y;
+    ::state__menu_hover = -1;
 }
 
-static int menu_label_x(int m) {
-    std::vector<std::string> names = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(MENU_NAMES, " ");
-    int x = px(40);
+static int commands__menu_label_x(int m) {
+    std::vector<std::string> names = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(::state__MENU_NAMES, " ");
+    int x = ::draw__px(40);
     for (int i = 0; i < m; i++) {
-        x = x + (tw(names[i], UI) + px(16));
+        x = x + (::draw__tw(names[i], ::state__UI) + ::draw__px(16));
     }
     return x;
 }
 
-static int menu_width(const std::vector<std::string>& items) {
-    int w = px(220);
+static int commands__menu_width(const std::vector<std::string>& items) {
+    int w = ::draw__px(220);
     {
         const std::vector<std::string>& __nexa_forin_1 = items;
         for (const std::string& id : __nexa_forin_1) {
             if (id == "-") {
                 continue;
             }
-            int lw = (tw(ctx_label(id), UI) + tw(ctx_keys(id), UI) + px(80));
-            w = imax(w, lw);
+            int lw = (::draw__tw(::commands__ctx_label(id), ::state__UI) + ::draw__tw(::commands__ctx_keys(id), ::state__UI) + ::draw__px(80));
+            w = ::draw__imax(w, lw);
         }
     }
     return w;
 }
 
-static int menu_height(const std::vector<std::string>& items) {
-    int h = px(8);
+static int commands__menu_height(const std::vector<std::string>& items) {
+    int h = ::draw__px(8);
     {
         const std::vector<std::string>& __nexa_forin_1 = items;
         for (const std::string& id : __nexa_forin_1) {
-            h = h + ((id == "-") ? (px(9)) : (px(26)));
+            h = h + ((id == "-") ? (::draw__px(9)) : (::draw__px(26)));
         }
     }
     return h;
 }
 
-static int menu_origin_x() {
-    if (menu_open >= 100) {
-        return menu_x;
+static int commands__menu_origin_x() {
+    if (::state__menu_open >= 100) {
+        return ::state__menu_x;
     }
-    return (menu_label_x(menu_open) - px(4));
+    return (::commands__menu_label_x(::state__menu_open) - ::draw__px(4));
 }
 
-static int menu_origin_y() {
-    if (menu_open >= 100) {
-        return menu_y;
+static int commands__menu_origin_y() {
+    if (::state__menu_open >= 100) {
+        return ::state__menu_y;
     }
-    return (TOOLBAR_H - px(4));
+    return (::state__TOOLBAR_H - ::draw__px(4));
 }
 
-static void draw_menu() {
-    if (menu_open < 0) {
+static void commands__draw_menu() {
+    if (::state__menu_open < 0) {
         return;
     }
-    std::vector<std::string> items = menu_items(menu_open);
-    int w = menu_width(items);
-    int h = menu_height(items);
-    int x = menu_origin_x();
-    int y = menu_origin_y();
-    if ((x + w) > (win_w - px(4))) {
-        x = (win_w - w - px(4));
+    std::vector<std::string> items = ::commands__menu_items(::state__menu_open);
+    int w = ::commands__menu_width(items);
+    int h = ::commands__menu_height(items);
+    int x = ::commands__menu_origin_x();
+    int y = ::commands__menu_origin_y();
+    if ((x + w) > (::state__win_w - ::draw__px(4))) {
+        x = (::state__win_w - w - ::draw__px(4));
     }
-    if ((y + h) > (win_h - px(4))) {
-        y = imax(px(4), (win_h - h - px(4)));
+    if ((y + h) > (::state__win_h - ::draw__px(4))) {
+        y = ::draw__imax(::draw__px(4), (::state__win_h - h - ::draw__px(4)));
     }
-    menu_x_draw = x;
-    menu_y_draw = y;
+    ::state__menu_x_draw = x;
+    ::state__menu_y_draw = y;
     __nexa_ui_panel(x, y, w, h, std::string());
-    fill((x + 1), (y + 1), (w - 2), (h - 2), C_EDITOR);
-    rrect_line(x, y, w, h, px(5), 0x454545);
-    int ry = (y + px(4));
-    menu_hover = -1;
+    ::draw__fill((x + 1), (y + 1), (w - 2), (h - 2), ::state__C_EDITOR);
+    ::draw__rrect_line(x, y, w, h, ::draw__px(5), 0x454545);
+    int ry = (y + ::draw__px(4));
+    ::state__menu_hover = -1;
     for (int i = 0; i < (int)((items).size()); i++) {
-        std::string id = items[i];
+        std::string id = __nexa_text(items[i]);
         if (id == "-") {
-            hline((x + px(10)), (ry + px(4)), (w - px(20)), 0x454545);
-            ry = ry + px(9);
+            ::draw__hline((x + ::draw__px(10)), (ry + ::draw__px(4)), (w - ::draw__px(20)), 0x454545);
+            ry = ry + ::draw__px(9);
             continue;
         }
-        int rh = px(26);
-        if (hovered((x + px(4)), ry, (w - px(8)), rh)) {
-            rrect((x + px(4)), ry, (w - px(8)), rh, px(4), C_ACCENT);
-            menu_hover = i;
+        int rh = ::draw__px(26);
+        if (::draw__hovered((x + ::draw__px(4)), ry, (w - ::draw__px(8)), rh)) {
+            ::draw__rrect((x + ::draw__px(4)), ry, (w - ::draw__px(8)), rh, ::draw__px(4), ::state__C_ACCENT);
+            ::state__menu_hover = i;
         }
-        int tc = ((menu_hover == i) ? (C_BRIGHT) : (C_TEXT));
-        if (id == "ctx.delete" && menu_hover != i) {
-            tc = C_TEXT;
+        int tc = ((::state__menu_hover == i) ? (::state__C_BRIGHT) : (::state__C_TEXT));
+        if (id == "ctx.delete" && ::state__menu_hover != i) {
+            tc = ::state__C_TEXT;
         }
-        txt_v((x + px(24)), ry, rh, ctx_label(id), tc, UI);
-        std::string k = ctx_keys(id);
+        ::draw__txt_v((x + ::draw__px(24)), ry, rh, ::commands__ctx_label(id), tc, ::state__UI);
+        std::string k = ::commands__ctx_keys(id);
         if ((int)((k).size()) > 0) {
-            int kw = tw(k, UI);
-            txt_v((x + w - kw - px(20)), ry, rh, k, ((menu_hover == i) ? (C_BRIGHT) : (C_MUTED)), UI);
+            int kw = ::draw__tw(k, ::state__UI);
+            ::draw__txt_v((x + w - kw - ::draw__px(20)), ry, rh, k, ((::state__menu_hover == i) ? (::state__C_BRIGHT) : (::state__C_MUTED)), ::state__UI);
         }
         ry = ry + rh;
     }
 }
 
-static bool menu_mouse(int x, int y) {
-    std::vector<std::string> items = menu_items(menu_open);
-    int w = menu_width(items);
-    int h = menu_height(items);
-    if (!(inside(x, y, menu_x_draw, menu_y_draw, w, h))) {
-        int was = menu_open;
-        menu_open = -1;
-        if (was < 100 && y < TOOLBAR_H) {
+static bool commands__menu_mouse(int x, int y) {
+    std::vector<std::string> items = ::commands__menu_items(::state__menu_open);
+    int w = ::commands__menu_width(items);
+    int h = ::commands__menu_height(items);
+    if (!(::draw__inside(x, y, ::state__menu_x_draw, ::state__menu_y_draw, w, h))) {
+        int was = ::state__menu_open;
+        ::state__menu_open = -1;
+        if (was < 100 && y < ::state__TOOLBAR_H) {
             return false;
         }
         return true;
     }
-    int ry = (menu_y_draw + px(4));
+    int ry = (::state__menu_y_draw + ::draw__px(4));
     for (int i = 0; i < (int)((items).size()); i++) {
-        std::string id = items[i];
-        int rh = ((id == "-") ? (px(9)) : (px(26)));
+        std::string id = __nexa_text(items[i]);
+        int rh = ((id == "-") ? (::draw__px(9)) : (::draw__px(26)));
         if (y >= ry && y < (ry + rh) && id != "-") {
-            int m = menu_open;
-            menu_open = -1;
+            int m = ::state__menu_open;
+            ::state__menu_open = -1;
             if (m >= 100) {
-                run_ctx(id);
+                ::commands__run_ctx(id);
             } else {
-                run_cmd(id);
+                ::commands__run_cmd(id);
             }
             return true;
         }
@@ -9708,21 +10221,21 @@ static bool menu_mouse(int x, int y) {
     return true;
 }
 
-static std::string find_compiler() {
+static std::string commands__find_compiler() {
     std::vector<std::string> names;
-    if ((int)((nexac).size()) > 0) {
-        names.push_back(nexac);
+    if ((int)((::state__nexac).size()) > 0) {
+        names.push_back(::state__nexac);
     }
     names.push_back("NexaC");
     names.push_back("Nexa");
     names.push_back("nexac");
     {
         const std::vector<std::string>& __nexa_forin_0 = names;
-        for (const std::string& n : __nexa_forin_0) {
+        for (std::string n : __nexa_forin_0) {
             if (__nexa_file_isfile((n).c_str())) {
                 return n;
             }
-            std::string p = nx_which(n.c_str());
+            std::string p = __nexa_text(nx_which(n.c_str()));
             if ((int)((p).size()) > 0) {
                 return p;
             }
@@ -9731,53 +10244,53 @@ static std::string find_compiler() {
     return "";
 }
 
-static void detect_compiler_version() {
-    std::string c = find_compiler();
-    nexac_version = "";
+static void commands__detect_compiler_version() {
+    std::string c = ::commands__find_compiler();
+    ::state__nexac_version = "";
     if ((int)((c).size()) == 0) {
         return;
     }
     std::string out = __nexa_os_exec((std::string("\"") + c + "\" --version 2>nul"));
-    nexac_version = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(out);
+    ::state__nexac_version = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(out);
 }
 
-static std::string project_dir() {
-    if ((int)((folder).size()) > 0) {
-        if (__nexa_file_isfile((path_join(folder, "nexapkg.json")).c_str())) {
-            return folder;
+static std::string commands__project_dir() {
+    if ((int)((::state__folder).size()) > 0) {
+        if (__nexa_file_isfile((::workspace__path_join(::state__folder, "nexapkg.json")).c_str())) {
+            return ::state__folder;
         }
-        std::string src = path_join(folder, "src");
-        if (__nexa_file_isfile((path_join(src, "nexapkg.json")).c_str())) {
+        std::string src = ::workspace__path_join(::state__folder, "src");
+        if (__nexa_file_isfile((::workspace__path_join(src, "nexapkg.json")).c_str())) {
             return src;
         }
     }
-    if (is_file_tab() && (int)((doc_path).size()) > 0 && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(doc_path), ".nxa")) {
-        return __nexa_file_dirname((doc_path).c_str());
+    if (::buffer__is_file_tab() && (int)((::state__doc_path).size()) > 0 && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(::state__doc_path), ".nxa")) {
+        return __nexa_file_dirname((::state__doc_path).c_str());
     }
-    return folder;
+    return ::state__folder;
 }
 
-static std::string entry_file(std::string dir) {
-    if (is_file_tab() && (int)((doc_path).size()) > 0 && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(doc_path), ".nxa")) {
+static std::string commands__entry_file(std::string dir) {
+    if (::buffer__is_file_tab() && (int)((::state__doc_path).size()) > 0 && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(::state__doc_path), ".nxa")) {
         {
-            const std::vector<std::string>& __nexa_forin_1 = L;
+            const std::vector<std::string>& __nexa_forin_1 = ::state__L;
             for (const std::string& s : __nexa_forin_1) {
                 if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(s), "fn main(")) {
-                    return doc_path;
+                    return ::state__doc_path;
                 }
             }
         }
     }
-    std::string main_nxa = path_join(dir, "main.nxa");
+    std::string main_nxa = ::workspace__path_join(dir, "main.nxa");
     if (__nexa_file_isfile((main_nxa).c_str())) {
         return main_nxa;
     }
     {
-        const std::vector<std::string>& __nexa_forin_2 = list_dir(dir);
+        const std::vector<std::string>& __nexa_forin_2 = ::workspace__list_dir(dir);
         for (const std::string& e : __nexa_forin_2) {
             std::string nm = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(e, 2, -1);
             if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(e, "f|") && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(nm), ".nxa")) {
-                std::string p = path_join(dir, nm);
+                std::string p = ::workspace__path_join(dir, nm);
                 std::string t = __nexa_file_read((p).c_str());
                 if (([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(t, "fn main(")) {
                     return p;
@@ -9785,34 +10298,34 @@ static std::string entry_file(std::string dir) {
             }
         }
     }
-    if (is_file_tab() && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(doc_path), ".nxa")) {
-        return doc_path;
+    if (::buffer__is_file_tab() && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(::state__doc_path), ".nxa")) {
+        return ::state__doc_path;
     }
     return "";
 }
 
-static void run_task(bool execute) {
-    save_all();
-    std::string c = find_compiler();
-    show_panel_tab(1);
+static void commands__run_task(bool execute) {
+    ::buffer__save_all();
+    std::string c = ::commands__find_compiler();
+    ::commands__show_panel_tab(1);
     if ((int)((c).size()) == 0) {
-        out_lines.clear();
-        log_out("The Nexa compiler was not found. Install NexaC (https://github.com/Bobism-2009/Nexa-Lang/releases) or set its path in Settings.");
+        ::state__out_lines.clear();
+        ::panel__log_out("The Nexa compiler was not found. Install NexaC (https://github.com/Bobism-2009/Nexa-Lang/releases) or set its path in Settings.");
         return;
     }
-    std::string dir = project_dir();
+    std::string dir = ::commands__project_dir();
     if ((int)((dir).size()) == 0) {
-        log_out("Open a folder or a .nxa file first.");
+        ::panel__log_out("Open a folder or a .nxa file first.");
         return;
     }
-    stop_task();
+    ::commands__stop_task();
     std::string cmdline = "";
     std::string label = "";
-    if (__nexa_file_isfile((path_join(dir, "nexapkg.json")).c_str())) {
+    if (__nexa_file_isfile((::workspace__path_join(dir, "nexapkg.json")).c_str())) {
         cmdline = (std::string("\"") + c + "\" build");
         label = "build";
         if (execute) {
-            __nexa_json m = __nexa_json_parse(__nexa_file_read((path_join(dir, "nexapkg.json")).c_str()));
+            __nexa_json m = __nexa_json_parse(__nexa_file_read((::workspace__path_join(dir, "nexapkg.json")).c_str()));
             std::string exe = "";
             if (m.ok() && m.has("output")) {
                 exe = m.get("output").as_string();
@@ -9826,81 +10339,81 @@ static void run_task(bool execute) {
                     exe += ".exe";
                 }
                 cmdline += (std::string(" && \"") + exe + "\"");
-                if ((int)((([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(run_args)).size()) > 0) {
-                    cmdline += (std::string(" ") + run_args);
+                if ((int)((([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(::state__run_args)).size()) > 0) {
+                    cmdline += (std::string(" ") + ::state__run_args);
                 }
             }
         }
     } else {
-        std::string entry = entry_file(dir);
+        std::string entry = ::commands__entry_file(dir);
         if ((int)((entry).size()) == 0) {
-            log_out((std::string("No .nxa file with fn main() in ") + dir + "."));
+            ::panel__log_out((std::string("No .nxa file with fn main() in ") + dir + "."));
             return;
         }
         std::string exe = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(entry, 0, ((int)((entry).size()) - 4)) + ".exe");
         cmdline = (std::string("\"") + c + "\" \"" + entry + "\" -o \"" + exe + "\"");
         if (execute) {
             cmdline += (std::string(" && \"") + exe + "\"");
-            if ((int)((([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(run_args)).size()) > 0) {
-                cmdline += (std::string(" ") + run_args);
+            if ((int)((([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(::state__run_args)).size()) > 0) {
+                cmdline += (std::string(" ") + ::state__run_args);
             }
         }
     }
     label = ((execute) ? (std::string("Run")) : (std::string("Build")));
-    out_lines.clear();
-    out_partial = "";
-    clear_problems_from("build");
-    log_out((std::string("> ") + cmdline));
-    log_out("");
-    task_proc = nx_proc_start(cmdline.c_str(), dir.c_str());
-    task_label = label;
-    task_start_ms = now_ms;
-    task_exit = -2;
-    out_follow = true;
-    if (task_proc < 0) {
-        log_out("Could not start the build.");
+    ::state__out_lines.clear();
+    ::state__out_partial = "";
+    ::panel__clear_problems_from("build");
+    ::panel__log_out((std::string("> ") + cmdline));
+    ::panel__log_out("");
+    ::state__task_proc = nx_proc_start(cmdline.c_str(), dir.c_str());
+    ::state__task_label = label;
+    ::state__task_start_ms = ::state__now_ms;
+    ::state__task_exit = -2;
+    ::state__out_follow = true;
+    if (::state__task_proc < 0) {
+        ::panel__log_out("Could not start the build.");
     }
 }
 
-static void stop_task() {
-    if (task_proc >= 0) {
-        if (nx_proc_running(task_proc) == 1) {
-            nx_proc_kill(task_proc);
-            log_out("");
-            log_out("[stopped]");
+static void commands__stop_task() {
+    if (::state__task_proc >= 0) {
+        if (nx_proc_running(::state__task_proc) == 1) {
+            nx_proc_kill(::state__task_proc);
+            ::panel__log_out("");
+            ::panel__log_out("[stopped]");
         }
-        nx_proc_free(task_proc);
-        task_proc = -1;
+        nx_proc_free(::state__task_proc);
+        ::state__task_proc = -1;
     }
 }
 
-static bool task_running() {
-    return (task_proc >= 0 && task_exit == -2);
+static bool commands__task_running() {
+    return (::state__task_proc >= 0 && ::state__task_exit == -2);
 }
 
-static void log_out(std::string s) {
+static void panel__log_out(std::string s) {
     {
-        const std::vector<std::string>& __nexa_forin_1 = split_lines(s);
+        const std::vector<std::string>& __nexa_forin_1 = ::nxtext__split_lines(s);
         for (const std::string& l : __nexa_forin_1) {
-            out_lines.push_back(l);
+            ::state__out_lines.push_back(l);
         }
     }
-    while ((int)((out_lines).size()) > 20000) {
-        ([&](){ auto& __nexa_v = out_lines; int __nexa_i = 0; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+    while ((int)((::state__out_lines).size()) > 20000) {
+        ([&](){ auto& __nexa_v = ::state__out_lines; int __nexa_i = 0; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
     }
-    out_follow = true;
-    frame_dirty = true;
+    ::state__out_follow = true;
+    ::state__frame_dirty = true;
 }
 
-static void flash(std::string s) {
-    flash_msg = s;
-    flash_until = (now_ms + 3500);
-    frame_dirty = true;
+static void panel__flash(std::string s) {
+    ::state__flash_msg = s;
+    ::state__flash_until = (::state__now_ms + 3500);
+    ::state__frame_dirty = true;
 }
 
-static void feed_lines(int which, std::string chunk) {
-    std::string partial = ((which == 1) ? (out_partial) : (term_partial));
-    std::string t = (partial + ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(strip_ansi(chunk), "\r\n", "\n"));
+static void panel__feed_lines(int which, std::string chunk) {
+    std::string partial = ((which == 1) ? (::state__out_partial) : (::state__term_partial));
+    std::string t = (partial + ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(::nxtext__strip_ansi(chunk), "\r\n", "\n"));
     std::vector<std::string> parts = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(t, "\n");
     int k = 0;
     while (k < ((int)((parts).size()) - 1)) {
@@ -9910,122 +10423,122 @@ static void feed_lines(int which, std::string chunk) {
             p = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(p, (cr + 1), -1);
         }
         if (which == 1) {
-            out_lines.push_back(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(p, "\t", "    "));
+            ::state__out_lines.push_back(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(p, "\t", "    "));
         } else {
-            term_lines.push_back(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(p, "\t", "    "));
+            ::state__term_lines.push_back(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(p, "\t", "    "));
         }
         k = k + 1;
     }
     if (which == 1) {
-        out_partial = parts[((int)((parts).size()) - 1)];
-        while ((int)((out_lines).size()) > 20000) {
-            ([&](){ auto& __nexa_v = out_lines; int __nexa_i = 0; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+        ::state__out_partial = parts[((int)((parts).size()) - 1)];
+        while ((int)((::state__out_lines).size()) > 20000) {
+            ([&](){ auto& __nexa_v = ::state__out_lines; int __nexa_i = 0; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
         }
     } else {
-        term_partial = parts[((int)((parts).size()) - 1)];
-        while ((int)((term_lines).size()) > 20000) {
-            ([&](){ auto& __nexa_v = term_lines; int __nexa_i = 0; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+        ::state__term_partial = parts[((int)((parts).size()) - 1)];
+        while ((int)((::state__term_lines).size()) > 20000) {
+            ([&](){ auto& __nexa_v = ::state__term_lines; int __nexa_i = 0; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
         }
     }
 }
 
-static void poll_processes() {
-    if (task_proc >= 0) {
-        std::string chunk = nx_proc_read(task_proc);
+static void panel__poll_processes() {
+    if (::state__task_proc >= 0) {
+        std::string chunk = __nexa_text(nx_proc_read(::state__task_proc));
         if ((int)((chunk).size()) > 0) {
-            feed_lines(1, chunk);
-            frame_dirty = true;
+            ::panel__feed_lines(1, chunk);
+            ::state__frame_dirty = true;
         }
-        if (task_exit == -2 && nx_proc_running(task_proc) == 0) {
-            task_exit = nx_proc_exit_code(task_proc);
-            if ((int)((out_partial).size()) > 0) {
-                out_lines.push_back(out_partial);
-                out_partial = "";
+        if (::state__task_exit == -2 && nx_proc_running(::state__task_proc) == 0) {
+            ::state__task_exit = nx_proc_exit_code(::state__task_proc);
+            if ((int)((::state__out_partial).size()) > 0) {
+                ::state__out_lines.push_back(::state__out_partial);
+                ::state__out_partial = "";
             }
-            int secs = ((now_ms - task_start_ms) / 100);
-            log_out("");
-            if (task_exit == 0) {
-                log_out((std::string("[") + task_label + " finished in " + std::to_string((secs / 10)) + "." + std::to_string((secs % 10)) + "s]"));
+            int secs = ((::state__now_ms - ::state__task_start_ms) / 100);
+            ::panel__log_out("");
+            if (::state__task_exit == 0) {
+                ::panel__log_out((std::string("[") + ::state__task_label + " finished in " + std::to_string((secs / 10)) + "." + std::to_string((secs % 10)) + "s]"));
             } else {
-                log_out((std::string("[") + task_label + " failed with exit code " + std::to_string(task_exit) + "]"));
+                ::panel__log_out((std::string("[") + ::state__task_label + " failed with exit code " + std::to_string(::state__task_exit) + "]"));
             }
-            parse_problems(([&](){ const auto& __nexa_v = out_lines; std::string __nexa_s = "\n"; std::string __nexa_o; for (size_t __nexa_i = 0; __nexa_i < __nexa_v.size(); __nexa_i++) { if (__nexa_i) __nexa_o += __nexa_s; __nexa_o += __nexa_v[__nexa_i]; } return __nexa_o; })(), "build");
-            nx_proc_free(task_proc);
-            task_proc = -1;
+            ::panel__parse_problems(([&](){ const auto& __nexa_v = ::state__out_lines; std::string __nexa_s = "\n"; std::string __nexa_o; for (size_t __nexa_i = 0; __nexa_i < __nexa_v.size(); __nexa_i++) { if (__nexa_i) __nexa_o += __nexa_s; __nexa_o += __nexa_v[__nexa_i]; } return __nexa_o; })(), "build");
+            nx_proc_free(::state__task_proc);
+            ::state__task_proc = -1;
         }
     }
-    if (term_proc >= 0) {
-        std::string chunk = nx_proc_read(term_proc);
+    if (::state__term_proc >= 0) {
+        std::string chunk = __nexa_text(nx_proc_read(::state__term_proc));
         if ((int)((chunk).size()) > 0) {
-            feed_lines(2, chunk);
-            term_follow = true;
-            frame_dirty = true;
+            ::panel__feed_lines(2, chunk);
+            ::state__term_follow = true;
+            ::state__frame_dirty = true;
         }
-        if (nx_proc_running(term_proc) == 0) {
-            term_lines.push_back(term_partial);
-            term_lines.push_back("[terminal exited: press Enter to start a new one]");
-            term_partial = "";
-            nx_proc_free(term_proc);
-            term_proc = -1;
+        if (nx_proc_running(::state__term_proc) == 0) {
+            ::state__term_lines.push_back(::state__term_partial);
+            ::state__term_lines.push_back("[terminal exited: press Enter to start a new one]");
+            ::state__term_partial = "";
+            nx_proc_free(::state__term_proc);
+            ::state__term_proc = -1;
         }
     }
-    if (check_proc >= 0) {
-        std::string more = nx_proc_read(check_proc);
-        check_out += more;
-        if (nx_proc_running(check_proc) == 0) {
-            nx_proc_free(check_proc);
-            check_proc = -1;
-            clear_problems_from("check");
-            parse_problems(check_out, "check");
-            frame_dirty = true;
+    if (::state__check_proc >= 0) {
+        std::string more = __nexa_text(nx_proc_read(::state__check_proc));
+        ::state__check_out += more;
+        if (nx_proc_running(::state__check_proc) == 0) {
+            nx_proc_free(::state__check_proc);
+            ::state__check_proc = -1;
+            ::panel__clear_problems_from("check");
+            ::panel__parse_problems(::state__check_out, "check");
+            ::state__frame_dirty = true;
         }
     }
 }
 
-static void clear_problems_for(std::string p) {
-    int i = ((int)((prob_file).size()) - 1);
+static void panel__clear_problems_for(std::string p) {
+    int i = ((int)((::state__prob_file).size()) - 1);
     while (i >= 0) {
-        if (same_path(prob_file[i], p)) {
-            ([&](){ auto& __nexa_v = prob_file; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
-            ([&](){ auto& __nexa_v = prob_line; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
-            ([&](){ auto& __nexa_v = prob_msg; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
-            ([&](){ auto& __nexa_v = prob_err; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
-            ([&](){ auto& __nexa_v = prob_src; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+        if (::buffer__same_path(::state__prob_file[i], p)) {
+            ([&](){ auto& __nexa_v = ::state__prob_file; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+            ([&](){ auto& __nexa_v = ::state__prob_line; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+            ([&](){ auto& __nexa_v = ::state__prob_msg; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+            ([&](){ auto& __nexa_v = ::state__prob_err; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+            ([&](){ auto& __nexa_v = ::state__prob_src; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
         }
         i = i - 1;
     }
 }
 
-static void clear_problems_from(std::string src) {
-    int i = ((int)((prob_file).size()) - 1);
+static void panel__clear_problems_from(std::string src) {
+    int i = ((int)((::state__prob_file).size()) - 1);
     while (i >= 0) {
-        if (prob_src[i] == src) {
-            ([&](){ auto& __nexa_v = prob_file; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
-            ([&](){ auto& __nexa_v = prob_line; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
-            ([&](){ auto& __nexa_v = prob_msg; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
-            ([&](){ auto& __nexa_v = prob_err; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
-            ([&](){ auto& __nexa_v = prob_src; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+        if (::state__prob_src[i] == src) {
+            ([&](){ auto& __nexa_v = ::state__prob_file; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+            ([&](){ auto& __nexa_v = ::state__prob_line; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+            ([&](){ auto& __nexa_v = ::state__prob_msg; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+            ([&](){ auto& __nexa_v = ::state__prob_err; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+            ([&](){ auto& __nexa_v = ::state__prob_src; int __nexa_i = i; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
         }
         i = i - 1;
     }
 }
 
-static void add_problem(std::string f, int ln, std::string msg, bool err, std::string src) {
-    for (int i = 0; i < (int)((prob_file).size()); i++) {
-        if (same_path(prob_file[i], f) && prob_line[i] == ln && prob_msg[i] == msg) {
+static void panel__add_problem(std::string f, int ln, std::string msg, bool err, std::string src) {
+    for (int i = 0; i < (int)((::state__prob_file).size()); i++) {
+        if (::buffer__same_path(::state__prob_file[i], f) && ::state__prob_line[i] == ln && ::state__prob_msg[i] == msg) {
             return;
         }
     }
-    prob_file.push_back(f);
-    prob_line.push_back(ln);
-    prob_msg.push_back(msg);
-    prob_err.push_back(err);
-    prob_src.push_back(src);
+    ::state__prob_file.push_back(f);
+    ::state__prob_line.push_back(ln);
+    ::state__prob_msg.push_back(msg);
+    ::state__prob_err.push_back(err);
+    ::state__prob_src.push_back(src);
 }
 
-static void parse_problems(std::string text, std::string src) {
+static void panel__parse_problems(std::string text, std::string src) {
     {
-        const std::vector<std::string>& __nexa_forin_2 = split_lines(text);
+        const std::vector<std::string>& __nexa_forin_2 = ::nxtext__split_lines(text);
         for (const std::string& raw : __nexa_forin_2) {
             std::string l = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(raw);
             int at = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(l, "[Nexa] Error: ");
@@ -10062,7 +10575,7 @@ static void parse_problems(std::string text, std::string src) {
                     if (ln < 1) {
                         ln = 1;
                     }
-                    add_problem(f, ln, msg, (!warn), src);
+                    ::panel__add_problem(f, ln, msg, (!warn), src);
                 }
                 continue;
             }
@@ -10080,7 +10593,7 @@ static void parse_problems(std::string text, std::string src) {
                     int ln = ([](const std::string& __s){ char* __e=nullptr; long __v=std::strtol(__s.c_str(),&__e,10); return (__e==__s.c_str())?0:static_cast<int>(__v); })(std::string(parts[((int)((parts).size()) - 2)]));
                     std::string f = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(loc, 0, ((int)((loc).size()) - (int)((parts[((int)((parts).size()) - 1)]).size()) - (int)((parts[((int)((parts).size()) - 2)]).size()) - 2));
                     if (ln > 0 && (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(f), ".nxa") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(f), ".hpp") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(f), ".h") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(f), ".cpp"))) {
-                        add_problem(f, ln, msg, (!isw), src);
+                        ::panel__add_problem(f, ln, msg, (!isw), src);
                     }
                 }
             }
@@ -10088,23 +10601,23 @@ static void parse_problems(std::string text, std::string src) {
     }
 }
 
-static void maybe_check() {
-    if (check_due == 0 || now_ms < check_due || check_proc >= 0) {
+static void panel__maybe_check() {
+    if (::state__check_due == 0 || ::state__now_ms < ::state__check_due || ::state__check_proc >= 0) {
         return;
     }
-    check_due = 0;
-    if (!(is_file_tab()) || doc_lang != L_NEXA || (int)((doc_path).size()) == 0 || doc_ver != doc_saved) {
+    ::state__check_due = 0;
+    if (!(::buffer__is_file_tab()) || ::state__doc_lang != ::state__L_NEXA || (int)((::state__doc_path).size()) == 0 || ::state__doc_ver != ::state__doc_saved) {
         return;
     }
-    std::string c = find_compiler();
+    std::string c = ::commands__find_compiler();
     if ((int)((c).size()) == 0) {
         return;
     }
-    std::string out = path_join(__nexa_os_tempdir(), "nexium-check.cpp");
-    std::string target = doc_path;
+    std::string out = ::workspace__path_join(__nexa_os_tempdir(), "nexium-check.cpp");
+    std::string target = ::state__doc_path;
     bool has_main = false;
     {
-        const std::vector<std::string>& __nexa_forin_0 = L;
+        const std::vector<std::string>& __nexa_forin_0 = ::state__L;
         for (const std::string& s : __nexa_forin_0) {
             if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(s), "fn main(")) {
                 has_main = true;
@@ -10112,20 +10625,20 @@ static void maybe_check() {
         }
     }
     if (!(has_main)) {
-        std::string entry = entry_file(project_dir());
+        std::string entry = ::commands__entry_file(::commands__project_dir());
         if ((int)((entry).size()) > 0) {
             target = entry;
         }
     }
-    check_file = target;
-    check_out = "";
-    check_proc = nx_proc_start((std::string("\"") + c + "\" \"" + target + "\" --source \"" + out + "\"").c_str(), __nexa_file_dirname((target).c_str()).c_str());
+    ::state__check_file = target;
+    ::state__check_out = "";
+    ::state__check_proc = nx_proc_start((std::string("\"") + c + "\" \"" + target + "\" --source \"" + out + "\"").c_str(), __nexa_file_dirname((target).c_str()).c_str());
 }
 
-static int problem_counts_err() {
+static int panel__problem_counts_err() {
     int n = 0;
     {
-        const std::vector<bool>& __nexa_forin_0 = prob_err;
+        const std::vector<bool>& __nexa_forin_0 = ::state__prob_err;
         for (const bool& e : __nexa_forin_0) {
             if (e) {
                 n = n + 1;
@@ -10135,90 +10648,90 @@ static int problem_counts_err() {
     return n;
 }
 
-static void ensure_terminal() {
-    if (term_proc >= 0) {
+static void panel__ensure_terminal() {
+    if (::state__term_proc >= 0) {
         return;
     }
-    std::string dir = folder;
+    std::string dir = ::state__folder;
     if ((int)((dir).size()) == 0) {
         dir = __nexa_os_home();
     }
-    term_proc = nx_proc_start("", dir.c_str());
-    term_follow = true;
+    ::state__term_proc = nx_proc_start("", dir.c_str());
+    ::state__term_follow = true;
 }
 
-static void term_key(int vk, int mods) {
-    bool ctrl = ((mods & M_CTRL) != 0);
-    if (vk == K_ENTER) {
-        std::string line = fld_text[FLD_TERM];
-        if (term_proc < 0) {
-            ensure_terminal();
+static void panel__term_key(int vk, int mods) {
+    bool ctrl = ((mods & ::state__M_CTRL) != 0);
+    if (vk == ::state__K_ENTER) {
+        std::string line = ::state__fld_text[::state__FLD_TERM];
+        if (::state__term_proc < 0) {
+            ::panel__ensure_terminal();
             return;
         }
-        term_partial += line;
-        term_lines.push_back(term_partial);
-        term_partial = "";
+        ::state__term_partial += line;
+        ::state__term_lines.push_back(::state__term_partial);
+        ::state__term_partial = "";
         if (([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(line) == "cls" || ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(line) == "clear") {
-            term_lines.clear();
+            ::state__term_lines.clear();
         }
         if ((int)((([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(line)).size()) > 0) {
-            term_history.push_back(line);
+            ::state__term_history.push_back(line);
         }
-        term_hist_i = (int)((term_history).size());
-        nx_proc_write(term_proc, (line + "\r\n").c_str());
-        fld_set(FLD_TERM, "");
-        term_follow = true;
+        ::state__term_hist_i = (int)((::state__term_history).size());
+        nx_proc_write(::state__term_proc, (line + "\r\n").c_str());
+        ::nxtext__fld_set(::state__FLD_TERM, "");
+        ::state__term_follow = true;
         return;
     }
-    if (ctrl && vk == 67 && !(fld_has_sel(FLD_TERM))) {
-        term_lines.push_back((term_partial + fld_text[FLD_TERM] + "^C"));
-        term_partial = "";
-        fld_set(FLD_TERM, "");
-        nx_proc_free(term_proc);
-        term_proc = -1;
-        ensure_terminal();
+    if (ctrl && vk == 67 && !(::nxtext__fld_has_sel(::state__FLD_TERM))) {
+        ::state__term_lines.push_back((::state__term_partial + ::state__fld_text[::state__FLD_TERM] + "^C"));
+        ::state__term_partial = "";
+        ::nxtext__fld_set(::state__FLD_TERM, "");
+        nx_proc_free(::state__term_proc);
+        ::state__term_proc = -1;
+        ::panel__ensure_terminal();
         return;
     }
     if (ctrl && vk == 76) {
-        term_lines.clear();
+        ::state__term_lines.clear();
         return;
     }
-    if (vk == K_UP) {
-        if (term_hist_i > 0) {
-            term_hist_i = term_hist_i - 1;
-            fld_set(FLD_TERM, term_history[term_hist_i]);
+    if (vk == ::state__K_UP) {
+        if (::state__term_hist_i > 0) {
+            ::state__term_hist_i = ::state__term_hist_i - 1;
+            ::nxtext__fld_set(::state__FLD_TERM, ::state__term_history[::state__term_hist_i]);
         }
         return;
     }
-    if (vk == K_DOWN) {
-        if (term_hist_i < ((int)((term_history).size()) - 1)) {
-            term_hist_i = term_hist_i + 1;
-            fld_set(FLD_TERM, term_history[term_hist_i]);
+    if (vk == ::state__K_DOWN) {
+        if (::state__term_hist_i < ((int)((::state__term_history).size()) - 1)) {
+            ::state__term_hist_i = ::state__term_hist_i + 1;
+            ::nxtext__fld_set(::state__FLD_TERM, ::state__term_history[::state__term_hist_i]);
         } else {
-            term_hist_i = (int)((term_history).size());
-            fld_set(FLD_TERM, "");
+            ::state__term_hist_i = (int)((::state__term_history).size());
+            ::nxtext__fld_set(::state__FLD_TERM, "");
         }
         return;
     }
-    if (vk == K_ESC) {
-        focus = F_EDITOR;
+    if (vk == ::state__K_ESC) {
+        ::state__focus = ::state__F_EDITOR;
         return;
     }
-    fld_key(FLD_TERM, vk, mods);
-    term_follow = true;
+    ::nxtext__fld_key(::state__FLD_TERM, vk, mods);
+    ::state__term_follow = true;
 }
 
-static int mono(int x, int y, std::string s, int c, int max_w) {
+static int panel__mono(int x, int y, std::string s, int c, int max_w) {
     if (max_w <= 0) {
         return 0;
     }
-    nx_clip(x, (y - px(2)), (x + max_w), (y + LH_MONO));
-    int w = nx_text(PANEL_FONT, x, y, s.c_str(), c);
+    nx_clip(x, (y - ::draw__px(2)), (x + max_w), (y + ::state__LH_MONO));
+    int w = nx_text(::state__PANEL_FONT, x, y, s.c_str(), c);
     nx_clip_off();
-    return imin(w, max_w);
+    return ::draw__imin(w, max_w);
 }
 
-static int out_color(const std::string& s) {
+static int panel__out_color(const std::string& s) {
     std::string l = ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(s);
     if (([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(l, "error") || ([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(l, "failed")) {
         return 0xF48771;
@@ -10227,381 +10740,428 @@ static int out_color(const std::string& s) {
         return 0xCCA700;
     }
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "[Nexa] Build successful") || ([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(s, "finished in")) {
-        return C_OK;
+        return ::state__C_OK;
     }
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "> ")) {
-        return C_MUTED;
+        return ::state__C_MUTED;
     }
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(s, "[Nexa]")) {
-        return C_MUTED;
+        return ::state__C_MUTED;
     }
-    return C_TEXT;
+    return ::state__C_TEXT;
 }
 
-static void panel_tabs_draw(int x, int y, int w) {
+static void panel__panel_tabs_draw(int x, int y, int w) {
     std::vector<std::string> names = std::vector<std::string>{"PROBLEMS", "OUTPUT", "TERMINAL"};
-    int tx = (x + px(12));
-    int th = px(35);
+    int tx = (x + ::draw__px(12));
+    int th = ::draw__px(35);
     for (int i = 0; i < 3; i++) {
-        std::string label = names[i];
-        int lw = tw(label, UI_SMALL);
+        std::string label = __nexa_text(names[i]);
+        int lw = ::draw__tw(label, ::state__UI_SMALL);
         int extra = 0;
-        int count = (int)((prob_file).size());
+        int count = (int)((::state__prob_file).size());
         if (i == 0 && count > 0) {
-            extra = (tw(std::to_string(count), UI_SMALL) + px(14));
+            extra = (::draw__tw(std::to_string(count), ::state__UI_SMALL) + ::draw__px(14));
         }
-        int wtab = (lw + extra + px(16));
-        bool on = (panel_tab == i);
-        int c = ((on) ? (C_BRIGHT) : (C_MUTED));
-        if (hovered(tx, y, wtab, th) && !(on)) {
-            c = C_TEXT;
+        int wtab = (lw + extra + ::draw__px(16));
+        bool on = (::state__panel_tab == i);
+        int c = ((on) ? (::state__C_BRIGHT) : (::state__C_MUTED));
+        if (::draw__hovered(tx, y, wtab, th) && !(on)) {
+            c = ::state__C_TEXT;
         }
-        txt_v((tx + px(8)), y, th, label, c, UI_SMALL);
+        ::draw__txt_v((tx + ::draw__px(8)), y, th, label, c, ::state__UI_SMALL);
         if (i == 0 && count > 0) {
-            int bx = (tx + px(8) + lw + px(6));
-            int bw = (tw(std::to_string(count), UI_SMALL) + px(10));
-            rrect(bx, (y + px(9)), bw, px(17), px(8), 0x616161);
-            txt_v((bx + px(5)), (y + px(9)), px(17), std::to_string(count), C_BRIGHT, UI_SMALL);
+            int bx = (tx + ::draw__px(8) + lw + ::draw__px(6));
+            int bw = (::draw__tw(std::to_string(count), ::state__UI_SMALL) + ::draw__px(10));
+            ::draw__rrect(bx, (y + ::draw__px(9)), bw, ::draw__px(17), ::draw__px(8), 0x616161);
+            ::draw__txt_v((bx + ::draw__px(5)), (y + ::draw__px(9)), ::draw__px(17), std::to_string(count), ::state__C_BRIGHT, ::state__UI_SMALL);
         }
         if (on) {
-            fill((tx + px(8)), (y + th - px(3)), (wtab - px(16)), px(1), C_BRIGHT);
+            ::draw__fill((tx + ::draw__px(8)), (y + th - ::draw__px(3)), (wtab - ::draw__px(16)), ::draw__px(1), ::state__C_BRIGHT);
         }
-        if (clicked_in(tx, y, wtab, th)) {
-            show_panel_tab(i);
-            focus = ((i == 2) ? (F_TERM) : (F_EDITOR));
+        if (::app__clicked_in(tx, y, wtab, th)) {
+            ::commands__show_panel_tab(i);
+            ::state__focus = ((i == 2) ? (::state__F_TERM) : (::state__F_EDITOR));
         }
         tx = tx + wtab;
     }
-    int bx = (x + w - px(30));
-    if (icon_button(bx, (y + px(7)), "close", "Close Panel")) {
-        show_panel = false;
-        if (focus == F_TERM) {
-            focus = F_EDITOR;
+    int bx = (x + w - ::draw__px(30));
+    if (::workspace__icon_button(bx, (y + ::draw__px(7)), "close", "Close Panel")) {
+        ::state__show_panel = false;
+        if (::state__focus == ::state__F_TERM) {
+            ::state__focus = ::state__F_EDITOR;
         }
     }
-    if (panel_tab == 1) {
-        if (task_running()) {
-            if (icon_button((bx - px(26)), (y + px(7)), "stop", "Stop")) {
-                stop_task();
+    if (::state__panel_tab == 1) {
+        if (::commands__task_running()) {
+            if (::workspace__icon_button((bx - ::draw__px(26)), (y + ::draw__px(7)), "stop", "Stop")) {
+                ::commands__stop_task();
             }
         }
-        if (icon_button((bx - px(52)), (y + px(7)), "copy", "Copy Output")) {
-            nx_clip_set(([&](){ const auto& __nexa_v = out_lines; std::string __nexa_s = "\n"; std::string __nexa_o; for (size_t __nexa_i = 0; __nexa_i < __nexa_v.size(); __nexa_i++) { if (__nexa_i) __nexa_o += __nexa_s; __nexa_o += __nexa_v[__nexa_i]; } return __nexa_o; })().c_str());
+        if (::workspace__icon_button((bx - ::draw__px(52)), (y + ::draw__px(7)), "copy", "Copy Output")) {
+            nx_clip_set(([&](){ const auto& __nexa_v = ::state__out_lines; std::string __nexa_s = "\n"; std::string __nexa_o; for (size_t __nexa_i = 0; __nexa_i < __nexa_v.size(); __nexa_i++) { if (__nexa_i) __nexa_o += __nexa_s; __nexa_o += __nexa_v[__nexa_i]; } return __nexa_o; })().c_str());
         }
-        if (icon_button((bx - px(78)), (y + px(7)), "clear", "Clear Output")) {
-            out_lines.clear();
+        if (::workspace__icon_button((bx - ::draw__px(78)), (y + ::draw__px(7)), "clear", "Clear Output")) {
+            ::state__out_lines.clear();
         }
-    } else if (panel_tab == 2) {
-        if (icon_button((bx - px(26)), (y + px(7)), "plus", "New Terminal")) {
-            run_cmd("term.new");
+    } else if (::state__panel_tab == 2) {
+        if (::workspace__icon_button((bx - ::draw__px(26)), (y + ::draw__px(7)), "plus", "New Terminal")) {
+            ::commands__run_cmd("term.new");
         }
-        if (icon_button((bx - px(52)), (y + px(7)), "clear", "Clear")) {
-            term_lines.clear();
+        if (::workspace__icon_button((bx - ::draw__px(52)), (y + ::draw__px(7)), "clear", "Clear")) {
+            ::state__term_lines.clear();
         }
     }
 }
 
-static void draw_panel() {
-    if (!(show_panel)) {
+static void panel__draw_panel() {
+    if (!(::state__show_panel)) {
         return;
     }
-    int x = main_x;
-    int w = main_w;
-    int y = panel_y;
-    int h = (win_h - STATUS_H - panel_y);
-    fill(x, y, w, h, C_PANEL);
-    shadow_h(x, y, w, false);
-    hline(x, y, w, C_BORDER);
-    panel_tabs_draw(x, y, w);
-    int by = (y + px(35));
-    int bh = (h - px(35));
-    panel_body_y = by;
-    panel_body_h = bh;
-    if (panel_tab == 0) {
-        draw_problems(x, by, w, bh);
-    } else if (panel_tab == 1) {
-        draw_lines(x, by, w, bh, 1);
+    int x = ::state__main_x;
+    int w = ::state__main_w;
+    int y = ::state__panel_y;
+    int h = (::state__win_h - ::state__STATUS_H - ::state__panel_y);
+    ::draw__fill(x, y, w, h, ::state__C_PANEL);
+    ::draw__shadow_h(x, y, w, false);
+    ::draw__hline(x, y, w, ::state__C_BORDER);
+    ::panel__panel_tabs_draw(x, y, w);
+    int by = (y + ::draw__px(35));
+    int bh = (h - ::draw__px(35));
+    ::state__panel_body_y = by;
+    ::state__panel_body_h = bh;
+    if (::state__panel_tab == 0) {
+        ::panel__draw_problems(x, by, w, bh);
+    } else if (::state__panel_tab == 1) {
+        ::panel__draw_lines(x, by, w, bh, 1);
     } else {
-        draw_lines(x, by, w, bh, 2);
+        ::panel__draw_lines(x, by, w, bh, 2);
     }
 }
 
-static void draw_problems(int x, int y, int w, int h) {
-    if ((int)((prob_file).size()) == 0) {
-        txt((x + px(20)), (y + px(6)), "No problems have been detected in the workspace.", C_MUTED, UI);
+static void panel__draw_problems(int x, int y, int w, int h) {
+    if ((int)((::state__prob_file).size()) == 0) {
+        ::draw__txt((x + ::draw__px(20)), (y + ::draw__px(6)), "No problems have been detected in the workspace.", ::state__C_MUTED, ::state__UI);
         return;
     }
-    int rh = ROW_H;
-    int content = ((int)((prob_file).size()) * rh);
-    prob_scroll = clamp(prob_scroll, 0, imax(0, (content - h)));
-    int i = (prob_scroll / rh);
-    while (i < (int)((prob_file).size())) {
-        int ry = (y + (i * rh) - prob_scroll);
+    int rh = ::state__ROW_H;
+    int content = ((int)((::state__prob_file).size()) * rh);
+    ::state__prob_scroll = ::draw__clamp(::state__prob_scroll, 0, ::draw__imax(0, (content - h)));
+    int i = (::state__prob_scroll / rh);
+    while (i < (int)((::state__prob_file).size())) {
+        int ry = (y + (i * rh) - ::state__prob_scroll);
         if (ry >= (y + h)) {
             break;
         }
-        if (hovered(x, ry, w, rh)) {
-            fill(x, ry, w, rh, C_HOVER);
+        if (::draw__hovered(x, ry, w, rh)) {
+            ::draw__fill(x, ry, w, rh, ::state__C_HOVER);
         }
-        bool err = prob_err[i];
-        int ic = ((err) ? (C_ERROR) : (C_WARNING));
-        circle((x + px(24)), (ry + (rh / 2)), px(5), ic);
+        bool err = ::state__prob_err[i];
+        int ic = ((err) ? (::state__C_ERROR) : (::state__C_WARNING));
+        ::draw__circle((x + ::draw__px(24)), (ry + (rh / 2)), ::draw__px(5), ic);
         if (err) {
-            line((x + px(22)), (ry + (rh / 2) - px(2)), (x + px(26)), (ry + (rh / 2) + px(2)), ic, 1);
-            line((x + px(26)), (ry + (rh / 2) - px(2)), (x + px(22)), (ry + (rh / 2) + px(2)), ic, 1);
+            ::draw__line((x + ::draw__px(22)), (ry + (rh / 2) - ::draw__px(2)), (x + ::draw__px(26)), (ry + (rh / 2) + ::draw__px(2)), ic, 1);
+            ::draw__line((x + ::draw__px(26)), (ry + (rh / 2) - ::draw__px(2)), (x + ::draw__px(22)), (ry + (rh / 2) + ::draw__px(2)), ic, 1);
         } else {
-            fill((x + px(24)), (ry + (rh / 2) - px(3)), 1, px(4), ic);
+            ::draw__fill((x + ::draw__px(24)), (ry + (rh / 2) - ::draw__px(3)), 1, ::draw__px(4), ic);
         }
-        std::string msg = prob_msg[i];
-        int mw = txt_v((x + px(38)), ry, rh, fit(msg, (w - px(260)), UI), C_TEXT, UI);
-        std::string f = prob_file[i];
-        txt_v((x + px(46) + mw), ry, rh, fit((__nexa_file_basename((f).c_str()) + " [Ln " + std::to_string(prob_line[i]) + "]"), px(200), UI_SMALL), C_MUTED, UI_SMALL);
+        std::string msg = ::state__prob_msg[i];
+        int mw = ::draw__txt_v((x + ::draw__px(38)), ry, rh, ::draw__fit(msg, (w - ::draw__px(260)), ::state__UI), ::state__C_TEXT, ::state__UI);
+        std::string f = ::state__prob_file[i];
+        ::draw__txt_v((x + ::draw__px(46) + mw), ry, rh, ::draw__fit((__nexa_file_basename((f).c_str()) + " [Ln " + std::to_string(::state__prob_line[i]) + "]"), ::draw__px(200), ::state__UI_SMALL), ::state__C_MUTED, ::state__UI_SMALL);
         i = i + 1;
     }
 }
 
-static void draw_lines(int x, int y, int w, int h, int which) {
-    int n = ((which == 1) ? ((int)((out_lines).size())) : ((int)((term_lines).size())));
-    int extra = ((which == 2) ? (1) : ((((int)((out_partial).size()) > 0) ? (1) : (0))));
+static void panel__draw_lines(int x, int y, int w, int h, int which) {
+    int n = ((which == 1) ? ((int)((::state__out_lines).size())) : ((int)((::state__term_lines).size())));
+    int extra = ((which == 2) ? (1) : ((((int)((::state__out_partial).size()) > 0) ? (1) : (0))));
     int total = (n + extra);
-    int rows = imax(1, ((h - px(8)) / LH_MONO));
-    int scroll = ((which == 1) ? (out_scroll) : (term_scroll));
-    bool follow = ((which == 1) ? (out_follow) : (term_follow));
-    int max_scroll = imax(0, (total - rows));
+    int rows = ::draw__imax(1, ((h - ::draw__px(8)) / ::state__LH_MONO));
+    int scroll = ((which == 1) ? (::state__out_scroll) : (::state__term_scroll));
+    bool follow = ((which == 1) ? (::state__out_follow) : (::state__term_follow));
+    int max_scroll = ::draw__imax(0, (total - rows));
     if (follow) {
         scroll = max_scroll;
     }
-    scroll = clamp(scroll, 0, max_scroll);
+    scroll = ::draw__clamp(scroll, 0, max_scroll);
     if (which == 1) {
-        out_scroll = scroll;
+        ::state__out_scroll = scroll;
     } else {
-        term_scroll = scroll;
+        ::state__term_scroll = scroll;
     }
-    int tx = (x + px(20));
-    int maxw = (w - px(40));
-    int ty = ((LH_MONO - nx_font_h(PANEL_FONT)) / 2);
+    int tx = (x + ::draw__px(20));
+    int maxw = (w - ::draw__px(40));
+    int ty = ((::state__LH_MONO - nx_font_h(::state__PANEL_FONT)) / 2);
     int r = 0;
     while (r < rows && (scroll + r) < total) {
         int i = (scroll + r);
-        int ly = (y + px(4) + (r * LH_MONO));
+        int ly = (y + ::draw__px(4) + (r * ::state__LH_MONO));
         if (i < n) {
-            std::string s = ((which == 1) ? (out_lines[i]) : (term_lines[i]));
-            mono(tx, (ly + ty), s, ((which == 1) ? (out_color(s)) : (C_TEXT)), maxw);
+            std::string s = ((which == 1) ? (::state__out_lines[i]) : (::state__term_lines[i]));
+            ::panel__mono(tx, (ly + ty), s, ((which == 1) ? (::panel__out_color(s)) : (::state__C_TEXT)), maxw);
         } else if (which == 1) {
-            mono(tx, (ly + ty), out_partial, C_TEXT, maxw);
+            ::panel__mono(tx, (ly + ty), ::state__out_partial, ::state__C_TEXT, maxw);
         } else {
-            int pw = mono(tx, (ly + ty), term_partial, C_TEXT, maxw);
-            std::string inp = fld_text[FLD_TERM];
-            int iw = mono((tx + pw), (ly + ty), inp, C_BRIGHT, (maxw - pw));
-            if (focus == F_TERM && caret_on()) {
-                int cxp = nx_text_w(PANEL_FONT, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(inp, 0, fld_caret[FLD_TERM]).c_str());
-                fill((tx + pw + cxp), ly, px(2), LH_MONO, C_TEXT);
+            int pw = ::panel__mono(tx, (ly + ty), ::state__term_partial, ::state__C_TEXT, maxw);
+            std::string inp = ::state__fld_text[::state__FLD_TERM];
+            int iw = ::panel__mono((tx + pw), (ly + ty), inp, ::state__C_BRIGHT, (maxw - pw));
+            if (::state__focus == ::state__F_TERM && ::nxtext__caret_on()) {
+                int cxp = nx_text_w(::state__PANEL_FONT, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(inp, 0, ::state__fld_caret[::state__FLD_TERM]).c_str());
+                ::draw__fill((tx + pw + cxp), ly, ::draw__px(2), ::state__LH_MONO, ::state__C_TEXT);
             }
-            if (term_proc < 0 && (int)((term_lines).size()) == 0) {
-                txt(tx, (ly + ty), "Starting terminal...", C_MUTED, UI);
+            if (::state__term_proc < 0 && (int)((::state__term_lines).size()) == 0) {
+                ::draw__txt(tx, (ly + ty), "Starting terminal...", ::state__C_MUTED, ::state__UI);
             }
         }
         r = r + 1;
     }
     if (total > rows) {
-        int sbh = (h - px(4));
-        int th = imax(px(20), (sbh * rows / total));
-        int tyy = (y + ((sbh - th) * scroll / imax(1, max_scroll)));
-        fill_a((x + w - px(12)), tyy, px(10), th, 0x797979, 70);
+        int sbh = (h - ::draw__px(4));
+        int th = ::draw__imax(::draw__px(20), (sbh * rows / total));
+        int tyy = (y + ((sbh - th) * scroll / ::draw__imax(1, max_scroll)));
+        ::draw__fill_a((x + w - ::draw__px(12)), tyy, ::draw__px(10), th, 0x797979, 70);
     }
 }
 
-static void panel_mouse(int x, int y, int btn, int clicks) {
-    if (y < panel_body_y) {
+static void panel__panel_mouse(int x, int y, int btn, int clicks) {
+    if (y < ::state__panel_body_y) {
         return;
     }
-    if (panel_tab == 0) {
-        int i = ((y - panel_body_y + prob_scroll) / ROW_H);
-        if (i >= 0 && i < (int)((prob_file).size())) {
-            std::string f = prob_file[i];
-            if (open_file(f, false)) {
-                int ln = clamp((prob_line[i] - 1), 0, ((int)((L).size()) - 1));
-                set_cursor(ln, (int)((leading_ws(L[ln])).size()), false);
-                reveal(true);
-                focus = F_EDITOR;
+    if (::state__panel_tab == 0) {
+        int i = ((y - ::state__panel_body_y + ::state__prob_scroll) / ::state__ROW_H);
+        if (i >= 0 && i < (int)((::state__prob_file).size())) {
+            std::string f = ::state__prob_file[i];
+            if (::buffer__open_file(f, false)) {
+                int ln = ::draw__clamp((::state__prob_line[i] - 1), 0, ((int)((::state__L).size()) - 1));
+                ::buffer__set_cursor(ln, (int)((::nxtext__leading_ws(::state__L[ln])).size()), false);
+                ::editor__reveal(true);
+                ::state__focus = ::state__F_EDITOR;
             }
         }
-    } else if (panel_tab == 2) {
-        focus = F_TERM;
-        ensure_terminal();
-    } else if (panel_tab == 1 && clicks >= 2) {
-        int i = (out_scroll + ((y - panel_body_y - px(4)) / LH_MONO));
-        if (i >= 0 && i < (int)((out_lines).size())) {
-            int before = (int)((prob_file).size());
-            parse_problems(out_lines[i], "build");
-            if ((int)((prob_file).size()) > 0) {
-                int k = ((int)((prob_file).size()) - 1);
-                for (int j = 0; j < (int)((prob_file).size()); j++) {
-                    if (([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(out_lines[i], prob_msg[j])) {
+    } else if (::state__panel_tab == 2) {
+        ::state__focus = ::state__F_TERM;
+        ::panel__ensure_terminal();
+    } else if (::state__panel_tab == 1 && clicks >= 2) {
+        int i = (::state__out_scroll + ((y - ::state__panel_body_y - ::draw__px(4)) / ::state__LH_MONO));
+        if (i >= 0 && i < (int)((::state__out_lines).size())) {
+            int before = (int)((::state__prob_file).size());
+            ::panel__parse_problems(::state__out_lines[i], "build");
+            if ((int)((::state__prob_file).size()) > 0) {
+                int k = ((int)((::state__prob_file).size()) - 1);
+                for (int j = 0; j < (int)((::state__prob_file).size()); j++) {
+                    if (([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(::state__out_lines[i], ::state__prob_msg[j])) {
                         k = j;
                     }
                 }
-                std::string f = prob_file[k];
-                if (open_file(f, false)) {
-                    int ln = clamp((prob_line[k] - 1), 0, ((int)((L).size()) - 1));
-                    set_cursor(ln, (int)((leading_ws(L[ln])).size()), false);
-                    reveal(true);
-                    focus = F_EDITOR;
+                std::string f = ::state__prob_file[k];
+                if (::buffer__open_file(f, false)) {
+                    int ln = ::draw__clamp((::state__prob_line[k] - 1), 0, ((int)((::state__L).size()) - 1));
+                    ::buffer__set_cursor(ln, (int)((::nxtext__leading_ws(::state__L[ln])).size()), false);
+                    ::editor__reveal(true);
+                    ::state__focus = ::state__F_EDITOR;
                 }
             }
         }
     }
 }
 
-static void panel_wheel(int delta) {
+static void panel__panel_wheel(int delta) {
     int n = (delta / 40);
     if (n == 0) {
         n = ((delta > 0) ? (1) : (-1));
     }
-    if (panel_tab == 0) {
-        prob_scroll = imax(0, (prob_scroll - (n * ROW_H)));
-    } else if (panel_tab == 1) {
-        out_scroll = imax(0, (out_scroll - n));
-        out_follow = false;
-        int rows = imax(1, ((panel_body_h - px(8)) / LH_MONO));
-        if (out_scroll >= ((int)((out_lines).size()) - rows)) {
-            out_follow = true;
+    if (::state__panel_tab == 0) {
+        ::state__prob_scroll = ::draw__imax(0, (::state__prob_scroll - (n * ::state__ROW_H)));
+    } else if (::state__panel_tab == 1) {
+        ::state__out_scroll = ::draw__imax(0, (::state__out_scroll - n));
+        ::state__out_follow = false;
+        int rows = ::draw__imax(1, ((::state__panel_body_h - ::draw__px(8)) / ::state__LH_MONO));
+        if (::state__out_scroll >= ((int)((::state__out_lines).size()) - rows)) {
+            ::state__out_follow = true;
         }
     } else {
-        term_scroll = imax(0, (term_scroll - n));
-        term_follow = false;
-        int rows = imax(1, ((panel_body_h - px(8)) / LH_MONO));
-        if (term_scroll >= ((int)((term_lines).size()) + 1 - rows)) {
-            term_follow = true;
+        ::state__term_scroll = ::draw__imax(0, (::state__term_scroll - n));
+        ::state__term_follow = false;
+        int rows = ::draw__imax(1, ((::state__panel_body_h - ::draw__px(8)) / ::state__LH_MONO));
+        if (::state__term_scroll >= ((int)((::state__term_lines).size()) + 1 - rows)) {
+            ::state__term_follow = true;
         }
     }
-    frame_dirty = true;
+    ::state__frame_dirty = true;
 }
 
-const int AG_IDLE = 0;
-const int AG_WAIT = 1;
-const int AG_TOOLS = 2;
-const int AG_PROC = 3;
+const int agent__AG_IDLE = 0;
+const int agent__AG_WAIT = 1;
+const int agent__AG_TOOLS = 2;
+const int agent__AG_PROC = 3;
 
-static std::vector<std::string> provider_ids() {
+static std::vector<std::string> agent__provider_ids() {
     return std::vector<std::string>{"openai", "anthropic", "openrouter", "groq", "ollama", "custom"};
 }
 
-static std::string provider_label(const std::string& id) {
-    if (id == "openai") {
-        return "OpenAI";
-    }
-    else if (id == "anthropic") {
-        return "Anthropic";
-    }
-    else if (id == "openrouter") {
-        return "OpenRouter";
-    }
-    else if (id == "groq") {
-        return "Groq";
-    }
-    else if (id == "ollama") {
-        return "Ollama";
-    }
-    else if (id == "custom") {
-        return "Custom";
-    }
-    else {
+static std::string agent__provider_label(const std::string& id) {
+    {
+        const std::string& __nexa_sws_1 = id;
+        int __nexa_swi_2 = -1;
+        if (__nexa_sws_1 == "openai") __nexa_swi_2 = 1;
+        else if (__nexa_sws_1 == "anthropic") __nexa_swi_2 = 2;
+        else if (__nexa_sws_1 == "openrouter") __nexa_swi_2 = 3;
+        else if (__nexa_sws_1 == "groq") __nexa_swi_2 = 4;
+        else if (__nexa_sws_1 == "ollama") __nexa_swi_2 = 5;
+        else if (__nexa_sws_1 == "custom") __nexa_swi_2 = 6;
+        switch (__nexa_swi_2) {
+        case 1: {
+            return "OpenAI";
+        }
+        case 2: {
+            return "Anthropic";
+        }
+        case 3: {
+            return "OpenRouter";
+        }
+        case 4: {
+            return "Groq";
+        }
+        case 5: {
+            return "Ollama";
+        }
+        case 6: {
+            return "Custom";
+        }
+        default: {
+            break;
+        }
+        }
     }
     return id;
 }
 
-static std::string provider_url(const std::string& id) {
-    if (id == "anthropic") {
-        return "https://api.anthropic.com";
-    }
-    else if (id == "openrouter") {
-        return "https://openrouter.ai/api/v1";
-    }
-    else if (id == "groq") {
-        return "https://api.groq.com/openai/v1";
-    }
-    else if (id == "ollama") {
-        return "http://127.0.0.1:11434/v1";
-    }
-    else {
+static std::string agent__provider_url(const std::string& id) {
+    {
+        const std::string& __nexa_sws_1 = id;
+        int __nexa_swi_2 = -1;
+        if (__nexa_sws_1 == "anthropic") __nexa_swi_2 = 1;
+        else if (__nexa_sws_1 == "openrouter") __nexa_swi_2 = 2;
+        else if (__nexa_sws_1 == "groq") __nexa_swi_2 = 3;
+        else if (__nexa_sws_1 == "ollama") __nexa_swi_2 = 4;
+        switch (__nexa_swi_2) {
+        case 1: {
+            return "https://api.anthropic.com";
+        }
+        case 2: {
+            return "https://openrouter.ai/api/v1";
+        }
+        case 3: {
+            return "https://api.groq.com/openai/v1";
+        }
+        case 4: {
+            return "http://127.0.0.1:11434/v1";
+        }
+        default: {
+            break;
+        }
+        }
     }
     return "https://api.openai.com/v1";
 }
 
-static std::string provider_env(const std::string& id) {
-    if (id == "openai") {
-        return "OPENAI_API_KEY";
-    }
-    else if (id == "anthropic") {
-        return "ANTHROPIC_API_KEY";
-    }
-    else if (id == "openrouter") {
-        return "OPENROUTER_API_KEY";
-    }
-    else if (id == "groq") {
-        return "GROQ_API_KEY";
-    }
-    else {
+static std::string agent__provider_env(const std::string& id) {
+    {
+        const std::string& __nexa_sws_1 = id;
+        int __nexa_swi_2 = -1;
+        if (__nexa_sws_1 == "openai") __nexa_swi_2 = 1;
+        else if (__nexa_sws_1 == "anthropic") __nexa_swi_2 = 2;
+        else if (__nexa_sws_1 == "openrouter") __nexa_swi_2 = 3;
+        else if (__nexa_sws_1 == "groq") __nexa_swi_2 = 4;
+        switch (__nexa_swi_2) {
+        case 1: {
+            return "OPENAI_API_KEY";
+        }
+        case 2: {
+            return "ANTHROPIC_API_KEY";
+        }
+        case 3: {
+            return "OPENROUTER_API_KEY";
+        }
+        case 4: {
+            return "GROQ_API_KEY";
+        }
+        default: {
+            break;
+        }
+        }
     }
     return "";
 }
 
-static std::vector<std::string> provider_models(const std::string& id) {
-    if (id == "openai") {
-        return std::vector<std::string>{"gpt-4.1|GPT-4.1", "gpt-4o|GPT-4o", "gpt-4o-mini|GPT-4o mini", "o3|o3", "o4-mini|o4-mini", "gpt-4.1-mini|GPT-4.1 mini"};
-    }
-    else if (id == "anthropic") {
-        return std::vector<std::string>{"claude-sonnet-5|Claude Sonnet 5", "claude-opus-5-5|Claude Opus 5.5", "claude-fable-5-1|Claude Fable 5.1", "claude-haiku-4-5-20251001|Claude Haiku 4.5", "claude-sonnet-4-20250514|Claude Sonnet 4"};
-    }
-    else if (id == "openrouter") {
-        return std::vector<std::string>{"anthropic/claude-sonnet-4|Claude Sonnet 4", "openai/gpt-4o|GPT-4o", "google/gemini-2.5-pro|Gemini 2.5 Pro", "qwen/qwen3-coder|Qwen3 Coder", "deepseek/deepseek-chat|DeepSeek V3"};
-    }
-    else if (id == "groq") {
-        return std::vector<std::string>{"openai/gpt-oss-20b|GPT OSS 20B", "openai/gpt-oss-120b|GPT OSS 120B", "qwen/qwen3.6-27b|Qwen3.6 27B", "groq/compound|Groq Compound", "groq/compound-mini|Compound Mini"};
-    }
-    else if (id == "ollama") {
-        return std::vector<std::string>{"llama3.2|Llama 3.2", "qwen2.5-coder|Qwen2.5 Coder", "deepseek-coder-v2|DeepSeek Coder V2", "codellama|Code Llama"};
-    }
-    else {
+static std::vector<std::string> agent__provider_models(const std::string& id) {
+    {
+        const std::string& __nexa_sws_1 = id;
+        int __nexa_swi_2 = -1;
+        if (__nexa_sws_1 == "openai") __nexa_swi_2 = 1;
+        else if (__nexa_sws_1 == "anthropic") __nexa_swi_2 = 2;
+        else if (__nexa_sws_1 == "openrouter") __nexa_swi_2 = 3;
+        else if (__nexa_sws_1 == "groq") __nexa_swi_2 = 4;
+        else if (__nexa_sws_1 == "ollama") __nexa_swi_2 = 5;
+        switch (__nexa_swi_2) {
+        case 1: {
+            return std::vector<std::string>{"gpt-4.1|GPT-4.1", "gpt-4o|GPT-4o", "gpt-4o-mini|GPT-4o mini", "o3|o3", "o4-mini|o4-mini", "gpt-4.1-mini|GPT-4.1 mini"};
+        }
+        case 2: {
+            return std::vector<std::string>{"claude-sonnet-5|Claude Sonnet 5", "claude-opus-5-5|Claude Opus 5.5", "claude-fable-5-1|Claude Fable 5.1", "claude-haiku-4-5-20251001|Claude Haiku 4.5", "claude-sonnet-4-20250514|Claude Sonnet 4"};
+        }
+        case 3: {
+            return std::vector<std::string>{"anthropic/claude-sonnet-4|Claude Sonnet 4", "openai/gpt-4o|GPT-4o", "google/gemini-2.5-pro|Gemini 2.5 Pro", "qwen/qwen3-coder|Qwen3 Coder", "deepseek/deepseek-chat|DeepSeek V3"};
+        }
+        case 4: {
+            return std::vector<std::string>{"openai/gpt-oss-20b|GPT OSS 20B", "openai/gpt-oss-120b|GPT OSS 120B", "qwen/qwen3.6-27b|Qwen3.6 27B", "groq/compound|Groq Compound", "groq/compound-mini|Compound Mini"};
+        }
+        case 5: {
+            return std::vector<std::string>{"llama3.2|Llama 3.2", "qwen2.5-coder|Qwen2.5 Coder", "deepseek-coder-v2|DeepSeek Coder V2", "codellama|Code Llama"};
+        }
+        default: {
+            break;
+        }
+        }
     }
     return std::vector<std::string>{"custom|Custom model"};
 }
 
-static std::string ag_key() {
-    if (((ag_keys).find(ag_provider) != (ag_keys).end()) && (int)((ag_keys[ag_provider]).size()) > 0) {
-        return ag_keys[ag_provider];
+static std::string agent__ag_key() {
+    if (((::state__ag_keys).find(::state__ag_provider) != (::state__ag_keys).end()) && (int)((::state__ag_keys[::state__ag_provider]).size()) > 0) {
+        return ::state__ag_keys[::state__ag_provider];
     }
-    std::string env = provider_env(ag_provider);
+    std::string env = ::agent__provider_env(::state__ag_provider);
     if ((int)((env).size()) > 0) {
-        std::string v = nx_env(env.c_str());
+        std::string v = __nexa_text(nx_env(env.c_str()));
         return v;
     }
     return "";
 }
 
-static std::string ag_url() {
-    if (((ag_urls).find(ag_provider) != (ag_urls).end()) && (int)((ag_urls[ag_provider]).size()) > 0) {
-        return ag_urls[ag_provider];
+static std::string agent__ag_url() {
+    if (((::state__ag_urls).find(::state__ag_provider) != (::state__ag_urls).end()) && (int)((::state__ag_urls[::state__ag_provider]).size()) > 0) {
+        return ::state__ag_urls[::state__ag_provider];
     }
-    return provider_url(ag_provider);
+    return ::agent__provider_url(::state__ag_provider);
 }
 
-static std::string ag_model() {
-    if (((ag_custom).find(ag_provider) != (ag_custom).end()) && (int)((ag_custom[ag_provider]).size()) > 0) {
-        return ag_custom[ag_provider];
+static std::string agent__ag_model() {
+    if (((::state__ag_custom).find(::state__ag_provider) != (::state__ag_custom).end()) && (int)((::state__ag_custom[::state__ag_provider]).size()) > 0) {
+        return ::state__ag_custom[::state__ag_provider];
     }
-    if (((ag_models).find(ag_provider) != (ag_models).end()) && (int)((ag_models[ag_provider]).size()) > 0) {
-        return ag_models[ag_provider];
+    if (((::state__ag_models).find(::state__ag_provider) != (::state__ag_models).end()) && (int)((::state__ag_models[::state__ag_provider]).size()) > 0) {
+        return ::state__ag_models[::state__ag_provider];
     }
-    std::vector<std::string> m = provider_models(ag_provider);
+    std::vector<std::string> m = ::agent__provider_models(::state__ag_provider);
     return ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(m[0], 0, ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(m[0], "|"));
 }
 
-static std::string ag_model_label() {
-    std::string id = ag_model();
+static std::string agent__ag_model_label() {
+    std::string id = ::agent__ag_model();
     {
-        const std::vector<std::string>& __nexa_forin_0 = provider_models(ag_provider);
+        const std::vector<std::string>& __nexa_forin_0 = ::agent__provider_models(::state__ag_provider);
         for (const std::string& m : __nexa_forin_0) {
             int bar = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(m, "|");
             if (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(m, 0, bar) == id) {
@@ -10612,7 +11172,7 @@ static std::string ag_model_label() {
     return id;
 }
 
-static std::string join_url(const std::string& base, const std::string& path) {
+static std::string agent__join_url(const std::string& base, const std::string& path) {
     std::string b = base;
     while (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(__s.size() - __p.size(), __p.size(), __p) == 0; })(b, "/")) {
         b = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(b, 0, ((int)((b).size()) - 1));
@@ -10620,75 +11180,76 @@ static std::string join_url(const std::string& base, const std::string& path) {
     return (b + path);
 }
 
-static void ag_push(std::string role, std::string content, std::string tid, std::string tname, std::string targs) {
-    ag_role.push_back(role);
-    ag_content.push_back(content);
-    ag_tool_id.push_back(tid);
-    ag_tool_name.push_back(tname);
-    ag_tool_args.push_back(targs);
-    ag_open.push_back(false);
-    ag_follow = true;
-    frame_dirty = true;
+static void agent__ag_push(std::string role, std::string content, std::string tid, std::string tname, std::string targs) {
+    ::state__ag_role.push_back(role);
+    ::state__ag_content.push_back(content);
+    ::state__ag_tool_id.push_back(tid);
+    ::state__ag_tool_name.push_back(tname);
+    ::state__ag_tool_args.push_back(targs);
+    ::state__ag_open.push_back(false);
+    ::state__ag_follow = true;
+    ::state__frame_dirty = true;
 }
 
-static void agent_new_chat() {
-    agent_stop();
-    ag_role.clear();
-    ag_content.clear();
-    ag_tool_id.clear();
-    ag_tool_name.clear();
-    ag_tool_args.clear();
-    ag_open.clear();
-    ag_error = "";
-    ag_status = "";
-    ag_scroll = 0;
-    ag_layout_key.clear();
-    ag_layout_h.clear();
+static void agent__agent_new_chat() {
+    ::agent__agent_stop();
+    ::state__ag_role.clear();
+    ::state__ag_content.clear();
+    ::state__ag_tool_id.clear();
+    ::state__ag_tool_name.clear();
+    ::state__ag_tool_args.clear();
+    ::state__ag_open.clear();
+    ::state__ag_error = "";
+    ::state__ag_status = "";
+    ::state__ag_scroll = 0;
+    ::state__ag_layout_key.clear();
+    ::state__ag_layout_h.clear();
 }
 
-static bool agent_busy() {
-    return (ag_state != AG_IDLE);
+static bool agent__agent_busy() {
+    return (::state__ag_state != ::agent__AG_IDLE);
 }
 
-static void agent_stop() {
-    if (ag_http >= 0) {
-        nx_http_free(ag_http);
-        ag_http = -1;
+static void agent__agent_stop() {
+    if (::state__ag_http >= 0) {
+        nx_http_free(::state__ag_http);
+        ::state__ag_http = -1;
     }
-    if (ag_proc >= 0) {
-        nx_proc_free(ag_proc);
-        ag_proc = -1;
+    if (::state__ag_proc >= 0) {
+        nx_proc_free(::state__ag_proc);
+        ::state__ag_proc = -1;
     }
-    if (ag_state != AG_IDLE) {
-        ag_status = "Stopped";
+    if (::state__ag_state != ::agent__AG_IDLE) {
+        ::state__ag_status = "Stopped";
     }
-    ag_state = AG_IDLE;
-    ag_pending.clear();
-    frame_dirty = true;
+    ::state__ag_state = ::agent__AG_IDLE;
+    ::state__ag_pending.clear();
+    ::state__frame_dirty = true;
 }
 
-static void agent_send() {
-    std::string text = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(fld_text[FLD_AGENT]);
-    if ((int)((text).size()) == 0 || agent_busy()) {
+static void agent__agent_send() {
+    std::string text = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(::state__fld_text[::state__FLD_AGENT]);
+    if ((int)((text).size()) == 0 || ::agent__agent_busy()) {
         return;
     }
-    if ((int)((ag_key()).size()) == 0 && ag_provider != "ollama" && ag_provider != "custom") {
-        ag_error = (std::string("Add an API key for ") + provider_label(ag_provider) + " in Settings (or set " + provider_env(ag_provider) + ").");
+    if ((int)((::agent__ag_key()).size()) == 0 && ::state__ag_provider != "ollama" && ::state__ag_provider != "custom") {
+        ::state__ag_error = (std::string("Add an API key for ") + ::agent__provider_label(::state__ag_provider) + " in Settings (or set " + ::agent__provider_env(::state__ag_provider) + ").");
         return;
     }
-    fld_set(FLD_AGENT, "");
-    ag_push("user", text, "", "", "");
-    ag_error = "";
-    ag_status = "";
-    ag_hops = 0;
-    ag_request();
+    ::nxtext__fld_set(::state__FLD_AGENT, "");
+    ::agent__ag_push("user", text, "", "", "");
+    ::state__ag_error = "";
+    ::state__ag_status = "";
+    ::state__ag_hops = 0;
+    ::agent__ag_request();
 }
 
-static std::string agent_system() {
-    bool agent_mode = (ag_mode == "agent");
-    bool groq = (ag_provider == "groq");
+static std::string agent__agent_system() {
+    bool agent_mode = (::state__ag_mode == "agent");
+    bool groq = (::state__ag_provider == "groq");
     std::string o = "You are Nexium, an AI assistant in a native Nexa IDE.\n";
-    o += "Nexa is a systems language (.nxa) that transpiles to C++ via NexaC.\n";
+    o += "Nexa is a systems language (.nxa) that transpiles to C++ via NexaC (0.1.16+).\n";
+    o += "It has priv, type aliases, shapes (T: Drawable), generics (fn id[T]), destructuring (let Point { x, y } = p), defer, float32/float64, and std modules including term/gfx/gfx3d/ui.\n";
     o += "Write real Nexa, not C++, unless the user is in inline_cpp! or asking about the compiler.\n";
     o += "The chat renders Markdown: headings, **bold**, lists, `inline code`, and fenced code blocks.\n";
     if (agent_mode) {
@@ -10699,11 +11260,11 @@ static std::string agent_system() {
         o += "Prefer edit_file for small edits. Prefer write_file for new files.\n";
         o += "Do not invent Nexa APIs that are not in the syntax notes.\n";
     }
-    if ((int)((folder).size()) > 0) {
-        o += (std::string("Open folder: ") + folder + "\n");
+    if ((int)((::state__folder).size()) > 0) {
+        o += (std::string("Open folder: ") + ::state__folder + "\n");
     }
-    if (is_file_tab()) {
-        o += (std::string("Active file: ") + (((int)((doc_path).size()) > 0) ? (doc_path) : (bufs[active].name)) + "\n");
+    if (::buffer__is_file_tab()) {
+        o += (std::string("Active file: ") + (((int)((::state__doc_path).size()) > 0) ? (::state__doc_path) : (::state__bufs[::state__active].name)) + "\n");
     }
     if (!(groq) || agent_mode) {
         int budget = ((groq) ? (3500) : (8000));
@@ -10712,7 +11273,7 @@ static std::string agent_system() {
         {
             const std::vector<std::string>& __nexa_forin_0 = std::vector<std::string>{"SYNTAX/Includes.txt", "SYNTAX/Core.txt", "SYNTAX/ControlFlow.txt", "SYNTAX/Modules.txt", "SYNTAX/Inline.txt", "SYNTAX/CLI.txt"};
             for (const std::string& rel : __nexa_forin_0) {
-                std::string p = path_join(nexa_lang, ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(rel, "/", "\\"));
+                std::string p = ::workspace__path_join(::state__nexa_lang, ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(rel, "/", "\\"));
                 if (!(__nexa_file_isfile((p).c_str()))) {
                     continue;
                 }
@@ -10725,17 +11286,17 @@ static std::string agent_system() {
         }
         o += ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(syntax, 0, budget);
     }
-    if (agent_mode && is_file_tab()) {
+    if (agent_mode && ::buffer__is_file_tab()) {
         int cap = ((groq) ? (2500) : (8000));
-        o += (std::string("\n\n===== Active buffer (truncated) =====\n") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(([&](){ const auto& __nexa_v = L; std::string __nexa_s = "\n"; std::string __nexa_o; for (size_t __nexa_i = 0; __nexa_i < __nexa_v.size(); __nexa_i++) { if (__nexa_i) __nexa_o += __nexa_s; __nexa_o += __nexa_v[__nexa_i]; } return __nexa_o; })(), 0, cap));
+        o += (std::string("\n\n===== Active buffer (truncated) =====\n") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(([&](){ const auto& __nexa_v = ::state__L; std::string __nexa_s = "\n"; std::string __nexa_o; for (size_t __nexa_i = 0; __nexa_i < __nexa_v.size(); __nexa_i++) { if (__nexa_i) __nexa_o += __nexa_s; __nexa_o += __nexa_v[__nexa_i]; } return __nexa_o; })(), 0, cap));
     }
     return o;
 }
 
-const std::string OPENAI_TOOLS = "[{\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"description\":\"Read a file. Optional 1-based offset and limit in lines.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"path\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"description\":\"Create or overwrite a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"edit_file\",\"description\":\"Replace one unique old_string with new_string.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old_string\":{\"type\":\"string\"},\"new_string\":{\"type\":\"string\"}},\"required\":[\"path\",\"old_string\",\"new_string\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"list_dir\",\"description\":\"List a directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}}},\n{\"type\":\"function\",\"function\":{\"name\":\"search_workspace\",\"description\":\"Search workspace files for a string. Optional glob like *.nxa.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"}},\"required\":[\"query\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"glob_files\",\"description\":\"Find files by glob (*.nxa, **/*.cpp).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"}},\"required\":[\"pattern\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"delete_file\",\"description\":\"Delete a file or folder.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"rename_file\",\"description\":\"Rename or move a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"from\":{\"type\":\"string\"},\"to\":{\"type\":\"string\"}},\"required\":[\"from\",\"to\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"run_command\",\"description\":\"Run a Windows cmd.exe command. Captures stdout/stderr and exit code. Use for git, builds, tests, installs, dir, powershell -Command, anything the user could type in a terminal. cwd defaults to the open folder. timeout_ms defaults to 60000.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"cwd\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}},\"required\":[\"command\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"run_nexa\",\"description\":\"Build the Nexa project (or one file) with NexaC, and run it if run is true. Returns the output.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"file\":{\"type\":\"string\"},\"run\":{\"type\":\"boolean\"}}}}},\n{\"type\":\"function\",\"function\":{\"name\":\"workspace_info\",\"description\":\"Open tabs, folder, selection.\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]";
+const std::string agent__OPENAI_TOOLS = "[{\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"description\":\"Read a file. Optional 1-based offset and limit in lines.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"path\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"description\":\"Create or overwrite a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"edit_file\",\"description\":\"Replace one unique old_string with new_string.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old_string\":{\"type\":\"string\"},\"new_string\":{\"type\":\"string\"}},\"required\":[\"path\",\"old_string\",\"new_string\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"list_dir\",\"description\":\"List a directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}}},\n{\"type\":\"function\",\"function\":{\"name\":\"search_workspace\",\"description\":\"Search workspace files for a string. Optional glob like *.nxa.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"}},\"required\":[\"query\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"glob_files\",\"description\":\"Find files by glob (*.nxa, **/*.cpp).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"}},\"required\":[\"pattern\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"delete_file\",\"description\":\"Delete a file or folder.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"rename_file\",\"description\":\"Rename or move a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"from\":{\"type\":\"string\"},\"to\":{\"type\":\"string\"}},\"required\":[\"from\",\"to\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"run_command\",\"description\":\"Run a Windows cmd.exe command. Captures stdout/stderr and exit code. Use for git, builds, tests, installs, dir, powershell -Command, anything the user could type in a terminal. cwd defaults to the open folder. timeout_ms defaults to 60000.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"cwd\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}},\"required\":[\"command\"]}}},\n{\"type\":\"function\",\"function\":{\"name\":\"run_nexa\",\"description\":\"Build the Nexa project (or one file) with NexaC, and run it if run is true. Returns the output.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"file\":{\"type\":\"string\"},\"run\":{\"type\":\"boolean\"}}}}},\n{\"type\":\"function\",\"function\":{\"name\":\"workspace_info\",\"description\":\"Open tabs, folder, selection.\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]";
 
-static __nexa_json anthropic_tools() {
-    __nexa_json src = __nexa_json_parse(OPENAI_TOOLS);
+static __nexa_json agent__anthropic_tools() {
+    __nexa_json src = __nexa_json_parse(::agent__OPENAI_TOOLS);
     __nexa_json out = __nexa_json::arr();
     for (int i = 0; i < src.len(); i++) {
         __nexa_json f = src.get_at(i).get("function");
@@ -10748,30 +11309,30 @@ static __nexa_json anthropic_tools() {
     return out;
 }
 
-static void ag_request() {
-    ag_hops = ag_hops + 1;
-    ag_state = AG_WAIT;
-    ag_status = "Thinking";
-    std::string system = agent_system();
-    bool use_tools = (ag_mode == "agent");
+static void agent__ag_request() {
+    ::state__ag_hops = ::state__ag_hops + 1;
+    ::state__ag_state = ::agent__AG_WAIT;
+    ::state__ag_status = "Thinking";
+    std::string system_ = ::agent__agent_system();
+    bool use_tools = (::state__ag_mode == "agent");
     __nexa_json body = __nexa_json::obj();
-    body.set("model", __nexa_json::str(ag_model()));
-    body.set("temperature", __nexa_json::number(ag_temp));
+    body.set("model", __nexa_json::str(::agent__ag_model()));
+    body.set("temperature", __nexa_json::number(::state__ag_temp));
     std::string headers = "Content-Type: application/json";
     std::string url = "";
-    if (ag_provider == "anthropic") {
+    if (::state__ag_provider == "anthropic") {
         body.set("max_tokens", __nexa_json::number(static_cast<double>(8192)));
-        body.set("system", __nexa_json::str(system));
+        body.set("system", __nexa_json::str(system_));
         __nexa_json msgs = __nexa_json::arr();
-        for (int i = 0; i < (int)((ag_role).size()); i++) {
-            std::string role = ag_role[i];
-            std::string content = ag_content[i];
-            std::string tname = ag_tool_name[i];
+        for (int i = 0; i < (int)((::state__ag_role).size()); i++) {
+            std::string role = __nexa_text(::state__ag_role[i]);
+            std::string content = __nexa_text(::state__ag_content[i]);
+            std::string tname = __nexa_text(::state__ag_tool_name[i]);
             __nexa_json m = __nexa_json::obj();
             if (role == "tool") {
                 __nexa_json block = __nexa_json::obj();
                 block.set("type", __nexa_json::str("tool_result"));
-                block.set("tool_use_id", __nexa_json::str(ag_tool_id[i]));
+                block.set("tool_use_id", __nexa_json::str(::state__ag_tool_id[i]));
                 block.set("content", __nexa_json::str(content));
                 __nexa_json blocks = __nexa_json::arr();
                 blocks.push(block);
@@ -10787,9 +11348,9 @@ static void ag_request() {
                 }
                 __nexa_json use = __nexa_json::obj();
                 use.set("type", __nexa_json::str("tool_use"));
-                use.set("id", __nexa_json::str(ag_tool_id[i]));
+                use.set("id", __nexa_json::str(::state__ag_tool_id[i]));
                 use.set("name", __nexa_json::str(tname));
-                std::string args = ag_tool_args[i];
+                std::string args = __nexa_text(::state__ag_tool_args[i]);
                 __nexa_json input = __nexa_json_parse((((int)((args).size()) > 0) ? (args) : (std::string("{}"))));
                 if (!(input.ok()) || !(input.is_object())) {
                     input = __nexa_json::obj();
@@ -10808,25 +11369,25 @@ static void ag_request() {
         }
         body.set("messages", msgs);
         if (use_tools) {
-            body.set("tools", anthropic_tools());
+            body.set("tools", ::agent__anthropic_tools());
         }
-        headers += (std::string("\nx-api-key: ") + ag_key() + "\nanthropic-version: 2023-06-01");
-        url = join_url(ag_url(), "/v1/messages");
+        headers += (std::string("\nx-api-key: ") + ::agent__ag_key() + "\nanthropic-version: 2023-06-01");
+        url = ::agent__join_url(::agent__ag_url(), "/v1/messages");
     } else {
-        body.set("max_tokens", __nexa_json::number(static_cast<double>(((ag_provider == "groq") ? (1000) : (4096)))));
+        body.set("max_tokens", __nexa_json::number(static_cast<double>(((::state__ag_provider == "groq") ? (1000) : (4096)))));
         __nexa_json msgs = __nexa_json::arr();
         __nexa_json sys = __nexa_json::obj();
         sys.set("role", __nexa_json::str("system"));
-        sys.set("content", __nexa_json::str(system));
+        sys.set("content", __nexa_json::str(system_));
         msgs.push(sys);
-        for (int i = 0; i < (int)((ag_role).size()); i++) {
-            std::string role = ag_role[i];
-            std::string content = ag_content[i];
-            std::string tname = ag_tool_name[i];
+        for (int i = 0; i < (int)((::state__ag_role).size()); i++) {
+            std::string role = __nexa_text(::state__ag_role[i]);
+            std::string content = __nexa_text(::state__ag_content[i]);
+            std::string tname = __nexa_text(::state__ag_tool_name[i]);
             __nexa_json m = __nexa_json::obj();
             if (role == "tool") {
                 m.set("role", __nexa_json::str("tool"));
-                m.set("tool_call_id", __nexa_json::str(ag_tool_id[i]));
+                m.set("tool_call_id", __nexa_json::str(::state__ag_tool_id[i]));
                 m.set("content", __nexa_json::str(content));
             } else if (role == "assistant" && (int)((tname).size()) > 0) {
                 m.set("role", __nexa_json::str("assistant"));
@@ -10837,9 +11398,9 @@ static void ag_request() {
                 }
                 __nexa_json fnc = __nexa_json::obj();
                 fnc.set("name", __nexa_json::str(tname));
-                fnc.set("arguments", __nexa_json::str(ag_tool_args[i]));
+                fnc.set("arguments", __nexa_json::str(::state__ag_tool_args[i]));
                 __nexa_json call = __nexa_json::obj();
-                call.set("id", __nexa_json::str(ag_tool_id[i]));
+                call.set("id", __nexa_json::str(::state__ag_tool_id[i]));
                 call.set("type", __nexa_json::str("function"));
                 call.set("function", fnc);
                 __nexa_json calls = __nexa_json::arr();
@@ -10855,39 +11416,39 @@ static void ag_request() {
         }
         body.set("messages", msgs);
         if (use_tools) {
-            body.set("tools", __nexa_json_parse(OPENAI_TOOLS));
+            body.set("tools", __nexa_json_parse(::agent__OPENAI_TOOLS));
         }
-        if ((int)((ag_key()).size()) > 0) {
-            headers += (std::string("\nAuthorization: Bearer ") + ag_key());
+        if ((int)((::agent__ag_key()).size()) > 0) {
+            headers += (std::string("\nAuthorization: Bearer ") + ::agent__ag_key());
         }
-        if (ag_provider == "openrouter") {
+        if (::state__ag_provider == "openrouter") {
             headers += "\nHTTP-Referer: https://nexium.local\nX-Title: Nexium";
         }
-        url = join_url(ag_url(), "/chat/completions");
+        url = ::agent__join_url(::agent__ag_url(), "/chat/completions");
     }
-    ag_http = nx_http_start("POST", url.c_str(), headers.c_str(), (body).stringify().c_str());
+    ::state__ag_http = nx_http_start("POST", url.c_str(), headers.c_str(), (body).stringify().c_str());
 }
 
-static void ag_fail(std::string msg) {
-    ag_error = msg;
-    ag_state = AG_IDLE;
-    ag_status = "";
-    frame_dirty = true;
+static void agent__ag_fail(std::string msg) {
+    ::state__ag_error = msg;
+    ::state__ag_state = ::agent__AG_IDLE;
+    ::state__ag_status = "";
+    ::state__frame_dirty = true;
 }
 
-static void ag_response() {
-    int status = nx_http_status(ag_http);
-    std::string body = nx_http_body(ag_http);
-    std::string err = nx_http_error(ag_http);
-    nx_http_free(ag_http);
-    ag_http = -1;
+static void agent__ag_response() {
+    int status = nx_http_status(::state__ag_http);
+    std::string body = __nexa_text(nx_http_body(::state__ag_http));
+    std::string err = __nexa_text(nx_http_error(::state__ag_http));
+    nx_http_free(::state__ag_http);
+    ::state__ag_http = -1;
     if ((int)((err).size()) > 0) {
-        ag_fail(err);
+        ::agent__ag_fail(err);
         return;
     }
     __nexa_json j = __nexa_json_parse(body);
     if (!(j.ok()) || !(j.is_object())) {
-        ag_fail((std::string("Unexpected response (") + std::to_string(status) + "): " + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(body, 0, 400)));
+        ::agent__ag_fail((std::string("Unexpected response (") + std::to_string(status) + "): " + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(body, 0, 400)));
         return;
     }
     if (j.has("error")) {
@@ -10899,13 +11460,13 @@ static void ag_response() {
         if (e.is_string()) {
             msg = e.as_string();
         }
-        ag_fail(msg);
+        ::agent__ag_fail(msg);
         return;
     }
     int calls = 0;
-    if (ag_provider == "anthropic") {
+    if (::state__ag_provider == "anthropic") {
         if (!(j.has("content"))) {
-            ag_fail((std::string("No content in response (") + std::to_string(status) + ")"));
+            ::agent__ag_fail((std::string("No content in response (") + std::to_string(status) + ")"));
             return;
         }
         __nexa_json content = j.get("content");
@@ -10917,18 +11478,18 @@ static void ag_response() {
                 text += b.get("text").as_string();
             }
             if (kind == "tool_use") {
-                ag_push("assistant", text, b.get("id").as_string(), b.get("name").as_string(), (b.get("input")).stringify());
-                ag_pending.push_back(((int)((ag_role).size()) - 1));
+                ::agent__ag_push("assistant", text, b.get("id").as_string(), b.get("name").as_string(), (b.get("input")).stringify());
+                ::state__ag_pending.push_back(((int)((::state__ag_role).size()) - 1));
                 text = "";
                 calls = calls + 1;
             }
         }
         if (calls == 0) {
-            ag_push("assistant", text, "", "", "");
+            ::agent__ag_push("assistant", text, "", "", "");
         }
     } else {
         if (!(j.has("choices")) || j.get("choices").len() == 0) {
-            ag_fail((std::string("No choices in response (") + std::to_string(status) + "): " + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(body, 0, 300)));
+            ::agent__ag_fail((std::string("No choices in response (") + std::to_string(status) + "): " + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(body, 0, 300)));
             return;
         }
         __nexa_json msg = j.get("choices").get_at(0).get("message");
@@ -10946,44 +11507,44 @@ static void ag_response() {
                     __nexa_json a = f.get("arguments");
                     args = ((a.is_string()) ? (a.as_string()) : ((a).stringify()));
                 }
-                ag_push("assistant", ((i == 0) ? (text) : (std::string(""))), c.get("id").as_string(), f.get("name").as_string(), args);
-                ag_pending.push_back(((int)((ag_role).size()) - 1));
+                ::agent__ag_push("assistant", ((i == 0) ? (text) : (std::string(""))), c.get("id").as_string(), f.get("name").as_string(), args);
+                ::state__ag_pending.push_back(((int)((::state__ag_role).size()) - 1));
                 calls = calls + 1;
             }
         }
         if (calls == 0) {
-            ag_push("assistant", text, "", "", "");
+            ::agent__ag_push("assistant", text, "", "", "");
         }
     }
     if (calls > 0) {
-        ag_state = AG_TOOLS;
+        ::state__ag_state = ::agent__AG_TOOLS;
     } else {
-        ag_state = AG_IDLE;
-        ag_status = "";
+        ::state__ag_state = ::agent__AG_IDLE;
+        ::state__ag_status = "";
     }
 }
 
-static void agent_poll() {
-    if (ag_state == AG_WAIT && ag_http >= 0 && nx_http_done(ag_http) == 1) {
-        ag_response();
-        frame_dirty = true;
+static void agent__agent_poll() {
+    if (::state__ag_state == ::agent__AG_WAIT && ::state__ag_http >= 0 && nx_http_done(::state__ag_http) == 1) {
+        ::agent__ag_response();
+        ::state__frame_dirty = true;
     }
-    if (ag_state == AG_PROC) {
-        std::string more = nx_proc_read(ag_proc);
-        ag_proc_out += more;
+    if (::state__ag_state == ::agent__AG_PROC) {
+        std::string more = __nexa_text(nx_proc_read(::state__ag_proc));
+        ::state__ag_proc_out += more;
         if ((int)((more).size()) > 0) {
-            feed_lines(1, more);
+            ::panel__feed_lines(1, more);
         }
-        bool finished = (nx_proc_running(ag_proc) == 0);
-        bool timed_out = ((now_ms - ag_proc_start) > ag_proc_timeout);
+        bool finished = (nx_proc_running(::state__ag_proc) == 0);
+        bool timed_out = ((::state__now_ms - ::state__ag_proc_start) > ::state__ag_proc_timeout);
         if (finished || timed_out) {
-            int code = nx_proc_exit_code(ag_proc);
+            int code = nx_proc_exit_code(::state__ag_proc);
             if (timed_out && !(finished)) {
-                nx_proc_kill(ag_proc);
+                nx_proc_kill(::state__ag_proc);
             }
-            nx_proc_free(ag_proc);
-            ag_proc = -1;
-            std::string out = strip_ansi(ag_proc_out);
+            nx_proc_free(::state__ag_proc);
+            ::state__ag_proc = -1;
+            std::string out = ::nxtext__strip_ansi(::state__ag_proc_out);
             if ((int)((out).size()) > 80000) {
                 out = (std::string("... [truncated]\n") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(out, ((int)((out).size()) - 80000), -1));
             }
@@ -10991,52 +11552,52 @@ static void agent_poll() {
             if (timed_out && !(finished)) {
                 res += " (timed out)";
             }
-            res += (std::string("\ncwd: ") + ag_proc_cwd + "\n" + (((int)((out).size()) == 0) ? (std::string("(no output)")) : (out)));
-            if ((int)((out_partial).size()) > 0) {
-                out_lines.push_back(out_partial);
-                out_partial = "";
+            res += (std::string("\ncwd: ") + ::state__ag_proc_cwd + "\n" + (((int)((out).size()) == 0) ? (std::string("(no output)")) : (out)));
+            if ((int)((::state__out_partial).size()) > 0) {
+                ::state__out_lines.push_back(::state__out_partial);
+                ::state__out_partial = "";
             }
-            log_out((std::string("[exit ") + std::to_string(code) + "]"));
-            ag_tool_result(res);
-            ag_state = AG_TOOLS;
+            ::panel__log_out((std::string("[exit ") + std::to_string(code) + "]"));
+            ::agent__ag_tool_result(res);
+            ::state__ag_state = ::agent__AG_TOOLS;
         }
-        frame_dirty = true;
+        ::state__frame_dirty = true;
     }
-    while (ag_state == AG_TOOLS) {
-        if ((int)((ag_pending).size()) == 0) {
-            if (ag_hops >= 24) {
-                ag_fail("Stopped after 24 rounds of tool calls.");
+    while (::state__ag_state == ::agent__AG_TOOLS) {
+        if ((int)((::state__ag_pending).size()) == 0) {
+            if (::state__ag_hops >= 24) {
+                ::agent__ag_fail("Stopped after 24 rounds of tool calls.");
                 return;
             }
-            ag_request();
+            ::agent__ag_request();
             return;
         }
-        int i = ag_pending[0];
-        ([&](){ auto& __nexa_v = ag_pending; int __nexa_i = 0; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
-        ag_tool_idx = i;
-        std::string name = ag_tool_name[i];
-        ag_status = (std::string("Running ") + name);
-        __nexa_json args = __nexa_json_parse(ag_tool_args[i]);
+        int i = ::state__ag_pending[0];
+        ([&](){ auto& __nexa_v = ::state__ag_pending; int __nexa_i = 0; __nexa_v.erase(__nexa_v.begin() + __nexa_i); })();
+        ::state__ag_tool_idx = i;
+        std::string name = ::state__ag_tool_name[i];
+        ::state__ag_status = (std::string("Running ") + name);
+        __nexa_json args = __nexa_json_parse(::state__ag_tool_args[i]);
         if (!(args.ok()) || !(args.is_object())) {
             args = __nexa_json::obj();
         }
         if (name == "run_command" || name == "run_nexa") {
-            if (tool_start_command(name, args)) {
-                ag_state = AG_PROC;
+            if (::agent__tool_start_command(name, args)) {
+                ::state__ag_state = ::agent__AG_PROC;
                 return;
             }
             continue;
         }
-        ag_tool_result(run_tool(name, args));
+        ::agent__ag_tool_result(::agent__run_tool(name, args));
     }
 }
 
-static void ag_tool_result(std::string res) {
-    int i = ag_tool_idx;
-    ag_push("tool", res, ag_tool_id[i], ag_tool_name[i], "");
+static void agent__ag_tool_result(std::string res) {
+    int i = ::state__ag_tool_idx;
+    ::agent__ag_push("tool", res, ::state__ag_tool_id[i], ::state__ag_tool_name[i], "");
 }
 
-static std::string jstr(const __nexa_json& a, const std::string& key) {
+static std::string agent__jstr(const __nexa_json& a, const std::string& key) {
     if (!(a.has(key))) {
         return "";
     }
@@ -11050,7 +11611,7 @@ static std::string jstr(const __nexa_json& a, const std::string& key) {
     return "";
 }
 
-static int jint(const __nexa_json& a, const std::string& key, int dflt) {
+static int agent__jint(const __nexa_json& a, const std::string& key, int dflt) {
     if (!(a.has(key))) {
         return dflt;
     }
@@ -11064,7 +11625,7 @@ static int jint(const __nexa_json& a, const std::string& key, int dflt) {
     return dflt;
 }
 
-static std::string resolve_path(const std::string& p) {
+static std::string agent__resolve_path(const std::string& p) {
     std::string q = ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(p, "/", "\\");
     if ((int)((q).size()) >= 2 && q[1] == ':') {
         return q;
@@ -11072,52 +11633,52 @@ static std::string resolve_path(const std::string& p) {
     if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(q, "\\")) {
         return q;
     }
-    if ((int)((folder).size()) > 0) {
-        return path_join(folder, q);
+    if ((int)((::state__folder).size()) > 0) {
+        return ::workspace__path_join(::state__folder, q);
     }
     return q;
 }
 
-static std::string file_text(const std::string& p) {
-    int bi = find_buf(p);
+static std::string agent__file_text(const std::string& p) {
+    int bi = ::buffer__find_buf(p);
     if (bi >= 0) {
-        if (bi == active) {
-            return ([&](){ const auto& __nexa_v = L; std::string __nexa_s = "\n"; std::string __nexa_o; for (size_t __nexa_i = 0; __nexa_i < __nexa_v.size(); __nexa_i++) { if (__nexa_i) __nexa_o += __nexa_s; __nexa_o += __nexa_v[__nexa_i]; } return __nexa_o; })();
+        if (bi == ::state__active) {
+            return ([&](){ const auto& __nexa_v = ::state__L; std::string __nexa_s = "\n"; std::string __nexa_o; for (size_t __nexa_i = 0; __nexa_i < __nexa_v.size(); __nexa_i++) { if (__nexa_i) __nexa_o += __nexa_s; __nexa_o += __nexa_v[__nexa_i]; } return __nexa_o; })();
         }
-        std::vector<std::string> lines = bufs[bi].lines;
+        std::vector<std::string> lines = ::state__bufs[bi].lines;
         return ([&](){ const auto& __nexa_v = lines; std::string __nexa_s = "\n"; std::string __nexa_o; for (size_t __nexa_i = 0; __nexa_i < __nexa_v.size(); __nexa_i++) { if (__nexa_i) __nexa_o += __nexa_s; __nexa_o += __nexa_v[__nexa_i]; } return __nexa_o; })();
     }
     std::string t = __nexa_file_read((p).c_str());
     return ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(t, "\r\n", "\n");
 }
 
-static void apply_to_buffer(std::string p, std::string text) {
-    int bi = find_buf(p);
+static void agent__apply_to_buffer(std::string p, std::string text) {
+    int bi = ::buffer__find_buf(p);
     if (bi < 0) {
         return;
     }
-    int keep = active;
-    switch_to(bi);
-    begin_edit("agent");
-    L = split_lines(text);
-    clamp_cursor();
-    end_edit(0);
-    doc_saved = doc_ver;
-    bufs[active].mtime = nx_mtime(p.c_str());
-    doc_store();
-    switch_to(keep);
+    int keep = ::state__active;
+    ::buffer__switch_to(bi);
+    ::buffer__begin_edit("agent");
+    ::state__L = ::nxtext__split_lines(text);
+    ::buffer__clamp_cursor();
+    ::buffer__end_edit(0);
+    ::state__doc_saved = ::state__doc_ver;
+    ::state__bufs[::state__active].mtime = nx_mtime(p.c_str());
+    ::buffer__doc_store();
+    ::buffer__switch_to(keep);
 }
 
-static bool write_text(std::string p, std::string text) {
+static bool agent__write_text(std::string p, std::string text) {
     std::string dir = __nexa_file_dirname((p).c_str());
     if ((int)((dir).size()) > 0 && !(__nexa_file_isdir((dir).c_str()))) {
         (void)__nexa_file_mkdir((dir).c_str());
     }
     std::string out = text;
-    int bi = find_buf(p);
+    int bi = ::buffer__find_buf(p);
     bool crlf = false;
     if (bi >= 0) {
-        crlf = bufs[bi].crlf;
+        crlf = ::state__bufs[bi].crlf;
     } else if (__nexa_file_isfile((p).c_str())) {
         std::string old = __nexa_file_read((p).c_str());
         crlf = ([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(old, "\r\n");
@@ -11128,18 +11689,18 @@ static bool write_text(std::string p, std::string text) {
     if (!(([&](const std::string& __nexa_fc) -> int { return __nexa_file_write((p).c_str(), __nexa_fc.data(), __nexa_fc.size(), 0); })(out))) {
         return false;
     }
-    apply_to_buffer(p, text);
+    ::agent__apply_to_buffer(p, text);
     return true;
 }
 
-static std::string tool_read(const __nexa_json& a) {
-    std::string p = resolve_path(jstr(a, "path"));
-    if (!(__nexa_file_isfile((p).c_str())) && find_buf(p) < 0) {
+static std::string agent__tool_read(const __nexa_json& a) {
+    std::string p = ::agent__resolve_path(::agent__jstr(a, "path"));
+    if (!(__nexa_file_isfile((p).c_str())) && ::buffer__find_buf(p) < 0) {
         return (std::string("ERROR: file not found: ") + p);
     }
-    std::string text = file_text(p);
-    int off = jint(a, "offset", 0);
-    int lim = jint(a, "limit", 0);
+    std::string text = ::agent__file_text(p);
+    int off = ::agent__jint(a, "offset", 0);
+    int lim = ::agent__jint(a, "limit", 0);
     if (off > 0 || lim > 0) {
         if (off < 1) {
             off = 1;
@@ -11165,27 +11726,27 @@ static std::string tool_read(const __nexa_json& a) {
     return text;
 }
 
-static std::string tool_write(__nexa_json a) {
-    std::string p = resolve_path(jstr(a, "path"));
-    std::string content = jstr(a, "content");
-    if (!(write_text(p, content))) {
+static std::string agent__tool_write(__nexa_json a) {
+    std::string p = ::agent__resolve_path(::agent__jstr(a, "path"));
+    std::string content = ::agent__jstr(a, "content");
+    if (!(::agent__write_text(p, content))) {
         return (std::string("ERROR: could not write ") + p);
     }
-    refresh_tree();
+    ::workspace__refresh_tree();
     return (std::string("Wrote ") + p + " (" + std::to_string((int)((content).size())) + " bytes)");
 }
 
-static std::string tool_edit(__nexa_json a) {
-    std::string p = resolve_path(jstr(a, "path"));
-    std::string olds = jstr(a, "old_string");
-    std::string news = jstr(a, "new_string");
+static std::string agent__tool_edit(__nexa_json a) {
+    std::string p = ::agent__resolve_path(::agent__jstr(a, "path"));
+    std::string olds = ::agent__jstr(a, "old_string");
+    std::string news = ::agent__jstr(a, "new_string");
     if ((int)((olds).size()) == 0) {
         return "ERROR: old_string is empty";
     }
-    if (!(__nexa_file_isfile((p).c_str())) && find_buf(p) < 0) {
+    if (!(__nexa_file_isfile((p).c_str())) && ::buffer__find_buf(p) < 0) {
         return (std::string("ERROR: file not found: ") + p);
     }
-    std::string text = file_text(p);
+    std::string text = ::agent__file_text(p);
     std::string o = ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(olds, "\r\n", "\n");
     int at = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(text, o);
     if (at < 0) {
@@ -11195,18 +11756,18 @@ static std::string tool_edit(__nexa_json a) {
         return "ERROR: old_string matched more than once; make it unique";
     }
     std::string t = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(text, 0, at) + ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(news, "\r\n", "\n") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(text, (at + (int)((o).size())), -1));
-    if (!(write_text(p, t))) {
+    if (!(::agent__write_text(p, t))) {
         return (std::string("ERROR: could not write ") + p);
     }
     return (std::string("Edited ") + p);
 }
 
-static std::string tool_list(const __nexa_json& a) {
-    std::string p = jstr(a, "path");
+static std::string agent__tool_list(const __nexa_json& a) {
+    std::string p = ::agent__jstr(a, "path");
     if ((int)((p).size()) == 0) {
-        p = folder;
+        p = ::state__folder;
     }
-    p = resolve_path(p);
+    p = ::agent__resolve_path(p);
     if (!(__nexa_file_isdir((p).c_str()))) {
         return (std::string("ERROR: not a directory: ") + p);
     }
@@ -11218,13 +11779,13 @@ static std::string tool_list(const __nexa_json& a) {
             if (nm == "." || nm == "..") {
                 continue;
             }
-            o += (((__nexa_file_isdir((path_join(p, nm)).c_str())) ? (std::string("dir  ")) : (std::string("file "))) + nm + "\n");
+            o += (((__nexa_file_isdir((::workspace__path_join(p, nm)).c_str())) ? (std::string("dir  ")) : (std::string("file "))) + nm + "\n");
         }
     }
     return (((int)((o).size()) == 0) ? (std::string("(empty)")) : (o));
 }
 
-static bool glob_at(const std::string& p, int pi, const std::string& s, int si) {
+static bool agent__glob_at(const std::string& p, int pi, const std::string& s, int si) {
     int i = pi;
     int j = si;
     while (i < (int)((p).size())) {
@@ -11238,7 +11799,7 @@ static bool glob_at(const std::string& p, int pi, const std::string& s, int si) 
             }
             int t = j;
             while (t <= (int)((s).size())) {
-                if (glob_at(p, i, s, t)) {
+                if (::agent__glob_at(p, i, s, t)) {
                     return true;
                 }
                 t = t + 1;
@@ -11249,7 +11810,7 @@ static bool glob_at(const std::string& p, int pi, const std::string& s, int si) 
             i = i + 1;
             int t = j;
             while (t <= (int)((s).size())) {
-                if (glob_at(p, i, s, t)) {
+                if (::agent__glob_at(p, i, s, t)) {
                     return true;
                 }
                 if (t < (int)((s).size()) && (s[t] == '/' || s[t] == '\\')) {
@@ -11279,41 +11840,41 @@ static bool glob_at(const std::string& p, int pi, const std::string& s, int si) 
     return (j == (int)((s).size()));
 }
 
-static bool glob_match(const std::string& pat, const std::string& rel) {
+static bool agent__glob_match(const std::string& pat, const std::string& rel) {
     if ((int)((pat).size()) == 0) {
         return true;
     }
-    return (glob_at(pat, 0, rel, 0) || glob_at(pat, 0, __nexa_file_basename((rel).c_str()), 0));
+    return (::agent__glob_at(pat, 0, rel, 0) || ::agent__glob_at(pat, 0, __nexa_file_basename((rel).c_str()), 0));
 }
 
-static std::string tool_search(__nexa_json a) {
-    std::string q = jstr(a, "query");
+static std::string agent__tool_search(__nexa_json a) {
+    std::string q = ::agent__jstr(a, "query");
     if ((int)((q).size()) == 0) {
         return "ERROR: query required";
     }
-    if ((int)((folder).size()) == 0) {
+    if ((int)((::state__folder).size()) == 0) {
         return "ERROR: no folder open";
     }
-    std::string g = jstr(a, "glob");
-    files_index_ms = 0;
-    ensure_files_index();
+    std::string g = ::agent__jstr(a, "glob");
+    ::state__files_index_ms = 0;
+    ::workspace__ensure_files_index();
     std::string o = "";
     int hits = 0;
     {
-        const std::vector<std::string>& __nexa_forin_1 = files_index;
+        const std::vector<std::string>& __nexa_forin_1 = ::state__files_index;
         for (const std::string& f : __nexa_forin_1) {
-            std::string rel = rel_path(f);
-            if (!(is_text_file(f)) || !(glob_match(g, rel))) {
+            std::string rel = ::workspace__rel_path(f);
+            if (!(::workspace__is_text_file(f)) || !(::agent__glob_match(g, rel))) {
                 continue;
             }
-            std::string text = file_text(f);
+            std::string text = ::agent__file_text(f);
             if (([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(text, 0, 800), std::string("\x00", 1))) {
                 continue;
             }
             std::vector<std::string> lines = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(text, "\n");
             for (int k = 0; k < (int)((lines).size()); k++) {
                 if (([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(lines[k], q)) {
-                    o += (std::string("") + rel + ":" + std::to_string((k + 1)) + ": " + lines[k] + "\n");
+                    o += (std::string("") + rel + ":" + __nexa_text((k + 1)) + ": " + lines[k] + "\n");
                     hits = hits + 1;
                     if (hits >= 200) {
                         return o;
@@ -11325,26 +11886,26 @@ static std::string tool_search(__nexa_json a) {
     return ((hits == 0) ? (std::string("No matches")) : (o));
 }
 
-static std::string tool_glob(__nexa_json a) {
-    std::string pat = jstr(a, "pattern");
+static std::string agent__tool_glob(__nexa_json a) {
+    std::string pat = ::agent__jstr(a, "pattern");
     if ((int)((pat).size()) == 0) {
-        pat = jstr(a, "glob");
+        pat = ::agent__jstr(a, "glob");
     }
     if ((int)((pat).size()) == 0) {
         return "ERROR: pattern required";
     }
-    if ((int)((folder).size()) == 0) {
+    if ((int)((::state__folder).size()) == 0) {
         return "ERROR: no folder open";
     }
-    files_index_ms = 0;
-    ensure_files_index();
+    ::state__files_index_ms = 0;
+    ::workspace__ensure_files_index();
     std::string o = "";
     int n = 0;
     {
-        const std::vector<std::string>& __nexa_forin_1 = files_index;
+        const std::vector<std::string>& __nexa_forin_1 = ::state__files_index;
         for (const std::string& f : __nexa_forin_1) {
-            std::string rel = rel_path(f);
-            if (glob_match(pat, rel)) {
+            std::string rel = ::workspace__rel_path(f);
+            if (::agent__glob_match(pat, rel)) {
                 o += (rel + "\n");
                 n = n + 1;
                 if (n >= 500) {
@@ -11356,43 +11917,43 @@ static std::string tool_glob(__nexa_json a) {
     return ((n == 0) ? (std::string("No files matched")) : (o));
 }
 
-static std::string tool_delete(__nexa_json a) {
-    std::string p = resolve_path(jstr(a, "path"));
+static std::string agent__tool_delete(__nexa_json a) {
+    std::string p = ::agent__resolve_path(::agent__jstr(a, "path"));
     if (!(__nexa_file_exists((p).c_str()))) {
         return (std::string("ERROR: not found: ") + p);
     }
-    int i = ((int)((bufs).size()) - 1);
+    int i = ((int)((::state__bufs).size()) - 1);
     while (i >= 0) {
-        std::string bp = bufs[i].path;
+        std::string bp = ::state__bufs[i].path;
         if ((int)((bp).size()) > 0 && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(bp), ([](std::string __s){ for (char& __c : __s) __c = (char)std::tolower((unsigned char)__c); return __s; })(p))) {
-            doc_store();
-            bufs[i].ver = bufs[i].saved;
-            if (i == active) {
-                doc_saved = doc_ver;
+            ::buffer__doc_store();
+            ::state__bufs[i].ver = ::state__bufs[i].saved;
+            if (i == ::state__active) {
+                ::state__doc_saved = ::state__doc_ver;
             }
-            close_tab(i);
+            ::buffer__close_tab(i);
         }
         i = i - 1;
     }
     int ok = ((__nexa_file_isdir((p).c_str())) ? (__nexa_file_remove_all((p).c_str())) : (__nexa_file_remove((p).c_str())));
-    refresh_tree();
+    ::workspace__refresh_tree();
     return ((ok) ? ((std::string("Deleted ") + p)) : ((std::string("ERROR: could not delete ") + p)));
 }
 
-static std::string tool_rename(__nexa_json a) {
-    std::string from = jstr(a, "from");
+static std::string agent__tool_rename(__nexa_json a) {
+    std::string from = ::agent__jstr(a, "from");
     if ((int)((from).size()) == 0) {
-        from = jstr(a, "path");
+        from = ::agent__jstr(a, "path");
     }
-    std::string to = jstr(a, "to");
+    std::string to = ::agent__jstr(a, "to");
     if ((int)((to).size()) == 0) {
-        to = jstr(a, "new_path");
+        to = ::agent__jstr(a, "new_path");
     }
     if ((int)((from).size()) == 0 || (int)((to).size()) == 0) {
         return "ERROR: from and to required";
     }
-    from = resolve_path(from);
-    to = resolve_path(to);
+    from = ::agent__resolve_path(from);
+    to = ::agent__resolve_path(to);
     std::string dir = __nexa_file_dirname((to).c_str());
     if ((int)((dir).size()) > 0 && !(__nexa_file_isdir((dir).c_str()))) {
         (void)__nexa_file_mkdir((dir).c_str());
@@ -11400,121 +11961,137 @@ static std::string tool_rename(__nexa_json a) {
     if (!(__nexa_file_rename((from).c_str(), (to).c_str()))) {
         return "ERROR: rename failed";
     }
-    doc_store();
-    for (int i = 0; i < (int)((bufs).size()); i++) {
-        std::string bp = bufs[i].path;
-        if ((int)((bp).size()) > 0 && same_path(bp, from)) {
-            bufs[i].path = to;
-            bufs[i].name = __nexa_file_basename((to).c_str());
+    ::buffer__doc_store();
+    for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+        std::string bp = __nexa_text(::state__bufs[i].path);
+        if ((int)((bp).size()) > 0 && ::buffer__same_path(bp, from)) {
+            ::state__bufs[i].path = to;
+            ::state__bufs[i].name = __nexa_file_basename((to).c_str());
         }
     }
-    int keep = active;
-    active = -1;
-    doc_load(keep);
-    refresh_tree();
+    int keep = ::state__active;
+    ::state__active = -1;
+    ::buffer__doc_load(keep);
+    ::workspace__refresh_tree();
     return (std::string("Renamed ") + from + " -> " + to);
 }
 
-static std::string tool_info() {
-    doc_store();
-    std::string o = (std::string("folder: ") + folder + "\n");
-    if (is_file_tab()) {
-        o += (std::string("active: ") + (((int)((doc_path).size()) > 0) ? (doc_path) : (bufs[active].name)) + "\n");
-        o += (std::string("cursor_line: ") + std::to_string((cy + 1)) + "\n");
-        std::string sel = sel_text();
+static std::string agent__tool_info() {
+    ::buffer__doc_store();
+    std::string o = (std::string("folder: ") + ::state__folder + "\n");
+    if (::buffer__is_file_tab()) {
+        o += (std::string("active: ") + (((int)((::state__doc_path).size()) > 0) ? (::state__doc_path) : (::state__bufs[::state__active].name)) + "\n");
+        o += (std::string("cursor_line: ") + std::to_string((::state__cy + 1)) + "\n");
+        std::string sel = ::buffer__sel_text();
         if ((int)((sel).size()) > 0) {
             o += (std::string("selection:\n") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(sel, 0, 4000) + "\n");
         }
     }
     o += "open_tabs:\n";
-    for (int i = 0; i < (int)((bufs).size()); i++) {
-        if (bufs[i].kind != 0) {
+    for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+        if (::state__bufs[i].kind != 0) {
             continue;
         }
-        std::string p = bufs[i].path;
-        std::string nm = bufs[i].name;
-        o += (std::string("  ") + (((int)((p).size()) > 0) ? (p) : (nm)) + ((buf_dirty(i)) ? (std::string(" *")) : (std::string(""))) + "\n");
+        std::string p = __nexa_text(::state__bufs[i].path);
+        std::string nm = __nexa_text(::state__bufs[i].name);
+        o += (std::string("  ") + (((int)((p).size()) > 0) ? (p) : (nm)) + ((::buffer__buf_dirty(i)) ? (std::string(" *")) : (std::string(""))) + "\n");
     }
     return o;
 }
 
-static std::string run_tool(std::string name, __nexa_json a) {
-    if (name == "read_file") {
-        return tool_read(a);
-    }
-    else if (name == "write_file") {
-        return tool_write(a);
-    }
-    else if (name == "edit_file") {
-        return tool_edit(a);
-    }
-    else if (name == "list_dir") {
-        return tool_list(a);
-    }
-    else if (name == "search_workspace") {
-        return tool_search(a);
-    }
-    else if (name == "glob_files") {
-        return tool_glob(a);
-    }
-    else if (name == "delete_file") {
-        return tool_delete(a);
-    }
-    else if (name == "rename_file") {
-        return tool_rename(a);
-    }
-    else if (name == "workspace_info") {
-        return tool_info();
-    }
-    else {
+static std::string agent__run_tool(std::string name, __nexa_json a) {
+    {
+        const std::string& __nexa_sws_2 = name;
+        int __nexa_swi_3 = -1;
+        if (__nexa_sws_2 == "read_file") __nexa_swi_3 = 1;
+        else if (__nexa_sws_2 == "write_file") __nexa_swi_3 = 2;
+        else if (__nexa_sws_2 == "edit_file") __nexa_swi_3 = 3;
+        else if (__nexa_sws_2 == "list_dir") __nexa_swi_3 = 4;
+        else if (__nexa_sws_2 == "search_workspace") __nexa_swi_3 = 5;
+        else if (__nexa_sws_2 == "glob_files") __nexa_swi_3 = 6;
+        else if (__nexa_sws_2 == "delete_file") __nexa_swi_3 = 7;
+        else if (__nexa_sws_2 == "rename_file") __nexa_swi_3 = 8;
+        else if (__nexa_sws_2 == "workspace_info") __nexa_swi_3 = 9;
+        switch (__nexa_swi_3) {
+        case 1: {
+            return ::agent__tool_read(a);
+        }
+        case 2: {
+            return ::agent__tool_write(a);
+        }
+        case 3: {
+            return ::agent__tool_edit(a);
+        }
+        case 4: {
+            return ::agent__tool_list(a);
+        }
+        case 5: {
+            return ::agent__tool_search(a);
+        }
+        case 6: {
+            return ::agent__tool_glob(a);
+        }
+        case 7: {
+            return ::agent__tool_delete(a);
+        }
+        case 8: {
+            return ::agent__tool_rename(a);
+        }
+        case 9: {
+            return ::agent__tool_info();
+        }
+        default: {
+            break;
+        }
+        }
     }
     return (std::string("ERROR: unknown tool ") + name);
 }
 
-static bool tool_start_command(std::string name, __nexa_json a) {
+static bool agent__tool_start_command(std::string name, __nexa_json a) {
     std::string cmdline = "";
     std::string cwd = "";
     int timeout = 60000;
     if (name == "run_command") {
-        cmdline = jstr(a, "command");
+        cmdline = ::agent__jstr(a, "command");
         if ((int)((cmdline).size()) == 0) {
-            cmdline = jstr(a, "cmd");
+            cmdline = ::agent__jstr(a, "cmd");
         }
-        cwd = jstr(a, "cwd");
+        cwd = ::agent__jstr(a, "cwd");
         if ((int)((cwd).size()) == 0) {
-            cwd = jstr(a, "working_directory");
+            cwd = ::agent__jstr(a, "working_directory");
         }
-        timeout = jint(a, "timeout_ms", 60000);
+        timeout = ::agent__jint(a, "timeout_ms", 60000);
     } else {
-        save_all();
-        std::string c = find_compiler();
+        ::buffer__save_all();
+        std::string c = ::commands__find_compiler();
         if ((int)((c).size()) == 0) {
-            ag_tool_result("ERROR: the Nexa compiler was not found");
+            ::agent__ag_tool_result("ERROR: the Nexa compiler was not found");
             return false;
         }
-        std::string f = jstr(a, "file");
+        std::string f = ::agent__jstr(a, "file");
         bool run = true;
         if (a.has("run") && a.get("run").is_bool()) {
             run = a.get("run").as_bool();
         }
-        std::string dir = project_dir();
+        std::string dir = ::commands__project_dir();
         std::string entry = "";
         if ((int)((f).size()) > 0) {
-            entry = resolve_path(f);
+            entry = ::agent__resolve_path(f);
             dir = __nexa_file_dirname((entry).c_str());
         }
         if ((int)((dir).size()) == 0) {
-            ag_tool_result("ERROR: no project folder");
+            ::agent__ag_tool_result("ERROR: no project folder");
             return false;
         }
-        if ((int)((entry).size()) == 0 && __nexa_file_isfile((path_join(dir, "nexapkg.json")).c_str())) {
+        if ((int)((entry).size()) == 0 && __nexa_file_isfile((::workspace__path_join(dir, "nexapkg.json")).c_str())) {
             cmdline = (std::string("\"") + c + "\" build");
         } else {
             if ((int)((entry).size()) == 0) {
-                entry = entry_file(dir);
+                entry = ::commands__entry_file(dir);
             }
             if ((int)((entry).size()) == 0) {
-                ag_tool_result("ERROR: no .nxa file with fn main() found");
+                ::agent__ag_tool_result("ERROR: no .nxa file with fn main() found");
                 return false;
             }
             std::string exe = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(entry, 0, ((int)((entry).size()) - 4)) + ".exe");
@@ -11527,36 +12104,36 @@ static bool tool_start_command(std::string name, __nexa_json a) {
         timeout = 120000;
     }
     if ((int)((cmdline).size()) == 0) {
-        ag_tool_result("ERROR: command required");
+        ::agent__ag_tool_result("ERROR: command required");
         return false;
     }
     if ((int)((cwd).size()) == 0) {
-        cwd = folder;
+        cwd = ::state__folder;
     } else {
-        cwd = resolve_path(cwd);
+        cwd = ::agent__resolve_path(cwd);
     }
-    if ((int)((cwd).size()) == 0 && is_file_tab() && (int)((doc_path).size()) > 0) {
-        cwd = __nexa_file_dirname((doc_path).c_str());
+    if ((int)((cwd).size()) == 0 && ::buffer__is_file_tab() && (int)((::state__doc_path).size()) > 0) {
+        cwd = __nexa_file_dirname((::state__doc_path).c_str());
     }
     if ((int)((cwd).size()) > 0 && !(__nexa_file_isdir((cwd).c_str()))) {
-        ag_tool_result((std::string("ERROR: cwd not found: ") + cwd));
+        ::agent__ag_tool_result((std::string("ERROR: cwd not found: ") + cwd));
         return false;
     }
-    show_panel_tab(1);
-    log_out((std::string("$ ") + cmdline));
-    ag_proc = nx_proc_start(cmdline.c_str(), cwd.c_str());
-    if (ag_proc < 0) {
-        ag_tool_result("ERROR: could not start the command");
+    ::commands__show_panel_tab(1);
+    ::panel__log_out((std::string("$ ") + cmdline));
+    ::state__ag_proc = nx_proc_start(cmdline.c_str(), cwd.c_str());
+    if (::state__ag_proc < 0) {
+        ::agent__ag_tool_result("ERROR: could not start the command");
         return false;
     }
-    ag_proc_out = "";
-    ag_proc_cwd = cwd;
-    ag_proc_start = now_ms;
-    ag_proc_timeout = clamp(timeout, 1000, 1800000);
+    ::state__ag_proc_out = "";
+    ::state__ag_proc_cwd = cwd;
+    ::state__ag_proc_start = ::state__now_ms;
+    ::state__ag_proc_timeout = ::draw__clamp(timeout, 1000, 1800000);
     return true;
 }
 
-static std::vector<std::string> ag_wrap(const std::string& s, int w, int size) {
+static std::vector<std::string> agent__ag_wrap(const std::string& s, int w, int size) {
     std::vector<std::string> out;
     {
         const std::vector<std::string>& __nexa_forin_3 = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(s, "\n");
@@ -11571,15 +12148,15 @@ static std::vector<std::string> ag_wrap(const std::string& s, int w, int size) {
                 const std::vector<std::string>& __nexa_forin_4 = words;
                 for (const std::string& wd : __nexa_forin_4) {
                     std::string t = (((int)((line_).size()) == 0) ? (wd) : ((line_ + " " + wd)));
-                    if (tw(t, size) > w && (int)((line_).size()) > 0) {
+                    if (::draw__tw(t, size) > w && (int)((line_).size()) > 0) {
                         out.push_back(line_);
                         line_ = wd;
                     } else {
                         line_ = t;
                     }
-                    while (tw(line_, size) > w && (int)((line_).size()) > 1) {
+                    while (::draw__tw(line_, size) > w && (int)((line_).size()) > 1) {
                         int cut = ((int)((line_).size()) - 1);
-                        while (cut > 1 && tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(line_, 0, cut), size) > w) {
+                        while (cut > 1 && ::draw__tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(line_, 0, cut), size) > w) {
                             cut = cut - 1;
                         }
                         out.push_back(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(line_, 0, cut));
@@ -11593,22 +12170,22 @@ static std::vector<std::string> ag_wrap(const std::string& s, int w, int size) {
     return out;
 }
 
-static std::string md_plain(const std::string& s) {
+static std::string agent__md_plain(const std::string& s) {
     return ([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(s, "**", ""), "__", "");
 }
 
-static void ag_layout(int i, int w) {
-    ag_lines.clear();
-    ag_styles.clear();
-    std::string role = ag_role[i];
-    std::string content = ag_content[i];
-    std::string tname = ag_tool_name[i];
+static void agent__ag_layout(int i, int w) {
+    ::state__ag_lines.clear();
+    ::state__ag_styles.clear();
+    std::string role = ::state__ag_role[i];
+    std::string content = ::state__ag_content[i];
+    std::string tname = ::state__ag_tool_name[i];
     if (role == "user") {
         {
-            const std::vector<std::string>& __nexa_forin_2 = ag_wrap(content, (w - px(24)), UI);
+            const std::vector<std::string>& __nexa_forin_2 = ::agent__ag_wrap(content, (w - ::draw__px(24)), ::state__UI);
             for (const std::string& l : __nexa_forin_2) {
-                ag_lines.push_back(l);
-                ag_styles.push_back(3);
+                ::state__ag_lines.push_back(l);
+                ::state__ag_styles.push_back(3);
             }
         }
         return;
@@ -11625,17 +12202,17 @@ static void ag_layout(int i, int w) {
                 std::string t = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(raw);
                 if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "```")) {
                     in_code = (!in_code);
-                    code_lang = fence_lang(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 3, -1));
-                    if (code_lang == L_PLAIN && (int)((t).size()) == 3) {
-                        code_lang = L_NEXA;
+                    code_lang = ::highlight__fence_lang(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 3, -1));
+                    if (code_lang == ::state__L_PLAIN && (int)((t).size()) == 3) {
+                        code_lang = ::state__L_NEXA;
                     }
-                    ag_lines.push_back("");
-                    ag_styles.push_back(((in_code) ? (7) : (8)));
+                    ::state__ag_lines.push_back("");
+                    ::state__ag_styles.push_back(((in_code) ? (7) : (8)));
                     continue;
                 }
                 if (in_code) {
-                    ag_lines.push_back(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(raw, "\t", "    "));
-                    ag_styles.push_back((100 + code_lang));
+                    ::state__ag_lines.push_back(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(raw, "\t", "    "));
+                    ::state__ag_styles.push_back((100 + code_lang));
                     continue;
                 }
                 if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "#")) {
@@ -11644,10 +12221,10 @@ static void ag_layout(int i, int w) {
                         h = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(h, 1, -1);
                     }
                     {
-                        const std::vector<std::string>& __nexa_forin_4 = ag_wrap(md_plain(([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(h)), w, UI);
+                        const std::vector<std::string>& __nexa_forin_4 = ::agent__ag_wrap(::agent__md_plain(([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(h)), w, ::state__UI);
                         for (const std::string& l : __nexa_forin_4) {
-                            ag_lines.push_back(l);
-                            ag_styles.push_back(1);
+                            ::state__ag_lines.push_back(l);
+                            ::state__ag_styles.push_back(1);
                         }
                     }
                     continue;
@@ -11655,45 +12232,45 @@ static void ag_layout(int i, int w) {
                 if (([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "- ") || ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(t, "* ")) {
                     bool first = true;
                     {
-                        const std::vector<std::string>& __nexa_forin_5 = ag_wrap(md_plain(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 2, -1)), (w - px(16)), UI);
+                        const std::vector<std::string>& __nexa_forin_5 = ::agent__ag_wrap(::agent__md_plain(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 2, -1)), (w - ::draw__px(16)), ::state__UI);
                         for (const std::string& l : __nexa_forin_5) {
-                            ag_lines.push_back(l);
-                            ag_styles.push_back(((first) ? (2) : (9)));
+                            ::state__ag_lines.push_back(l);
+                            ::state__ag_styles.push_back(((first) ? (2) : (9)));
                             first = false;
                         }
                     }
                     continue;
                 }
                 {
-                    const std::vector<std::string>& __nexa_forin_6 = ag_wrap(md_plain(raw), w, UI);
+                    const std::vector<std::string>& __nexa_forin_6 = ::agent__ag_wrap(::agent__md_plain(raw), w, ::state__UI);
                     for (const std::string& l : __nexa_forin_6) {
-                        ag_lines.push_back(l);
-                        ag_styles.push_back(0);
+                        ::state__ag_lines.push_back(l);
+                        ::state__ag_styles.push_back(0);
                     }
                 }
             }
         }
     }
     if ((int)((tname).size()) > 0) {
-        ag_lines.push_back(tname);
-        ag_styles.push_back(6);
-        if (ag_open[i]) {
+        ::state__ag_lines.push_back(tname);
+        ::state__ag_styles.push_back(6);
+        if (::state__ag_open[i]) {
             std::string res = "";
-            if ((i + 1) < (int)((ag_role).size()) && ag_role[(i + 1)] == "tool") {
-                res = ag_content[(i + 1)];
+            if ((i + 1) < (int)((::state__ag_role).size()) && ::state__ag_role[(i + 1)] == "tool") {
+                res = ::state__ag_content[(i + 1)];
             }
-            std::string args = ag_tool_args[i];
+            std::string args = ::state__ag_tool_args[i];
             int shown = 0;
             {
                 const std::vector<std::string>& __nexa_forin_7 = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })((std::string("> ") + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(args, 0, 600) + "\n" + res), "\n");
                 for (const std::string& l : __nexa_forin_7) {
                     if (shown >= 40) {
-                        ag_lines.push_back("...");
-                        ag_styles.push_back(104);
+                        ::state__ag_lines.push_back("...");
+                        ::state__ag_styles.push_back(104);
                         break;
                     }
-                    ag_lines.push_back(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(l, "\t", "    "));
-                    ag_styles.push_back(100);
+                    ::state__ag_lines.push_back(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(l, "\t", "    "));
+                    ::state__ag_styles.push_back(100);
                     shown = shown + 1;
                 }
             }
@@ -11701,34 +12278,34 @@ static void ag_layout(int i, int w) {
     }
 }
 
-static int line_h(int style) {
+static int agent__line_h(int style) {
     if (style >= 100) {
-        return LH_MONO;
+        return ::state__LH_MONO;
     }
     if (style == 7 || style == 8) {
-        return px(6);
+        return ::draw__px(6);
     }
     if (style == 1) {
-        return (__nexa_ui_text_height(px(15)) + px(8));
+        return (__nexa_ui_text_height(::draw__px(15)) + ::draw__px(8));
     }
     if (style == 6) {
-        return px(28);
+        return ::draw__px(28);
     }
-    return (__nexa_ui_text_height(UI) + px(5));
+    return (__nexa_ui_text_height(::state__UI) + ::draw__px(5));
 }
 
-static std::string tool_summary(int i) {
-    __nexa_json a = __nexa_json_parse(ag_tool_args[i]);
+static std::string agent__tool_summary(int i) {
+    __nexa_json a = __nexa_json_parse(::state__ag_tool_args[i]);
     if (!(a.ok()) || !(a.is_object())) {
         return "";
     }
     {
         const std::vector<std::string>& __nexa_forin_1 = std::vector<std::string>{"path", "command", "query", "pattern", "from", "file"};
         for (const std::string& k : __nexa_forin_1) {
-            std::string v = jstr(a, k);
+            std::string v = ::agent__jstr(a, k);
             if ((int)((v).size()) > 0) {
                 if (k == "path" || k == "from" || k == "file") {
-                    return rel_path(resolve_path(v));
+                    return ::workspace__rel_path(::agent__resolve_path(v));
                 }
                 return v;
             }
@@ -11737,191 +12314,209 @@ static std::string tool_summary(int i) {
     return "";
 }
 
-static std::string tool_verb(const std::string& name) {
-    if (name == "read_file") {
-        return "Read";
-    }
-    else if (name == "write_file") {
-        return "Wrote";
-    }
-    else if (name == "edit_file") {
-        return "Edited";
-    }
-    else if (name == "list_dir") {
-        return "Listed";
-    }
-    else if (name == "search_workspace") {
-        return "Searched";
-    }
-    else if (name == "glob_files") {
-        return "Found files";
-    }
-    else if (name == "delete_file") {
-        return "Deleted";
-    }
-    else if (name == "rename_file") {
-        return "Renamed";
-    }
-    else if (name == "run_command") {
-        return "Ran";
-    }
-    else if (name == "run_nexa") {
-        return "Built";
-    }
-    else if (name == "workspace_info") {
-        return "Looked at the workspace";
-    }
-    else {
+static std::string agent__tool_verb(const std::string& name) {
+    {
+        const std::string& __nexa_sws_1 = name;
+        int __nexa_swi_2 = -1;
+        if (__nexa_sws_1 == "read_file") __nexa_swi_2 = 1;
+        else if (__nexa_sws_1 == "write_file") __nexa_swi_2 = 2;
+        else if (__nexa_sws_1 == "edit_file") __nexa_swi_2 = 3;
+        else if (__nexa_sws_1 == "list_dir") __nexa_swi_2 = 4;
+        else if (__nexa_sws_1 == "search_workspace") __nexa_swi_2 = 5;
+        else if (__nexa_sws_1 == "glob_files") __nexa_swi_2 = 6;
+        else if (__nexa_sws_1 == "delete_file") __nexa_swi_2 = 7;
+        else if (__nexa_sws_1 == "rename_file") __nexa_swi_2 = 8;
+        else if (__nexa_sws_1 == "run_command") __nexa_swi_2 = 9;
+        else if (__nexa_sws_1 == "run_nexa") __nexa_swi_2 = 10;
+        else if (__nexa_sws_1 == "workspace_info") __nexa_swi_2 = 11;
+        switch (__nexa_swi_2) {
+        case 1: {
+            return "Read";
+        }
+        case 2: {
+            return "Wrote";
+        }
+        case 3: {
+            return "Edited";
+        }
+        case 4: {
+            return "Listed";
+        }
+        case 5: {
+            return "Searched";
+        }
+        case 6: {
+            return "Found files";
+        }
+        case 7: {
+            return "Deleted";
+        }
+        case 8: {
+            return "Renamed";
+        }
+        case 9: {
+            return "Ran";
+        }
+        case 10: {
+            return "Built";
+        }
+        case 11: {
+            return "Looked at the workspace";
+        }
+        default: {
+            break;
+        }
+        }
     }
     return name;
 }
 
-static int agent_x() {
-    return (win_w - agent_w);
+static int agent__agent_x() {
+    return (::state__win_w - ::state__agent_w);
 }
 
-static void draw_agent() {
-    if (!(show_agent)) {
+static void agent__draw_agent() {
+    if (!(::state__show_agent)) {
         return;
     }
-    int x = agent_x();
-    int y = TOOLBAR_H;
-    int w = agent_w;
-    int h = (win_h - STATUS_H - y);
-    fill(x, y, w, h, C_SIDEBAR);
-    vline(x, y, h, C_BORDER);
-    shadow_v((x - px(6)), y, h, false);
-    fill((x + 1), y, (w - 1), HEADER_H, C_SIDEBAR);
-    txt_v((x + px(16)), y, HEADER_H, "AGENT", C_MUTED, UI_SMALL);
-    int bx = (x + w - px(28));
-    if (icon_button(bx, (y + px(8)), "close", "Close (Ctrl+Shift+L)")) {
-        show_agent = false;
+    int x = ::agent__agent_x();
+    int y = ::state__TOOLBAR_H;
+    int w = ::state__agent_w;
+    int h = (::state__win_h - ::state__STATUS_H - y);
+    ::draw__fill(x, y, w, h, ::state__C_SIDEBAR);
+    ::draw__vline(x, y, h, ::state__C_BORDER);
+    ::draw__shadow_v((x - ::draw__px(6)), y, h, false);
+    ::draw__fill((x + 1), y, (w - 1), ::state__HEADER_H, ::state__C_SIDEBAR);
+    ::draw__txt_v((x + ::draw__px(16)), y, ::state__HEADER_H, "AGENT", ::state__C_MUTED, ::state__UI_SMALL);
+    int bx = (x + w - ::draw__px(28));
+    if (::workspace__icon_button(bx, (y + ::draw__px(8)), "close", "Close (Ctrl+Shift+L)")) {
+        ::state__show_agent = false;
     }
-    if (icon_button((bx - px(24)), (y + px(8)), "gear", "Agent Settings")) {
-        open_special(1);
-        page_scroll = px(560);
+    if (::workspace__icon_button((bx - ::draw__px(24)), (y + ::draw__px(8)), "gear", "Agent Settings")) {
+        ::buffer__open_special(1);
+        ::state__page_scroll = ::draw__px(560);
     }
-    if (icon_button((bx - px(48)), (y + px(8)), "plus", "New Chat")) {
-        agent_new_chat();
+    if (::workspace__icon_button((bx - ::draw__px(48)), (y + ::draw__px(8)), "plus", "New Chat")) {
+        ::agent__agent_new_chat();
     }
-    int ry = (y + HEADER_H);
-    int dw = ((w - px(40)) / 3);
+    int ry = (y + ::state__HEADER_H);
+    int dw = ((w - ::draw__px(40)) / 3);
     std::vector<std::string> modes = std::vector<std::string>{"Agent", "Chat"};
-    int mi = ((ag_mode == "chat") ? (1) : (0));
-    std::vector<std::string> providers = provider_ids();
-    int pi = ([&](){ const auto& __nexa_v = providers; const auto& __nexa_x = ag_provider; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
+    int mi = ((::state__ag_mode == "chat") ? (1) : (0));
+    std::vector<std::string> providers = ::agent__provider_ids();
+    int pi = ([&](){ const auto& __nexa_v = providers; const auto& __nexa_x = ::state__ag_provider; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
     std::vector<std::string> plabels;
     {
         const std::vector<std::string>& __nexa_forin_0 = providers;
         for (const std::string& p : __nexa_forin_0) {
-            plabels.push_back(provider_label(p));
+            plabels.push_back(::agent__provider_label(p));
         }
     }
-    std::vector<std::string> models = provider_models(ag_provider);
+    std::vector<std::string> models = ::agent__provider_models(::state__ag_provider);
     std::vector<std::string> mlabels;
     int mcur = 0;
     for (int k = 0; k < (int)((models).size()); k++) {
-        std::string m = models[k];
+        std::string m = __nexa_text(models[k]);
         int bar = ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(m, "|");
         mlabels.push_back(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(m, (bar + 1), -1));
-        if (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(m, 0, bar) == ag_model()) {
+        if (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(m, 0, bar) == ::agent__ag_model()) {
             mcur = k;
         }
     }
-    int msg_top = (ry + px(44));
-    int input_h = ag_input_h(w);
-    int msg_bottom = (y + h - input_h - px(20));
-    draw_agent_messages(x, msg_top, w, (msg_bottom - msg_top));
-    fill((x + 1), ry, (w - 1), px(44), C_SIDEBAR);
-    hline((x + 1), (msg_top - 1), (w - 1), C_BORDER);
-    draw_agent_input(x, msg_bottom, w, (y + h - msg_bottom));
-    int nm = __nexa_ui_dropdown((x + px(12)), (ry + px(6)), dw, modes, mi);
-    int np = __nexa_ui_dropdown((x + px(20) + dw), (ry + px(6)), dw, plabels, pi);
-    int nmod = __nexa_ui_dropdown((x + px(28) + (dw * 2)), (ry + px(6)), dw, mlabels, mcur);
+    int msg_top = (ry + ::draw__px(44));
+    int input_h = ::agent__ag_input_h(w);
+    int msg_bottom = (y + h - input_h - ::draw__px(20));
+    ::agent__draw_agent_messages(x, msg_top, w, (msg_bottom - msg_top));
+    ::draw__fill((x + 1), ry, (w - 1), ::draw__px(44), ::state__C_SIDEBAR);
+    ::draw__hline((x + 1), (msg_top - 1), (w - 1), ::state__C_BORDER);
+    ::agent__draw_agent_input(x, msg_bottom, w, (y + h - msg_bottom));
+    int nm = __nexa_ui_dropdown((x + ::draw__px(12)), (ry + ::draw__px(6)), dw, modes, mi);
+    int np = __nexa_ui_dropdown((x + ::draw__px(20) + dw), (ry + ::draw__px(6)), dw, plabels, pi);
+    int nmod = __nexa_ui_dropdown((x + ::draw__px(28) + (dw * 2)), (ry + ::draw__px(6)), dw, mlabels, mcur);
     if (nm != mi) {
-        ag_mode = ((nm == 1) ? (std::string("chat")) : (std::string("agent")));
-        save_settings();
+        ::state__ag_mode = ((nm == 1) ? (std::string("chat")) : (std::string("agent")));
+        ::app__save_settings();
     }
     if (np != pi && np >= 0) {
-        ag_provider = providers[np];
-        save_settings();
+        ::state__ag_provider = providers[np];
+        ::app__save_settings();
     }
     if (nmod != mcur && nmod >= 0 && nmod < (int)((models).size())) {
         std::string m = models[nmod];
-        ag_models[ag_provider] = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(m, 0, ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(m, "|"));
-        ag_custom[ag_provider] = "";
-        save_settings();
+        ::state__ag_models[::state__ag_provider] = ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(m, 0, ([](const std::string& __s, const std::string& __p){ size_t __n = __s.find(__p); return __n == std::string::npos ? -1 : (int)__n; })(m, "|"));
+        ::state__ag_custom[::state__ag_provider] = "";
+        ::app__save_settings();
     }
-    if (drag == 7 || (hovered((x - px(2)), y, px(5), h) && drag == 0)) {
-        fill((x - 1), y, px(3), h, C_ACCENT);
+    if (::state__drag == 7 || (::draw__hovered((x - ::draw__px(2)), y, ::draw__px(5), h) && ::state__drag == 0)) {
+        ::draw__fill((x - 1), y, ::draw__px(3), h, ::state__C_ACCENT);
     }
 }
 
-static void draw_agent_messages(int x, int y, int w, int h) {
-    int tw_ = (w - px(32));
-    int tx = (x + px(16));
-    int total = px(12);
-    while ((int)((ag_layout_key).size()) < (int)((ag_role).size())) {
-        ag_layout_key.push_back("");
-        ag_layout_h.push_back(0);
+static void agent__draw_agent_messages(int x, int y, int w, int h) {
+    int tw_ = (w - ::draw__px(32));
+    int tx = (x + ::draw__px(16));
+    int total = ::draw__px(12);
+    while ((int)((::state__ag_layout_key).size()) < (int)((::state__ag_role).size())) {
+        ::state__ag_layout_key.push_back("");
+        ::state__ag_layout_h.push_back(0);
     }
-    for (int i = 0; i < (int)((ag_role).size()); i++) {
-        std::string key = (std::string("") + std::to_string(tw_) + "|" + std::to_string((int)((ag_content[i]).size())) + "|" + std::string(ag_open[i] ? "true" : "false") + "|" + std::string(((i + 1) < (int)((ag_role).size())) ? "true" : "false"));
-        if (ag_layout_key[i] != key) {
-            ag_layout(i, tw_);
+    for (int i = 0; i < (int)((::state__ag_role).size()); i++) {
+        std::string key = __nexa_text((std::string("") + std::to_string(tw_) + "|" + __nexa_text((int)((::state__ag_content[i]).size())) + "|" + std::string(::state__ag_open[i] ? "true" : "false") + "|" + std::string(((i + 1) < (int)((::state__ag_role).size())) ? "true" : "false")));
+        if (::state__ag_layout_key[i] != key) {
+            ::agent__ag_layout(i, tw_);
             int hh = 0;
             {
-                const std::vector<int>& __nexa_forin_4 = ag_styles;
+                const std::vector<int>& __nexa_forin_4 = ::state__ag_styles;
                 for (const int& st : __nexa_forin_4) {
-                    hh = hh + line_h(st);
+                    hh = hh + ::agent__line_h(st);
                 }
             }
             if (hh > 0) {
-                hh = hh + px(14);
+                hh = hh + ::draw__px(14);
             }
-            if (ag_role[i] == "user") {
-                hh = hh + px(10);
+            if (::state__ag_role[i] == "user") {
+                hh = hh + ::draw__px(10);
             }
-            ag_layout_key[i] = key;
-            ag_layout_h[i] = hh;
+            ::state__ag_layout_key[i] = key;
+            ::state__ag_layout_h[i] = hh;
         }
-        total = total + ag_layout_h[i];
+        total = total + ::state__ag_layout_h[i];
     }
-    int status_h = ((agent_busy() || (int)((ag_error).size()) > 0 || (int)((ag_status).size()) > 0) ? (px(40)) : (0));
+    int status_h = ((::agent__agent_busy() || (int)((::state__ag_error).size()) > 0 || (int)((::state__ag_status).size()) > 0) ? (::draw__px(40)) : (0));
     total = total + status_h;
-    int max_scroll = imax(0, (total - h));
-    if (ag_follow) {
-        ag_scroll = max_scroll;
+    int max_scroll = ::draw__imax(0, (total - h));
+    if (::state__ag_follow) {
+        ::state__ag_scroll = max_scroll;
     }
-    ag_scroll = clamp(ag_scroll, 0, max_scroll);
-    ag_msg_y = y;
-    ag_msg_h = h;
+    ::state__ag_scroll = ::draw__clamp(::state__ag_scroll, 0, max_scroll);
+    ::state__ag_msg_y = y;
+    ::state__ag_msg_h = h;
     nx_clip((x + 1), y, (x + w), (y + h));
-    if ((int)((ag_role).size()) == 0) {
-        int cy_ = (y + imax(px(20), ((h / 2) - px(110))));
-        draw_logo_c((x + ((w - px(56)) / 2)), cy_, px(56), false, 0x2C2C2C, 0x1F3A52);
-        std::string lines = ((ag_mode == "agent") ? (std::string("Ask about your code, or have the agent read and edit files, search the folder, run commands and build with NexaC.")) : (std::string("Ask about Nexa or your code. Switch to Agent to let it edit files and run commands.")));
-        int py = (cy_ + px(76));
+    if ((int)((::state__ag_role).size()) == 0) {
+        int cy_ = (y + ::draw__imax(::draw__px(20), ((h / 2) - ::draw__px(110))));
+        ::chrome__draw_logo_c((x + ((w - ::draw__px(56)) / 2)), cy_, ::draw__px(56), false, 0x2C2C2C, 0x1F3A52);
+        std::string lines = ((::state__ag_mode == "agent") ? (std::string("Ask about your code, or have the agent read and edit files, search the folder, run commands and build with NexaC.")) : (std::string("Ask about Nexa or your code. Switch to Agent to let it edit files and run commands.")));
+        int py = (cy_ + ::draw__px(76));
         {
-            const std::vector<std::string>& __nexa_forin_5 = ag_wrap(lines, (w - px(60)), UI);
+            const std::vector<std::string>& __nexa_forin_5 = ::agent__ag_wrap(lines, (w - ::draw__px(60)), ::state__UI);
             for (const std::string& l : __nexa_forin_5) {
-                int lw = tw(l, UI);
-                txt((x + ((w - lw) / 2)), py, l, C_MUTED, UI);
-                py = py + (__nexa_ui_text_height(UI) + px(5));
+                int lw = ::draw__tw(l, ::state__UI);
+                ::draw__txt((x + ((w - lw) / 2)), py, l, ::state__C_MUTED, ::state__UI);
+                py = py + (__nexa_ui_text_height(::state__UI) + ::draw__px(5));
             }
         }
-        if ((int)((ag_key()).size()) == 0 && ag_provider != "ollama" && ag_provider != "custom") {
-            py = py + px(10);
+        if ((int)((::agent__ag_key()).size()) == 0 && ::state__ag_provider != "ollama" && ::state__ag_provider != "custom") {
+            py = py + ::draw__px(10);
             std::string lab = "Add an API key in Settings";
-            if (link_button((x + ((w - tw(lab, UI)) / 2)), py, lab)) {
-                open_special(1);
-                page_scroll = px(560);
+            if (::chrome__link_button((x + ((w - ::draw__tw(lab, ::state__UI)) / 2)), py, lab)) {
+                ::buffer__open_special(1);
+                ::state__page_scroll = ::draw__px(560);
             }
         }
     }
-    int yy = (y + px(12) - ag_scroll);
-    for (int i = 0; i < (int)((ag_role).size()); i++) {
-        int hh = ag_layout_h[i];
+    int yy = (y + ::draw__px(12) - ::state__ag_scroll);
+    for (int i = 0; i < (int)((::state__ag_role).size()); i++) {
+        int hh = ::state__ag_layout_h[i];
         if (hh == 0) {
             continue;
         }
@@ -11929,20 +12524,20 @@ static void draw_agent_messages(int x, int y, int w, int h) {
             yy = yy + hh;
             continue;
         }
-        ag_layout(i, tw_);
-        std::string role = ag_role[i];
+        ::agent__ag_layout(i, tw_);
+        std::string role = __nexa_text(::state__ag_role[i]);
         if (role == "user") {
-            rrect((tx - px(4)), yy, (tw_ + px(8)), (hh - px(14)), px(6), 0x2B2D30);
-            yy = yy + px(5);
+            ::draw__rrect((tx - ::draw__px(4)), yy, (tw_ + ::draw__px(8)), (hh - ::draw__px(14)), ::draw__px(6), 0x2B2D30);
+            yy = yy + ::draw__px(5);
         }
         int ly = yy;
         int code_top = -1;
         int code_st = 0;
         std::string code_dl = "";
-        for (int k = 0; k < (int)((ag_lines).size()); k++) {
-            int st = ag_styles[k];
-            std::string s = ag_lines[k];
-            int lh = line_h(st);
+        for (int k = 0; k < (int)((::state__ag_lines).size()); k++) {
+            int st = ::state__ag_styles[k];
+            std::string s = __nexa_text(::state__ag_lines[k]);
+            int lh = ::agent__line_h(st);
             if (st == 7) {
                 code_top = ly;
                 code_st = 0;
@@ -11951,111 +12546,111 @@ static void draw_agent_messages(int x, int y, int w, int h) {
                 if (code_top < 0) {
                     code_top = ly;
                 }
-                fill((tx - px(4)), ly, (tw_ + px(8)), lh, 0x141414);
+                ::draw__fill((tx - ::draw__px(4)), ly, (tw_ + ::draw__px(8)), lh, 0x141414);
                 int lang = (st - 100);
-                std::vector<int> cols = hl_line(lang, s, code_st, code_dl);
-                code_st = hl_out_state;
-                code_dl = hl_out_delim;
-                mono_colored((tx + px(4)), (ly + ((lh - nx_font_h(PANEL_FONT)) / 2)), s, cols, (tw_ - px(8)));
+                std::vector<int> cols = ::highlight__hl_line(lang, s, code_st, code_dl);
+                code_st = ::state__hl_out_state;
+                code_dl = ::state__hl_out_delim;
+                ::agent__mono_colored((tx + ::draw__px(4)), (ly + ((lh - nx_font_h(::state__PANEL_FONT)) / 2)), s, cols, (tw_ - ::draw__px(8)));
             } else if (st == 8) {
                 code_top = -1;
             } else if (st == 1) {
-                __nexa_ui_heading(tx, (ly + px(4)), std::string(s), px(15));
+                __nexa_ui_heading(tx, (ly + ::draw__px(4)), std::string(s), ::draw__px(15));
             } else if (st == 2 || st == 9) {
                 if (st == 2) {
-                    disc((tx + px(4)), (ly + (lh / 2)), px(2), C_TEXT);
+                    ::draw__disc((tx + ::draw__px(4)), (ly + (lh / 2)), ::draw__px(2), ::state__C_TEXT);
                 }
-                txt_inline((tx + px(14)), (ly + px(2)), s);
+                ::agent__txt_inline((tx + ::draw__px(14)), (ly + ::draw__px(2)), s);
             } else if (st == 3) {
-                txt((tx + px(6)), (ly + px(2)), s, C_BRIGHT, UI);
+                ::draw__txt((tx + ::draw__px(6)), (ly + ::draw__px(2)), s, ::state__C_BRIGHT, ::state__UI);
             } else if (st == 6) {
-                bool res_ok = (!((i + 1) < (int)((ag_role).size()) && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(ag_content[(i + 1)], "ERROR")));
-                bool running = ((i + 1) >= (int)((ag_role).size()) || ag_role[(i + 1)] != "tool");
-                rrect((tx - px(4)), (ly + px(2)), (tw_ + px(8)), (lh - px(4)), px(5), 0x252526);
-                int ic = ((running) ? (C_ACCENT) : (((res_ok) ? (C_OK) : (C_ERROR))));
-                disc((tx + px(6)), (ly + (lh / 2)), px(3), ic);
-                std::string verb = tool_verb(s);
-                int vw = txt_v((tx + px(16)), ly, lh, verb, C_TEXT, UI);
-                std::string sum = tool_summary(i);
-                txt_v((tx + px(22) + vw), ly, lh, fit(sum, (tw_ - vw - px(52)), UI), C_MUTED, UI);
-                draw_glyph(((ag_open[i]) ? (std::string("chevdown")) : (std::string("chevright"))), (tx + tw_ - px(18)), (ly + ((lh - px(16)) / 2)), px(16), C_MUTED);
-                if (clicked_in((tx - px(4)), (ly + px(2)), (tw_ + px(8)), (lh - px(4))) && inside(up_x, up_y, x, y, w, h)) {
-                    ag_open[i] = (!ag_open[i]);
-                    ag_follow = false;
+                bool res_ok = (!((i + 1) < (int)((::state__ag_role).size()) && ([](const std::string& __s, const std::string& __p){ return __s.size() >= __p.size() && __s.compare(0, __p.size(), __p) == 0; })(::state__ag_content[(i + 1)], "ERROR")));
+                bool running = ((i + 1) >= (int)((::state__ag_role).size()) || ::state__ag_role[(i + 1)] != "tool");
+                ::draw__rrect((tx - ::draw__px(4)), (ly + ::draw__px(2)), (tw_ + ::draw__px(8)), (lh - ::draw__px(4)), ::draw__px(5), 0x252526);
+                int ic = ((running) ? (::state__C_ACCENT) : (((res_ok) ? (::state__C_OK) : (::state__C_ERROR))));
+                ::draw__disc((tx + ::draw__px(6)), (ly + (lh / 2)), ::draw__px(3), ic);
+                std::string verb = ::agent__tool_verb(s);
+                int vw = ::draw__txt_v((tx + ::draw__px(16)), ly, lh, verb, ::state__C_TEXT, ::state__UI);
+                std::string sum = __nexa_text(::agent__tool_summary(i));
+                ::draw__txt_v((tx + ::draw__px(22) + vw), ly, lh, ::draw__fit(sum, (tw_ - vw - ::draw__px(52)), ::state__UI), ::state__C_MUTED, ::state__UI);
+                ::draw__draw_glyph(((::state__ag_open[i]) ? (std::string("chevdown")) : (std::string("chevright"))), (tx + tw_ - ::draw__px(18)), (ly + ((lh - ::draw__px(16)) / 2)), ::draw__px(16), ::state__C_MUTED);
+                if (::app__clicked_in((tx - ::draw__px(4)), (ly + ::draw__px(2)), (tw_ + ::draw__px(8)), (lh - ::draw__px(4))) && ::draw__inside(::state__up_x, ::state__up_y, x, y, w, h)) {
+                    ::state__ag_open[i] = (!::state__ag_open[i]);
+                    ::state__ag_follow = false;
                 }
             } else if ((int)((s).size()) > 0) {
-                txt_inline(tx, (ly + px(2)), s);
+                ::agent__txt_inline(tx, (ly + ::draw__px(2)), s);
             }
             ly = ly + lh;
         }
-        if (role == "assistant" && (int)((ag_content[i]).size()) > 0 && hovered(x, yy, w, hh) && inside(mx, my, x, y, w, h)) {
-            if (icon_button((x + w - px(34)), (yy - px(4)), "copy", "Copy")) {
-                nx_clip_set(ag_content[i].c_str());
+        if (role == "assistant" && (int)((::state__ag_content[i]).size()) > 0 && ::draw__hovered(x, yy, w, hh) && ::draw__inside(::state__mx, ::state__my, x, y, w, h)) {
+            if (::workspace__icon_button((x + w - ::draw__px(34)), (yy - ::draw__px(4)), "copy", "Copy")) {
+                nx_clip_set(::state__ag_content[i].c_str());
             }
         }
-        yy = yy + (hh - ((role == "user") ? (px(5)) : (0)));
+        yy = yy + (hh - ((role == "user") ? (::draw__px(5)) : (0)));
     }
     if (status_h > 0) {
-        int sy_ = (yy + px(4));
-        if ((int)((ag_error).size()) > 0 && !(agent_busy())) {
+        int sy_ = (yy + ::draw__px(4));
+        if ((int)((::state__ag_error).size()) > 0 && !(::agent__agent_busy())) {
             {
-                const std::vector<std::string>& __nexa_forin_6 = ag_wrap(ag_error, tw_, UI);
+                const std::vector<std::string>& __nexa_forin_6 = ::agent__ag_wrap(::state__ag_error, tw_, ::state__UI);
                 for (const std::string& l : __nexa_forin_6) {
-                    txt(tx, sy_, l, 0xF48771, UI);
-                    sy_ = sy_ + (__nexa_ui_text_height(UI) + px(4));
+                    ::draw__txt(tx, sy_, l, 0xF48771, ::state__UI);
+                    sy_ = sy_ + (__nexa_ui_text_height(::state__UI) + ::draw__px(4));
                 }
             }
-        } else if (agent_busy()) {
-            std::string dots = ([](const std::string& __s, int __n){ std::string __o; for (int __i = 0; __i < __n; __i++) __o += __s; return __o; })(".", static_cast<int>((now_ms / 400 % 4)));
-            txt(tx, sy_, (ag_status + dots), C_MUTED, UI);
+        } else if (::agent__agent_busy()) {
+            std::string dots = ([](const std::string& __s, int __n){ std::string __o; for (int __i = 0; __i < __n; __i++) __o += __s; return __o; })(".", static_cast<int>((::state__now_ms / 400 % 4)));
+            ::draw__txt(tx, sy_, (::state__ag_status + dots), ::state__C_MUTED, ::state__UI);
         } else {
-            txt(tx, sy_, ag_status, C_MUTED, UI);
+            ::draw__txt(tx, sy_, ::state__ag_status, ::state__C_MUTED, ::state__UI);
         }
     }
     nx_clip_off();
     if (total > h) {
-        int th = imax(px(20), (h * h / total));
-        int ty = (y + ((h - th) * ag_scroll / imax(1, max_scroll)));
-        fill_a((x + w - px(8)), ty, px(6), th, 0x797979, 70);
+        int th = ::draw__imax(::draw__px(20), (h * h / total));
+        int ty = (y + ((h - th) * ::state__ag_scroll / ::draw__imax(1, max_scroll)));
+        ::draw__fill_a((x + w - ::draw__px(8)), ty, ::draw__px(6), th, 0x797979, 70);
     }
 }
 
-static std::vector<std::string> ag_input_lines(int w) {
-    std::string t = fld_text[FLD_AGENT];
-    return ag_wrap(t, (w - px(40) - px(64)), UI);
+static std::vector<std::string> agent__ag_input_lines(int w) {
+    std::string t = ::state__fld_text[::state__FLD_AGENT];
+    return ::agent__ag_wrap(t, (w - ::draw__px(40) - ::draw__px(64)), ::state__UI);
 }
 
-static int ag_input_h(int w) {
-    int n = clamp((int)((ag_input_lines(w)).size()), 1, 8);
-    return ((n * (__nexa_ui_text_height(UI) + px(5))) + px(22));
+static int agent__ag_input_h(int w) {
+    int n = ::draw__clamp((int)((::agent__ag_input_lines(w)).size()), 1, 8);
+    return ((n * (__nexa_ui_text_height(::state__UI) + ::draw__px(5))) + ::draw__px(22));
 }
 
-static void draw_agent_input(int x, int y, int w, int h) {
-    fill((x + 1), y, (w - 1), h, C_SIDEBAR);
-    int bx = (x + px(12));
-    int by = (y + px(6));
-    int bw = (w - px(24));
-    int bh = (h - px(16));
-    ag_in_x = bx;
-    ag_in_y = by;
-    ag_in_w = bw;
-    ag_in_h = bh;
-    bool focused = (focus == F_AGENT);
-    rrect(bx, by, bw, bh, px(6), C_INPUT);
-    rrect_line(bx, by, bw, bh, px(6), ((focused) ? (C_ACCENT) : (C_INPUT_BORDER)));
-    std::string t = fld_text[FLD_AGENT];
-    int lh = (__nexa_ui_text_height(UI) + px(5));
-    std::vector<std::string> lines = ag_input_lines(w);
-    int tx = (bx + px(10));
-    int ty = (by + px(8));
+static void agent__draw_agent_input(int x, int y, int w, int h) {
+    ::draw__fill((x + 1), y, (w - 1), h, ::state__C_SIDEBAR);
+    int bx = (x + ::draw__px(12));
+    int by = (y + ::draw__px(6));
+    int bw = (w - ::draw__px(24));
+    int bh = (h - ::draw__px(16));
+    ::state__ag_in_x = bx;
+    ::state__ag_in_y = by;
+    ::state__ag_in_w = bw;
+    ::state__ag_in_h = bh;
+    bool focused = (::state__focus == ::state__F_AGENT);
+    ::draw__rrect(bx, by, bw, bh, ::draw__px(6), ::state__C_INPUT);
+    ::draw__rrect_line(bx, by, bw, bh, ::draw__px(6), ((focused) ? (::state__C_ACCENT) : (::state__C_INPUT_BORDER)));
+    std::string t = ::state__fld_text[::state__FLD_AGENT];
+    int lh = (__nexa_ui_text_height(::state__UI) + ::draw__px(5));
+    std::vector<std::string> lines = ::agent__ag_input_lines(w);
+    int tx = (bx + ::draw__px(10));
+    int ty = (by + ::draw__px(8));
     if ((int)((t).size()) == 0) {
-        txt(tx, ty, ((ag_mode == "agent") ? (std::string("Ask the agent to do something...")) : (std::string("Ask a question..."))), C_DIM, UI);
+        ::draw__txt(tx, ty, ((::state__ag_mode == "agent") ? (std::string("Ask the agent to do something...")) : (std::string("Ask a question..."))), ::state__C_DIM, ::state__UI);
     }
-    int caret = fld_caret[FLD_AGENT];
+    int caret = ::state__fld_caret[::state__FLD_AGENT];
     int pos = 0;
-    int first = imax(0, ((int)((lines).size()) - 8));
+    int first = ::draw__imax(0, ((int)((lines).size()) - 8));
     for (int k = 0; k < (int)((lines).size()); k++) {
-        std::string l = lines[k];
+        std::string l = __nexa_text(lines[k]);
         int lstart = ([](const std::string& __s, const std::string& __p, int __f){ if (__f < 0) __f = 0; if ((size_t)__f > __s.size()) return -1; size_t __n = __s.find(__p, (size_t)__f); return __n == std::string::npos ? -1 : (int)__n; })(t, l, pos);
         if (lstart < 0) {
             lstart = pos;
@@ -12063,16 +12658,16 @@ static void draw_agent_input(int x, int y, int w, int h) {
         int lend = (lstart + (int)((l).size()));
         if (k >= first) {
             int ly = (ty + ((k - first) * lh));
-            if (focused && fld_has_sel(FLD_AGENT)) {
-                int a = imax(imin(fld_anchor[FLD_AGENT], caret), lstart);
-                int b = imin(imax(fld_anchor[FLD_AGENT], caret), lend);
+            if (focused && ::nxtext__fld_has_sel(::state__FLD_AGENT)) {
+                int a = ::draw__imax(::draw__imin(::state__fld_anchor[::state__FLD_AGENT], caret), lstart);
+                int b = ::draw__imin(::draw__imax(::state__fld_anchor[::state__FLD_AGENT], caret), lend);
                 if (b > a) {
-                    fill((tx + tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, lstart, (a - lstart)), UI)), ly, tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, a, (b - a)), UI), (lh - px(2)), C_SELECTION);
+                    ::draw__fill((tx + ::draw__tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, lstart, (a - lstart)), ::state__UI)), ly, ::draw__tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, a, (b - a)), ::state__UI), (lh - ::draw__px(2)), ::state__C_SELECTION);
                 }
             }
-            txt(tx, ly, l, C_TEXT, UI);
-            if (focused && caret_on() && caret >= lstart && (caret < lend || (caret == lend && (k == ((int)((lines).size()) - 1) || ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, lend, 1) != " ")))) {
-                fill((tx + tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, lstart, (caret - lstart)), UI)), ly, 1, (lh - px(3)), C_TEXT);
+            ::draw__txt(tx, ly, l, ::state__C_TEXT, ::state__UI);
+            if (focused && ::nxtext__caret_on() && caret >= lstart && (caret < lend || (caret == lend && (k == ((int)((lines).size()) - 1) || ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, lend, 1) != " ")))) {
+                ::draw__fill((tx + ::draw__tw(([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, lstart, (caret - lstart)), ::state__UI)), ly, 1, (lh - ::draw__px(3)), ::state__C_TEXT);
             }
         }
         pos = lend;
@@ -12080,78 +12675,78 @@ static void draw_agent_input(int x, int y, int w, int h) {
             pos = pos + 1;
         }
     }
-    int sx_ = (bx + bw - px(58));
-    int sy_ = (by + bh - px(30));
-    if (agent_busy()) {
-        if (__nexa_ui_button(sx_, sy_, px(52), px(24), std::string("Stop"), std::string("danger"))) {
-            agent_stop();
+    int sx_ = (bx + bw - ::draw__px(58));
+    int sy_ = (by + bh - ::draw__px(30));
+    if (::agent__agent_busy()) {
+        if (__nexa_ui_button(sx_, sy_, ::draw__px(52), ::draw__px(24), std::string("Stop"), std::string("danger"))) {
+            ::agent__agent_stop();
         }
     } else {
-        if (__nexa_ui_button(sx_, sy_, px(52), px(24), std::string("Send"), std::string("primary"))) {
-            agent_send();
+        if (__nexa_ui_button(sx_, sy_, ::draw__px(52), ::draw__px(24), std::string("Send"), std::string("primary"))) {
+            ::agent__agent_send();
         }
     }
-    txt((bx + px(10)), (by + bh - px(20)), ((ag_mode == "agent") ? ((provider_label(ag_provider) + " \xC2\xB7 " + ag_model_label())) : ((std::string("Chat \xC2\xB7 ") + ag_model_label()))), C_DIM, UI_SMALL);
+    ::draw__txt((bx + ::draw__px(10)), (by + bh - ::draw__px(20)), ((::state__ag_mode == "agent") ? ((::agent__provider_label(::state__ag_provider) + " \xC2\xB7 " + ::agent__ag_model_label())) : ((std::string("Chat \xC2\xB7 ") + ::agent__ag_model_label()))), ::state__C_DIM, ::state__UI_SMALL);
 }
 
-static void agent_key(int vk, int mods) {
-    bool shift = ((mods & M_SHIFT) != 0);
-    if (vk == K_ENTER && !(shift)) {
-        agent_send();
+static void agent__agent_key(int vk, int mods) {
+    bool shift = ((mods & ::state__M_SHIFT) != 0);
+    if (vk == ::state__K_ENTER && !(shift)) {
+        ::agent__agent_send();
         return;
     }
-    if (vk == K_ENTER && shift) {
-        if (fld_has_sel(FLD_AGENT)) {
-            fld_del_sel(FLD_AGENT);
+    if (vk == ::state__K_ENTER && shift) {
+        if (::nxtext__fld_has_sel(::state__FLD_AGENT)) {
+            ::nxtext__fld_del_sel(::state__FLD_AGENT);
         }
-        std::string t = fld_text[FLD_AGENT];
-        int c = fld_caret[FLD_AGENT];
-        fld_text[FLD_AGENT] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, c) + "\n" + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, c, -1));
-        fld_caret[FLD_AGENT] = (c + 1);
-        fld_anchor[FLD_AGENT] = (c + 1);
+        std::string t = ::state__fld_text[::state__FLD_AGENT];
+        int c = ::state__fld_caret[::state__FLD_AGENT];
+        ::state__fld_text[::state__FLD_AGENT] = (([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, 0, c) + "\n" + ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(t, c, -1));
+        ::state__fld_caret[::state__FLD_AGENT] = (c + 1);
+        ::state__fld_anchor[::state__FLD_AGENT] = (c + 1);
         return;
     }
-    if (vk == K_ESC) {
-        if (agent_busy()) {
-            agent_stop();
+    if (vk == ::state__K_ESC) {
+        if (::agent__agent_busy()) {
+            ::agent__agent_stop();
         } else {
-            focus = F_EDITOR;
+            ::state__focus = ::state__F_EDITOR;
         }
         return;
     }
-    fld_key(FLD_AGENT, vk, mods);
+    ::nxtext__fld_key(::state__FLD_AGENT, vk, mods);
 }
 
-static void agent_mouse(int x, int y, int btn) {
-    if (inside(x, y, ag_in_x, ag_in_y, ag_in_w, ag_in_h)) {
-        focus = F_AGENT;
-        fld_caret[FLD_AGENT] = (int)((fld_text[FLD_AGENT]).size());
-        fld_anchor[FLD_AGENT] = fld_caret[FLD_AGENT];
+static void agent__agent_mouse(int x, int y, int btn) {
+    if (::draw__inside(x, y, ::state__ag_in_x, ::state__ag_in_y, ::state__ag_in_w, ::state__ag_in_h)) {
+        ::state__focus = ::state__F_AGENT;
+        ::state__fld_caret[::state__FLD_AGENT] = (int)((::state__fld_text[::state__FLD_AGENT]).size());
+        ::state__fld_anchor[::state__FLD_AGENT] = ::state__fld_caret[::state__FLD_AGENT];
         return;
     }
-    if (y >= (TOOLBAR_H + HEADER_H + px(44))) {
-        focus = F_AGENT;
+    if (y >= (::state__TOOLBAR_H + ::state__HEADER_H + ::draw__px(44))) {
+        ::state__focus = ::state__F_AGENT;
     }
 }
 
-static void agent_wheel(int delta) {
-    ag_scroll = imax(0, (ag_scroll - (delta * px(60) / 120)));
-    ag_follow = false;
-    frame_dirty = true;
+static void agent__agent_wheel(int delta) {
+    ::state__ag_scroll = ::draw__imax(0, (::state__ag_scroll - (delta * ::draw__px(60) / 120)));
+    ::state__ag_follow = false;
+    ::state__frame_dirty = true;
 }
 
-static void mono_colored(int x, int y, std::string s, std::vector<int> cols, int max_w) {
-    nx_clip(x, (y - px(2)), (x + max_w), (y + nx_font_h(PANEL_FONT) + px(2)));
+static void agent__mono_colored(int x, int y, std::string s, std::vector<int> cols, int max_w) {
+    nx_clip(x, (y - ::draw__px(2)), (x + max_w), (y + nx_font_h(::state__PANEL_FONT) + ::draw__px(2)));
     int v = 0;
     int j = 0;
     int n = (int)((s).size());
-    int cw = nx_font_cw(PANEL_FONT);
+    int cw = nx_font_cw(::state__PANEL_FONT);
     while (j < n && (v * cw) < max_w) {
-        int cl = cp_len(s, j);
-        int b = ubyte(s, j);
+        int cl = ::nxtext__cp_len(s, j);
+        int b = ::nxtext__ubyte(s, j);
         if (b > 32) {
-            int c = ((j < (int)((cols).size())) ? (cols[j]) : (C_TEXT));
-            nx_text_cell(PANEL_FONT, (x + (v * cw)), y, cw, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, j, cl).c_str(), c);
+            int c = ((j < (int)((cols).size())) ? (cols[j]) : (::state__C_TEXT));
+            nx_text_cell(::state__PANEL_FONT, (x + (v * cw)), y, cw, ([](const std::string& __s, int __a, int __n){ if (__a < 0) __a = 0; if ((size_t)__a >= __s.size()) return std::string(); return __s.substr((size_t)__a, __n < 0 ? std::string::npos : (size_t)__n); })(s, j, cl).c_str(), c);
         }
         j = j + cl;
         v = v + 1;
@@ -12159,58 +12754,58 @@ static void mono_colored(int x, int y, std::string s, std::vector<int> cols, int
     nx_clip_off();
 }
 
-static void txt_inline(int x, int y, const std::string& s) {
+static void agent__txt_inline(int x, int y, const std::string& s) {
     if (!(([](const std::string& __s, const std::string& __p){ return __s.find(__p) != std::string::npos; })(s, "`"))) {
-        txt(x, y, s, C_TEXT, UI);
+        ::draw__txt(x, y, s, ::state__C_TEXT, ::state__UI);
         return;
     }
     std::vector<std::string> parts = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(s, "`");
     int px_ = x;
     for (int k = 0; k < (int)((parts).size()); k++) {
-        std::string part = parts[k];
+        std::string part = __nexa_text(parts[k]);
         if ((k % 2) == 1) {
-            int w = tw(part, UI);
-            rrect((px_ - px(1)), (y - px(1)), (w + px(4)), (__nexa_ui_text_height(UI) + px(2)), px(3), 0x2A2A2A);
-            txt((px_ + px(1)), y, part, 0xD7BA7D, UI);
-            px_ = px_ + (w + px(5));
+            int w = ::draw__tw(part, ::state__UI);
+            ::draw__rrect((px_ - ::draw__px(1)), (y - ::draw__px(1)), (w + ::draw__px(4)), (__nexa_ui_text_height(::state__UI) + ::draw__px(2)), ::draw__px(3), 0x2A2A2A);
+            ::draw__txt((px_ + ::draw__px(1)), y, part, 0xD7BA7D, ::state__UI);
+            px_ = px_ + (w + ::draw__px(5));
         } else {
-            px_ = px_ + txt(px_, y, part, C_TEXT, UI);
+            px_ = px_ + ::draw__txt(px_, y, part, ::state__C_TEXT, ::state__UI);
         }
     }
 }
 
-static void layout() {
-    int top = TOOLBAR_H;
-    int bottom = (win_h - STATUS_H);
-    sidebar_w = clamp(sidebar_w, px(170), imax(px(170), (win_w / 2)));
-    side_x = ACT_W;
-    side_y = top;
-    side_h = (bottom - top);
-    main_x = (ACT_W + ((show_sidebar) ? ((sidebar_w + 1)) : (0)));
-    agent_w = clamp(agent_w, px(280), imax(px(280), (win_w / 2)));
-    main_w = (win_w - main_x - ((show_agent) ? (agent_w) : (0)));
-    panel_h = clamp(panel_h, px(100), imax(px(100), (bottom - top - px(140))));
-    panel_y = ((show_panel) ? ((bottom - panel_h)) : (bottom));
-    ed_x = main_x;
-    ed_w = main_w;
-    ed_y = (top + TABS_H + ((is_file_tab()) ? (CRUMB_H) : (0)));
-    ed_h = (panel_y - ed_y);
-    gutter_w = (px(18) + (digits(imax((int)((L).size()), 99)) * CW) + px(22));
-    text_x = (ed_x + gutter_w);
-    text_w = (ed_w - gutter_w - SCROLL_W - mm_w());
+static void chrome__layout() {
+    int top = ::state__TOOLBAR_H;
+    int bottom = (::state__win_h - ::state__STATUS_H);
+    ::state__sidebar_w = ::draw__clamp(::state__sidebar_w, ::draw__px(170), ::draw__imax(::draw__px(170), (::state__win_w / 2)));
+    ::state__side_x = ::state__ACT_W;
+    ::state__side_y = top;
+    ::state__side_h = (bottom - top);
+    ::state__main_x = (::state__ACT_W + ((::state__show_sidebar) ? ((::state__sidebar_w + 1)) : (0)));
+    ::state__agent_w = ::draw__clamp(::state__agent_w, ::draw__px(280), ::draw__imax(::draw__px(280), (::state__win_w / 2)));
+    ::state__main_w = (::state__win_w - ::state__main_x - ((::state__show_agent) ? (::state__agent_w) : (0)));
+    ::state__panel_h = ::draw__clamp(::state__panel_h, ::draw__px(100), ::draw__imax(::draw__px(100), (bottom - top - ::draw__px(140))));
+    ::state__panel_y = ((::state__show_panel) ? ((bottom - ::state__panel_h)) : (bottom));
+    ::state__ed_x = ::state__main_x;
+    ::state__ed_w = ::state__main_w;
+    ::state__ed_y = (top + ::state__TABS_H + ((::buffer__is_file_tab()) ? (::state__CRUMB_H) : (0)));
+    ::state__ed_h = (::state__panel_y - ::state__ed_y);
+    ::state__gutter_w = (::draw__px(18) + (::editor__digits(::draw__imax((int)((::state__L).size()), 99)) * ::state__CW) + ::draw__px(22));
+    ::state__text_x = (::state__ed_x + ::state__gutter_w);
+    ::state__text_w = (::state__ed_w - ::state__gutter_w - ::state__SCROLL_W - ::editor__mm_w());
 }
 
-static int para(int x, int y, int w, const std::string& s, int c, int size) {
+static int chrome__para(int x, int y, int w, const std::string& s, int c, int size) {
     std::vector<std::string> words = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(s, " ");
-    int lh = (__nexa_ui_text_height(size) + px(4));
+    int lh = (__nexa_ui_text_height(size) + ::draw__px(4));
     std::string line_ = "";
     int yy = y;
     {
         const std::vector<std::string>& __nexa_forin_6 = words;
         for (const std::string& wd : __nexa_forin_6) {
             std::string t = (((int)((line_).size()) == 0) ? (wd) : ((line_ + " " + wd)));
-            if (tw(t, size) > w && (int)((line_).size()) > 0) {
-                txt(x, yy, line_, c, size);
+            if (::draw__tw(t, size) > w && (int)((line_).size()) > 0) {
+                ::draw__txt(x, yy, line_, c, size);
                 yy = yy + lh;
                 line_ = wd;
             } else {
@@ -12219,400 +12814,400 @@ static int para(int x, int y, int w, const std::string& s, int c, int size) {
         }
     }
     if ((int)((line_).size()) > 0) {
-        txt(x, yy, line_, c, size);
+        ::draw__txt(x, yy, line_, c, size);
         yy = yy + lh;
     }
     return (yy - y);
 }
 
-static void section_title(int x, int y, int w, const std::string& title) {
-    fill(x, y, w, HEADER_H, C_SIDEBAR);
-    txt_v((x + px(20)), y, HEADER_H, title, C_MUTED, UI_SMALL);
+static void chrome__section_title(int x, int y, int w, const std::string& title) {
+    ::draw__fill(x, y, w, ::state__HEADER_H, ::state__C_SIDEBAR);
+    ::draw__txt_v((x + ::draw__px(20)), y, ::state__HEADER_H, title, ::state__C_MUTED, ::state__UI_SMALL);
 }
 
-static void tooltip(std::string s) {
-    tip_text = s;
+static void chrome__tooltip(std::string s) {
+    ::state__tip_text = s;
 }
 
-static void draw_tooltip() {
-    if ((int)((tip_text).size()) == 0 || drag != 0) {
+static void chrome__draw_tooltip() {
+    if ((int)((::state__tip_text).size()) == 0 || ::state__drag != 0) {
         return;
     }
-    int w = (tw(tip_text, UI_SMALL) + px(14));
-    int h = px(22);
-    int x = clamp((mx + px(10)), px(4), (win_w - w - px(4)));
-    int y = (my + px(20));
-    if ((y + h) > win_h) {
-        y = (my - h - px(6));
+    int w = (::draw__tw(::state__tip_text, ::state__UI_SMALL) + ::draw__px(14));
+    int h = ::draw__px(22);
+    int x = ::draw__clamp((::state__mx + ::draw__px(10)), ::draw__px(4), (::state__win_w - w - ::draw__px(4)));
+    int y = (::state__my + ::draw__px(20));
+    if ((y + h) > ::state__win_h) {
+        y = (::state__my - h - ::draw__px(6));
     }
-    fill(x, y, w, h, 0x252526);
-    outline(x, y, w, h, 0x454545);
-    txt_v((x + px(7)), y, h, tip_text, C_TEXT, UI_SMALL);
+    ::draw__fill(x, y, w, h, 0x252526);
+    ::draw__outline(x, y, w, h, 0x454545);
+    ::draw__txt_v((x + ::draw__px(7)), y, h, ::state__tip_text, ::state__C_TEXT, ::state__UI_SMALL);
 }
 
-static void draw_logo(int x, int y, int s, bool back) {
-    draw_logo_c(x, y, s, back, C_BRIGHT, 0x2AA1F0);
+static void chrome__draw_logo(int x, int y, int s, bool back) {
+    ::chrome__draw_logo_c(x, y, s, back, ::state__C_BRIGHT, 0x2AA1F0);
 }
 
-static void draw_logo_c(int x, int y, int s, bool back, int fg, int bar) {
+static void chrome__draw_logo_c(int x, int y, int s, bool back, int fg, int bar) {
     if (back) {
-        rrect(x, y, s, s, (s * 13 / 64), 0x1C1D22);
+        ::draw__rrect(x, y, s, s, (s * 13 / 64), 0x1C1D22);
     }
     int u = s;
-    fill((x + (u * 265 / 1024)), (y + (u * 220 / 1024)), imax(1, (u * 12 / 1024)), (u * 568 / 1024), bar);
+    ::draw__fill((x + (u * 265 / 1024)), (y + (u * 220 / 1024)), ::draw__imax(1, (u * 12 / 1024)), (u * 568 / 1024), bar);
     int l = (x + (u * 292 / 1024));
     int t = (y + (u * 235 / 1024));
     int b = (y + (u * 778 / 1024));
     int r = (x + (u * 758 / 1024));
     int stem = (u * 126 / 1024);
-    fill(l, t, stem, (b - t), fg);
-    fill((r - stem), t, stem, (b - t), fg);
+    ::draw__fill(l, t, stem, (b - t), fg);
+    ::draw__fill((r - stem), t, stem, (b - t), fg);
     __nexa_gfx_fill_tri(l, t, (l + stem), t, r, b, ((fg >> 16) & 255), ((fg >> 8) & 255), (fg & 255));
     __nexa_gfx_fill_tri(l, t, (r - stem), b, r, b, ((fg >> 16) & 255), ((fg >> 8) & 255), (fg & 255));
 }
 
-static void draw_toolbar() {
-    fill(0, 0, win_w, TOOLBAR_H, C_TITLE);
-    hline(0, (TOOLBAR_H - 1), win_w, C_BORDER);
-    draw_logo(px(10), ((TOOLBAR_H - px(20)) / 2), px(20), true);
-    std::vector<std::string> names = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(MENU_NAMES, " ");
+static void chrome__draw_toolbar() {
+    ::draw__fill(0, 0, ::state__win_w, ::state__TOOLBAR_H, ::state__C_TITLE);
+    ::draw__hline(0, (::state__TOOLBAR_H - 1), ::state__win_w, ::state__C_BORDER);
+    ::chrome__draw_logo(::draw__px(10), ((::state__TOOLBAR_H - ::draw__px(20)) / 2), ::draw__px(20), true);
+    std::vector<std::string> names = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(::state__MENU_NAMES, " ");
     for (int i = 0; i < (int)((names).size()); i++) {
-        int x = menu_label_x(i);
-        int lw = (tw(names[i], UI) + px(12));
-        bool hov = hovered((x - px(6)), px(5), lw, (TOOLBAR_H - px(10)));
-        if (menu_open == i || hov) {
-            rrect((x - px(6)), px(5), lw, (TOOLBAR_H - px(10)), px(4), 0x2D2E2E);
-            if (hov && menu_open >= 0 && menu_open < 100 && menu_open != i) {
-                menu_open = i;
+        int x = ::commands__menu_label_x(i);
+        int lw = (::draw__tw(names[i], ::state__UI) + ::draw__px(12));
+        bool hov = ::draw__hovered((x - ::draw__px(6)), ::draw__px(5), lw, (::state__TOOLBAR_H - ::draw__px(10)));
+        if (::state__menu_open == i || hov) {
+            ::draw__rrect((x - ::draw__px(6)), ::draw__px(5), lw, (::state__TOOLBAR_H - ::draw__px(10)), ::draw__px(4), 0x2D2E2E);
+            if (hov && ::state__menu_open >= 0 && ::state__menu_open < 100 && ::state__menu_open != i) {
+                ::state__menu_open = i;
             }
         }
-        txt_v(x, 0, TOOLBAR_H, names[i], C_TEXT, UI);
+        ::draw__txt_v(x, 0, ::state__TOOLBAR_H, names[i], ::state__C_TEXT, ::state__UI);
     }
-    int cw_ = clamp((win_w * 38 / 100), px(200), px(600));
-    int cx_ = ((win_w - cw_) / 2);
-    int menus_end = menu_label_x((int)((names).size()));
-    if (cx_ < (menus_end + px(10))) {
-        cx_ = (menus_end + px(10));
+    int cw_ = ::draw__clamp((::state__win_w * 38 / 100), ::draw__px(200), ::draw__px(600));
+    int cx_ = ((::state__win_w - cw_) / 2);
+    int menus_end = ::commands__menu_label_x((int)((names).size()));
+    if (cx_ < (menus_end + ::draw__px(10))) {
+        cx_ = (menus_end + ::draw__px(10));
     }
-    int right_w = px(170);
-    if ((cx_ + cw_) > (win_w - right_w)) {
-        cw_ = (win_w - right_w - cx_);
+    int right_w = ::draw__px(170);
+    if ((cx_ + cw_) > (::state__win_w - right_w)) {
+        cw_ = (::state__win_w - right_w - cx_);
     }
-    if (cw_ > px(120)) {
-        int cy_ = px(6);
-        int ch_ = (TOOLBAR_H - px(12));
-        bool hov = hovered(cx_, cy_, cw_, ch_);
-        rrect(cx_, cy_, cw_, ch_, px(6), ((hov) ? (0x303030) : (0x262626)));
-        rrect_line(cx_, cy_, cw_, ch_, px(6), ((hov) ? (0x4A4A4A) : (0x3C3C3C)));
-        std::string label = (((int)((folder).size()) > 0) ? (__nexa_file_basename((folder).c_str())) : (std::string("Nexium")));
-        int lw = tw(label, UI);
-        int ix = (cx_ + ((cw_ - lw) / 2) - px(10));
-        circle(ix, (cy_ + (ch_ / 2) - 1), px(5), C_MUTED);
-        line((ix + px(3)), (cy_ + (ch_ / 2) + px(3)), (ix + px(7)), (cy_ + (ch_ / 2) + px(7)), C_MUTED, 1);
-        txt_v((ix + px(14)), cy_, ch_, label, C_MUTED, UI);
-        cmd_center_x = cx_;
-        cmd_center_w = cw_;
+    if (cw_ > ::draw__px(120)) {
+        int cy_ = ::draw__px(6);
+        int ch_ = (::state__TOOLBAR_H - ::draw__px(12));
+        bool hov = ::draw__hovered(cx_, cy_, cw_, ch_);
+        ::draw__rrect(cx_, cy_, cw_, ch_, ::draw__px(6), ((hov) ? (0x303030) : (0x262626)));
+        ::draw__rrect_line(cx_, cy_, cw_, ch_, ::draw__px(6), ((hov) ? (0x4A4A4A) : (0x3C3C3C)));
+        std::string label = (((int)((::state__folder).size()) > 0) ? (__nexa_file_basename((::state__folder).c_str())) : (std::string("Nexium")));
+        int lw = ::draw__tw(label, ::state__UI);
+        int ix = (cx_ + ((cw_ - lw) / 2) - ::draw__px(10));
+        ::draw__circle(ix, (cy_ + (ch_ / 2) - 1), ::draw__px(5), ::state__C_MUTED);
+        ::draw__line((ix + ::draw__px(3)), (cy_ + (ch_ / 2) + ::draw__px(3)), (ix + ::draw__px(7)), (cy_ + (ch_ / 2) + ::draw__px(7)), ::state__C_MUTED, 1);
+        ::draw__txt_v((ix + ::draw__px(14)), cy_, ch_, label, ::state__C_MUTED, ::state__UI);
+        ::state__cmd_center_x = cx_;
+        ::state__cmd_center_w = cw_;
     } else {
-        cmd_center_w = 0;
+        ::state__cmd_center_w = 0;
     }
-    int bx = (win_w - px(160));
-    int by = px(5);
-    int bh = (TOOLBAR_H - px(10));
-    if (task_running()) {
-        if (__nexa_ui_button((bx + px(76)), by, px(76), bh, std::string("Stop"), std::string("danger"))) {
-            stop_task();
+    int bx = (::state__win_w - ::draw__px(160));
+    int by = ::draw__px(5);
+    int bh = (::state__TOOLBAR_H - ::draw__px(10));
+    if (::commands__task_running()) {
+        if (__nexa_ui_button((bx + ::draw__px(76)), by, ::draw__px(76), bh, std::string("Stop"), std::string("danger"))) {
+            ::commands__stop_task();
         }
-        int spin = (now_ms / 120 % 8);
-        int sx_ = (bx + px(40));
+        int spin = (::state__now_ms / 120 % 8);
+        int sx_ = (bx + ::draw__px(40));
         for (int k = 0; k < 8; k++) {
             int a = (k * 45);
-            int c = ((k == spin) ? (C_BRIGHT) : (0x555555));
-            disc((sx_ + static_cast<int>((std::cos(static_cast<double>((a * 3.14159 / 180.0))) * px(7)))), (by + (bh / 2) + static_cast<int>((std::sin(static_cast<double>((a * 3.14159 / 180.0))) * px(7)))), (px(1) + 1), c);
+            int c = ((k == spin) ? (::state__C_BRIGHT) : (0x555555));
+            ::draw__disc((sx_ + static_cast<int>((std::cos(static_cast<double>((a * 3.14159 / 180.0))) * ::draw__px(7)))), (by + (bh / 2) + static_cast<int>((std::sin(static_cast<double>((a * 3.14159 / 180.0))) * ::draw__px(7)))), (::draw__px(1) + 1), c);
         }
     } else {
-        if (__nexa_ui_button(bx, by, px(72), bh, std::string("Build"), std::string("secondary"))) {
-            run_cmd("run.build");
+        if (__nexa_ui_button(bx, by, ::draw__px(72), bh, std::string("Build"), std::string("secondary"))) {
+            ::commands__run_cmd("run.build");
         }
-        if (__nexa_ui_button((bx + px(78)), by, px(76), bh, std::string("Run"), std::string("primary"))) {
-            run_cmd("run.run");
+        if (__nexa_ui_button((bx + ::draw__px(78)), by, ::draw__px(76), bh, std::string("Run"), std::string("primary"))) {
+            ::commands__run_cmd("run.run");
         }
     }
-    if (hovered(bx, by, px(154), bh)) {
-        tooltip(((task_running()) ? (std::string("Stop (Shift+F5)")) : (std::string("Build (Ctrl+Shift+B) / Build and Run (F5)"))));
+    if (::draw__hovered(bx, by, ::draw__px(154), bh)) {
+        ::chrome__tooltip(((::commands__task_running()) ? (std::string("Stop (Shift+F5)")) : (std::string("Build (Ctrl+Shift+B) / Build and Run (F5)"))));
     }
 }
 
-static void toolbar_mouse(int x, int y) {
-    std::vector<std::string> names = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(MENU_NAMES, " ");
+static void chrome__toolbar_mouse(int x, int y) {
+    std::vector<std::string> names = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(::state__MENU_NAMES, " ");
     for (int i = 0; i < (int)((names).size()); i++) {
-        int lx = menu_label_x(i);
-        int lw = (tw(names[i], UI) + px(12));
-        if (x >= (lx - px(6)) && x < (lx - px(6) + lw)) {
-            menu_open = ((menu_open == i) ? (-1) : (i));
-            menu_hover = -1;
+        int lx = ::commands__menu_label_x(i);
+        int lw = (::draw__tw(names[i], ::state__UI) + ::draw__px(12));
+        if (x >= (lx - ::draw__px(6)) && x < (lx - ::draw__px(6) + lw)) {
+            ::state__menu_open = ((::state__menu_open == i) ? (-1) : (i));
+            ::state__menu_hover = -1;
             return;
         }
     }
-    if (cmd_center_w > 0 && x >= cmd_center_x && x < (cmd_center_x + cmd_center_w)) {
-        open_quick("");
+    if (::state__cmd_center_w > 0 && x >= ::state__cmd_center_x && x < (::state__cmd_center_x + ::state__cmd_center_w)) {
+        ::workspace__open_quick("");
     }
 }
 
-static void icon_files(int x, int y, int c) {
-    outline((x + px(4)), (y + px(1)), px(11), px(15), c);
-    fill((x + px(1)), (y + px(5)), px(11), px(15), C_ACTBAR);
-    outline((x + px(1)), (y + px(5)), px(11), px(15), c);
-    hline((x + px(4)), (y + px(10)), px(5), c);
-    hline((x + px(4)), (y + px(13)), px(5), c);
+static void chrome__icon_files(int x, int y, int c) {
+    ::draw__outline((x + ::draw__px(4)), (y + ::draw__px(1)), ::draw__px(11), ::draw__px(15), c);
+    ::draw__fill((x + ::draw__px(1)), (y + ::draw__px(5)), ::draw__px(11), ::draw__px(15), ::state__C_ACTBAR);
+    ::draw__outline((x + ::draw__px(1)), (y + ::draw__px(5)), ::draw__px(11), ::draw__px(15), c);
+    ::draw__hline((x + ::draw__px(4)), (y + ::draw__px(10)), ::draw__px(5), c);
+    ::draw__hline((x + ::draw__px(4)), (y + ::draw__px(13)), ::draw__px(5), c);
 }
 
-static void icon_search(int x, int y, int c) {
-    circle((x + px(10)), (y + px(8)), px(6), c);
-    circle((x + px(10)), (y + px(8)), (px(6) - 1), c);
-    line((x + px(5)), (y + px(13)), (x + px(1)), (y + px(18)), c, 2);
+static void chrome__icon_search(int x, int y, int c) {
+    ::draw__circle((x + ::draw__px(10)), (y + ::draw__px(8)), ::draw__px(6), c);
+    ::draw__circle((x + ::draw__px(10)), (y + ::draw__px(8)), (::draw__px(6) - 1), c);
+    ::draw__line((x + ::draw__px(5)), (y + ::draw__px(13)), (x + ::draw__px(1)), (y + ::draw__px(18)), c, 2);
 }
 
-static void icon_gear(int x, int y, int c) {
-    gear((x + px(10)), (y + px(10)), px(9), c);
+static void chrome__icon_gear(int x, int y, int c) {
+    ::chrome__gear((x + ::draw__px(10)), (y + ::draw__px(10)), ::draw__px(9), c);
 }
 
-static void gear(int cx_, int cy_, int r, int c) {
+static void chrome__gear(int cx_, int cy_, int r, int c) {
     int inner = (r * 2 / 3);
     for (int k = 0; k < 8; k++) {
         double a = (k * 45 * 3.14159 / 180.0);
         int x1 = (cx_ + static_cast<int>((std::cos(static_cast<double>(a)) * inner)));
-        int y1 = (cy_ + static_cast<int>((std::sin(static_cast<double>(a)) * inner)));
+        int y1_ = (cy_ + static_cast<int>((std::sin(static_cast<double>(a)) * inner)));
         int x2 = (cx_ + static_cast<int>((std::cos(static_cast<double>(a)) * r)));
         int y2 = (cy_ + static_cast<int>((std::sin(static_cast<double>(a)) * r)));
-        line(x1, y1, x2, y2, c, ((r >= px(8)) ? (2) : (1)));
+        ::draw__line(x1, y1_, x2, y2, c, ((r >= ::draw__px(8)) ? (2) : (1)));
     }
-    circle(cx_, cy_, inner, c);
-    circle(cx_, cy_, imax(1, (r / 3)), c);
+    ::draw__circle(cx_, cy_, inner, c);
+    ::draw__circle(cx_, cy_, ::draw__imax(1, (r / 3)), c);
 }
 
-static void draw_activity() {
-    fill(0, TOOLBAR_H, ACT_W, (win_h - TOOLBAR_H - STATUS_H), C_ACTBAR);
-    vline((ACT_W - 1), TOOLBAR_H, (win_h - TOOLBAR_H - STATUS_H), C_BORDER);
+static void chrome__draw_activity() {
+    ::draw__fill(0, ::state__TOOLBAR_H, ::state__ACT_W, (::state__win_h - ::state__TOOLBAR_H - ::state__STATUS_H), ::state__C_ACTBAR);
+    ::draw__vline((::state__ACT_W - 1), ::state__TOOLBAR_H, (::state__win_h - ::state__TOOLBAR_H - ::state__STATUS_H), ::state__C_BORDER);
     int items = 3;
     for (int i = 0; i < items; i++) {
-        int y = (TOOLBAR_H + (i * ACT_W));
-        bool on = (show_sidebar && view == i);
-        bool hov = hovered(0, y, ACT_W, ACT_W);
-        int c = ((on || hov) ? (C_BRIGHT) : (0x868686));
+        int y = (::state__TOOLBAR_H + (i * ::state__ACT_W));
+        bool on = (::state__show_sidebar && ::state__view == i);
+        bool hov = ::draw__hovered(0, y, ::state__ACT_W, ::state__ACT_W);
+        int c = ((on || hov) ? (::state__C_BRIGHT) : (0x868686));
         if (on) {
-            fill(0, y, px(2), ACT_W, C_BRIGHT);
+            ::draw__fill(0, y, ::draw__px(2), ::state__ACT_W, ::state__C_BRIGHT);
         }
-        int ix = ((ACT_W - px(20)) / 2);
-        int iy = (y + ((ACT_W - px(20)) / 2));
+        int ix = ((::state__ACT_W - ::draw__px(20)) / 2);
+        int iy = (y + ((::state__ACT_W - ::draw__px(20)) / 2));
         if (i == 0) {
-            icon_files(ix, iy, c);
+            ::chrome__icon_files(ix, iy, c);
         } else if (i == 1) {
-            icon_search(ix, iy, c);
+            ::chrome__icon_search(ix, iy, c);
         } else {
-            draw_glyph("outline", ix, iy, px(20), c);
+            ::draw__draw_glyph("outline", ix, iy, ::draw__px(20), c);
         }
         if (hov) {
             if (i == 0) {
-                tooltip("Explorer (Ctrl+Shift+E)");
+                ::chrome__tooltip("Explorer (Ctrl+Shift+E)");
             }
             if (i == 1) {
-                tooltip("Search (Ctrl+Shift+F)");
+                ::chrome__tooltip("Search (Ctrl+Shift+F)");
             }
             if (i == 2) {
-                tooltip("Outline");
+                ::chrome__tooltip("Outline");
             }
         }
     }
-    int ay_ = (win_h - STATUS_H - (ACT_W * 2));
-    bool ahov = hovered(0, ay_, ACT_W, ACT_W);
-    if (show_agent) {
-        fill(0, ay_, px(2), ACT_W, C_BRIGHT);
+    int ay_ = (::state__win_h - ::state__STATUS_H - (::state__ACT_W * 2));
+    bool ahov = ::draw__hovered(0, ay_, ::state__ACT_W, ::state__ACT_W);
+    if (::state__show_agent) {
+        ::draw__fill(0, ay_, ::draw__px(2), ::state__ACT_W, ::state__C_BRIGHT);
     }
-    draw_glyph("agent", ((ACT_W - px(20)) / 2), (ay_ + ((ACT_W - px(20)) / 2)), px(20), ((ahov || show_agent) ? (C_BRIGHT) : (0x868686)));
+    ::draw__draw_glyph("agent", ((::state__ACT_W - ::draw__px(20)) / 2), (ay_ + ((::state__ACT_W - ::draw__px(20)) / 2)), ::draw__px(20), ((ahov || ::state__show_agent) ? (::state__C_BRIGHT) : (0x868686)));
     if (ahov) {
-        tooltip("Agent (Ctrl+Shift+L)");
+        ::chrome__tooltip("Agent (Ctrl+Shift+L)");
     }
-    int gy = (win_h - STATUS_H - ACT_W);
-    bool ghov = hovered(0, gy, ACT_W, ACT_W);
-    bool gon = (active_kind() == 1);
-    icon_gear(((ACT_W - px(20)) / 2), (gy + ((ACT_W - px(20)) / 2)), ((ghov || gon) ? (C_BRIGHT) : (0x868686)));
+    int gy = (::state__win_h - ::state__STATUS_H - ::state__ACT_W);
+    bool ghov = ::draw__hovered(0, gy, ::state__ACT_W, ::state__ACT_W);
+    bool gon = (::buffer__active_kind() == 1);
+    ::chrome__icon_gear(((::state__ACT_W - ::draw__px(20)) / 2), (gy + ((::state__ACT_W - ::draw__px(20)) / 2)), ((ghov || gon) ? (::state__C_BRIGHT) : (0x868686)));
     if (ghov) {
-        tooltip("Settings (Ctrl+,)");
+        ::chrome__tooltip("Settings (Ctrl+,)");
     }
 }
 
-static void activity_mouse(int x, int y) {
-    int gy = (win_h - STATUS_H - ACT_W);
+static void chrome__activity_mouse(int x, int y) {
+    int gy = (::state__win_h - ::state__STATUS_H - ::state__ACT_W);
     if (y >= gy) {
-        open_special(1);
+        ::buffer__open_special(1);
         return;
     }
-    if (y >= (gy - ACT_W)) {
-        show_agent = (!show_agent);
-        if (show_agent) {
-            focus = F_AGENT;
+    if (y >= (gy - ::state__ACT_W)) {
+        ::state__show_agent = (!::state__show_agent);
+        if (::state__show_agent) {
+            ::state__focus = ::state__F_AGENT;
         }
-        save_settings();
+        ::app__save_settings();
         return;
     }
-    int i = ((y - TOOLBAR_H) / ACT_W);
+    int i = ((y - ::state__TOOLBAR_H) / ::state__ACT_W);
     if (i < 0 || i > 2) {
         return;
     }
-    if (show_sidebar && view == i) {
-        show_sidebar = false;
+    if (::state__show_sidebar && ::state__view == i) {
+        ::state__show_sidebar = false;
     } else {
-        show_sidebar = true;
-        view = i;
+        ::state__show_sidebar = true;
+        ::state__view = i;
         if (i == 1) {
-            focus = F_SEARCH;
-            fld_select_all(FLD_SEARCH);
+            ::state__focus = ::state__F_SEARCH;
+            ::nxtext__fld_select_all(::state__FLD_SEARCH);
         }
     }
 }
 
-static void draw_sidebar() {
-    if (!(show_sidebar)) {
+static void chrome__draw_sidebar() {
+    if (!(::state__show_sidebar)) {
         return;
     }
-    fill(side_x, side_y, sidebar_w, side_h, C_SIDEBAR);
-    if (view == 0) {
-        draw_explorer();
-    } else if (view == 1) {
-        draw_search_view();
+    ::draw__fill(::state__side_x, ::state__side_y, ::state__sidebar_w, ::state__side_h, ::state__C_SIDEBAR);
+    if (::state__view == 0) {
+        ::workspace__draw_explorer();
+    } else if (::state__view == 1) {
+        ::workspace__draw_search_view();
     } else {
-        draw_outline();
+        ::workspace__draw_outline();
     }
-    vline((side_x + sidebar_w), side_y, side_h, C_BORDER);
-    shadow_v((side_x + sidebar_w + 1), side_y, side_h, true);
-    if (drag == 1 || (hovered((side_x + sidebar_w - px(2)), side_y, px(5), side_h) && drag == 0)) {
-        fill((side_x + sidebar_w - 1), side_y, px(3), side_h, C_ACCENT);
+    ::draw__vline((::state__side_x + ::state__sidebar_w), ::state__side_y, ::state__side_h, ::state__C_BORDER);
+    ::draw__shadow_v((::state__side_x + ::state__sidebar_w + 1), ::state__side_y, ::state__side_h, true);
+    if (::state__drag == 1 || (::draw__hovered((::state__side_x + ::state__sidebar_w - ::draw__px(2)), ::state__side_y, ::draw__px(5), ::state__side_h) && ::state__drag == 0)) {
+        ::draw__fill((::state__side_x + ::state__sidebar_w - 1), ::state__side_y, ::draw__px(3), ::state__side_h, ::state__C_ACCENT);
     }
 }
 
-static int tab_width(int i) {
-    std::string nm = bufs[i].name;
-    return (tw(nm, UI) + px(64));
+static int chrome__tab_width(int i) {
+    std::string nm = ::state__bufs[i].name;
+    return (::draw__tw(nm, ::state__UI) + ::draw__px(64));
 }
 
-static void draw_tabs() {
-    int x0 = main_x;
-    int y = TOOLBAR_H;
-    fill(x0, y, main_w, TABS_H, C_TITLE);
-    hline(x0, (y + TABS_H - 1), main_w, C_BORDER);
-    tab_xs.clear();
-    tab_ws.clear();
+static void chrome__draw_tabs() {
+    int x0 = ::state__main_x;
+    int y = ::state__TOOLBAR_H;
+    ::draw__fill(x0, y, ::state__main_w, ::state__TABS_H, ::state__C_TITLE);
+    ::draw__hline(x0, (y + ::state__TABS_H - 1), ::state__main_w, ::state__C_BORDER);
+    ::state__tab_xs.clear();
+    ::state__tab_ws.clear();
     int total = 0;
     int act_x = 0;
     int act_w = 0;
-    for (int i = 0; i < (int)((bufs).size()); i++) {
-        int w = tab_width(i);
-        if (i == active) {
+    for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+        int w = ::chrome__tab_width(i);
+        if (i == ::state__active) {
             act_x = total;
             act_w = w;
         }
         total = total + w;
     }
-    if (active >= 0 && tab_follow) {
-        if (act_x < tab_scroll) {
-            tab_scroll = act_x;
+    if (::state__active >= 0 && ::state__tab_follow) {
+        if (act_x < ::state__tab_scroll) {
+            ::state__tab_scroll = act_x;
         }
-        if ((act_x + act_w) > (tab_scroll + main_w)) {
-            tab_scroll = (act_x + act_w - main_w);
+        if ((act_x + act_w) > (::state__tab_scroll + ::state__main_w)) {
+            ::state__tab_scroll = (act_x + act_w - ::state__main_w);
         }
-        tab_follow = false;
+        ::state__tab_follow = false;
     }
-    tab_scroll = clamp(tab_scroll, 0, imax(0, (total - main_w)));
-    int x = (x0 - tab_scroll);
-    for (int i = 0; i < (int)((bufs).size()); i++) {
-        int w = tab_width(i);
-        tab_xs.push_back(x);
-        tab_ws.push_back(w);
-        if ((x + w) > x0 && x < (x0 + main_w)) {
-            bool on = (i == active);
-            bool hov = (hovered(x, y, w, TABS_H) && drag == 0);
+    ::state__tab_scroll = ::draw__clamp(::state__tab_scroll, 0, ::draw__imax(0, (total - ::state__main_w)));
+    int x = (x0 - ::state__tab_scroll);
+    for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+        int w = ::chrome__tab_width(i);
+        ::state__tab_xs.push_back(x);
+        ::state__tab_ws.push_back(w);
+        if ((x + w) > x0 && x < (x0 + ::state__main_w)) {
+            bool on = (i == ::state__active);
+            bool hov = (::draw__hovered(x, y, w, ::state__TABS_H) && ::state__drag == 0);
             if (on) {
-                fill(x, y, w, TABS_H, C_EDITOR);
-                fill(x, y, w, 1, C_ACCENT);
+                ::draw__fill(x, y, w, ::state__TABS_H, ::state__C_EDITOR);
+                ::draw__fill(x, y, w, 1, ::state__C_ACCENT);
             } else if (hov) {
-                fill(x, y, w, (TABS_H - 1), 0x1F1F1F);
+                ::draw__fill(x, y, w, (::state__TABS_H - 1), 0x1F1F1F);
             }
-            vline((x + w - 1), y, (TABS_H - 1), C_BORDER);
-            std::string nm = bufs[i].name;
-            int kind = bufs[i].kind;
-            int ix = (x + px(12));
+            ::draw__vline((x + w - 1), y, (::state__TABS_H - 1), ::state__C_BORDER);
+            std::string nm = __nexa_text(::state__bufs[i].name);
+            int kind = ::state__bufs[i].kind;
+            int ix = (x + ::draw__px(12));
             if (kind == 0) {
-                draw_badge(ix, y, TABS_H, nm);
+                ::highlight__draw_badge(ix, y, ::state__TABS_H, nm);
             } else if (kind == 1) {
-                gear((ix + px(7)), (y + (TABS_H / 2)), px(7), 0x868686);
+                ::chrome__gear((ix + ::draw__px(7)), (y + (::state__TABS_H / 2)), ::draw__px(7), 0x868686);
             } else {
-                draw_logo(ix, (y + ((TABS_H - px(14)) / 2)), px(14), true);
+                ::chrome__draw_logo(ix, (y + ((::state__TABS_H - ::draw__px(14)) / 2)), ::draw__px(14), true);
             }
-            int tc = ((on) ? (C_BRIGHT) : (C_MUTED));
-            bool preview = bufs[i].preview;
-            txt_v((ix + px(20)), y, TABS_H, nm, ((preview && !(on)) ? (0x8B8B8B) : (tc)), UI);
-            int bx = (x + w - px(28));
-            int by = (y + ((TABS_H - px(20)) / 2));
-            bool dirty = buf_dirty(i);
-            bool bh = hovered(bx, by, px(20), px(20));
+            int tc = ((on) ? (::state__C_BRIGHT) : (::state__C_MUTED));
+            bool preview = ::state__bufs[i].preview;
+            ::draw__txt_v((ix + ::draw__px(20)), y, ::state__TABS_H, nm, ((preview && !(on)) ? (0x8B8B8B) : (tc)), ::state__UI);
+            int bx = (x + w - ::draw__px(28));
+            int by = (y + ((::state__TABS_H - ::draw__px(20)) / 2));
+            bool dirty = ::buffer__buf_dirty(i);
+            bool bh = ::draw__hovered(bx, by, ::draw__px(20), ::draw__px(20));
             if (bh) {
-                rrect(bx, by, px(20), px(20), px(4), 0x3A3D41);
+                ::draw__rrect(bx, by, ::draw__px(20), ::draw__px(20), ::draw__px(4), 0x3A3D41);
             }
             if (dirty && !(bh)) {
-                disc((bx + px(10)), (by + px(10)), px(4), ((on) ? (C_BRIGHT) : (C_MUTED)));
+                ::draw__disc((bx + ::draw__px(10)), (by + ::draw__px(10)), ::draw__px(4), ((on) ? (::state__C_BRIGHT) : (::state__C_MUTED)));
             } else if (on || hov || bh) {
-                int c = ((on || bh) ? (C_BRIGHT) : (C_MUTED));
-                line((bx + px(6)), (by + px(6)), (bx + px(14)), (by + px(14)), c, 1);
-                line((bx + px(14)), (by + px(6)), (bx + px(6)), (by + px(14)), c, 1);
+                int c = ((on || bh) ? (::state__C_BRIGHT) : (::state__C_MUTED));
+                ::draw__line((bx + ::draw__px(6)), (by + ::draw__px(6)), (bx + ::draw__px(14)), (by + ::draw__px(14)), c, 1);
+                ::draw__line((bx + ::draw__px(14)), (by + ::draw__px(6)), (bx + ::draw__px(6)), (by + ::draw__px(14)), c, 1);
             }
         }
         x = x + w;
     }
 }
 
-static void tabs_mouse(int x, int y, int btn, int clicks) {
-    for (int i = 0; i < (int)((tab_xs).size()); i++) {
-        int tx = tab_xs[i];
-        int w = tab_ws[i];
-        if (x >= tx && x < (tx + w) && x >= main_x) {
-            int bx = (tx + w - px(28));
-            if (btn == 2 || (btn == 0 && x >= bx && x < (bx + px(20)))) {
-                close_tab(i);
+static void chrome__tabs_mouse(int x, int y, int btn, int clicks) {
+    for (int i = 0; i < (int)((::state__tab_xs).size()); i++) {
+        int tx = ::state__tab_xs[i];
+        int w = ::state__tab_ws[i];
+        if (x >= tx && x < (tx + w) && x >= ::state__main_x) {
+            int bx = (tx + w - ::draw__px(28));
+            if (btn == 2 || (btn == 0 && x >= bx && x < (bx + ::draw__px(20)))) {
+                ::buffer__close_tab(i);
                 return;
             }
             if (btn == 1) {
-                tab_ctx = i;
-                menu_open = 101;
-                menu_x = x;
-                menu_y = (y + px(10));
+                ::state__tab_ctx = i;
+                ::state__menu_open = 101;
+                ::state__menu_x = x;
+                ::state__menu_y = (y + ::draw__px(10));
                 return;
             }
-            switch_to(i);
-            if (clicks >= 2 && i < (int)((bufs).size())) {
-                bufs[i].preview = false;
+            ::buffer__switch_to(i);
+            if (clicks >= 2 && i < (int)((::state__bufs).size())) {
+                ::state__bufs[i].preview = false;
             }
-            focus = F_EDITOR;
-            tab_follow = true;
+            ::state__focus = ::state__F_EDITOR;
+            ::state__tab_follow = true;
             return;
         }
     }
     if (clicks >= 2 && btn == 0) {
-        new_untitled();
+        ::buffer__new_untitled();
     }
 }
 
-static void draw_crumbs() {
-    if (!(is_file_tab())) {
+static void chrome__draw_crumbs() {
+    if (!(::buffer__is_file_tab())) {
         return;
     }
-    int y = (TOOLBAR_H + TABS_H);
-    fill(main_x, y, main_w, CRUMB_H, C_EDITOR);
-    int x = (main_x + px(16));
+    int y = (::state__TOOLBAR_H + ::state__TABS_H);
+    ::draw__fill(::state__main_x, y, ::state__main_w, ::state__CRUMB_H, ::state__C_EDITOR);
+    int x = (::state__main_x + ::draw__px(16));
     std::vector<std::string> parts;
-    if ((int)((doc_path).size()) == 0) {
-        parts.push_back(bufs[active].name);
+    if ((int)((::state__doc_path).size()) == 0) {
+        parts.push_back(::state__bufs[::state__active].name);
     } else {
-        std::string rp = rel_path(doc_path);
+        std::string rp = ::workspace__rel_path(::state__doc_path);
         {
             const std::vector<std::string>& __nexa_forin_0 = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(([](std::string __s, const std::string& __f, const std::string& __t){ if (__f.empty()) return __s; size_t __p = 0; while ((__p = __s.find(__f, __p)) != std::string::npos) { __s.replace(__p, __f.size(), __t); __p += __t.size(); } return __s; })(rp, "/", "\\"), "\\");
             for (const std::string& p : __nexa_forin_0) {
@@ -12622,522 +13217,522 @@ static void draw_crumbs() {
             }
         }
     }
-    std::string sym = enclosing_symbol();
+    std::string sym = ::editor__enclosing_symbol();
     for (int i = 0; i < (int)((parts).size()); i++) {
         bool last = (i == ((int)((parts).size()) - 1));
         if (last) {
-            draw_badge(x, y, CRUMB_H, parts[i]);
-            x = x + px(20);
+            ::highlight__draw_badge(x, y, ::state__CRUMB_H, parts[i]);
+            x = x + ::draw__px(20);
         }
-        x = x + txt_v(x, y, CRUMB_H, parts[i], C_MUTED, UI);
+        x = x + ::draw__txt_v(x, y, ::state__CRUMB_H, parts[i], ::state__C_MUTED, ::state__UI);
         if (!(last) || (int)((sym).size()) > 0) {
-            chevron((x + px(8)), (y + (CRUMB_H / 2)), false, C_MUTED);
-            x = x + px(16);
+            ::workspace__chevron((x + ::draw__px(8)), (y + (::state__CRUMB_H / 2)), false, ::state__C_MUTED);
+            x = x + ::draw__px(16);
         }
-        if (x > (main_x + main_w - px(40))) {
+        if (x > (::state__main_x + ::state__main_w - ::draw__px(40))) {
             break;
         }
     }
     if ((int)((sym).size()) > 0) {
-        draw_glyph("symbol", (x - px(2)), (y + ((CRUMB_H - px(16)) / 2)), px(16), 0xB180D7);
-        txt_v((x + px(18)), y, CRUMB_H, sym, C_MUTED, UI);
+        ::draw__draw_glyph("symbol", (x - ::draw__px(2)), (y + ((::state__CRUMB_H - ::draw__px(16)) / 2)), ::draw__px(16), 0xB180D7);
+        ::draw__txt_v((x + ::draw__px(18)), y, ::state__CRUMB_H, sym, ::state__C_MUTED, ::state__UI);
     }
 }
 
-static int status_item(int x, std::string s, std::string id, bool right) {
-    int w = (tw(s, UI_SMALL) + px(16));
+static int chrome__status_item(int x, std::string s, std::string id, bool right) {
+    int w = (::draw__tw(s, ::state__UI_SMALL) + ::draw__px(16));
     int ix = ((right) ? ((x - w)) : (x));
-    if (hovered(ix, (win_h - STATUS_H), w, STATUS_H) && (int)((id).size()) > 0) {
-        fill(ix, (win_h - STATUS_H), w, STATUS_H, 0x1F77B4);
+    if (::draw__hovered(ix, (::state__win_h - ::state__STATUS_H), w, ::state__STATUS_H) && (int)((id).size()) > 0) {
+        ::draw__fill(ix, (::state__win_h - ::state__STATUS_H), w, ::state__STATUS_H, 0x1F77B4);
     }
-    txt_v((ix + px(8)), (win_h - STATUS_H), STATUS_H, s, C_BRIGHT, UI_SMALL);
-    status_items_x.push_back(ix);
-    status_items_w.push_back(w);
-    status_items_id.push_back(id);
+    ::draw__txt_v((ix + ::draw__px(8)), (::state__win_h - ::state__STATUS_H), ::state__STATUS_H, s, ::state__C_BRIGHT, ::state__UI_SMALL);
+    ::state__status_items_x.push_back(ix);
+    ::state__status_items_w.push_back(w);
+    ::state__status_items_id.push_back(id);
     return w;
 }
 
-static void draw_status() {
-    int y = (win_h - STATUS_H);
-    fill(0, y, win_w, STATUS_H, C_STATUS);
-    status_items_x.clear();
-    status_items_w.clear();
-    status_items_id.clear();
-    int bw = px(34);
-    fill(0, y, bw, STATUS_H, 0x16825D);
-    draw_logo(((bw - px(14)) / 2), (y + ((STATUS_H - px(14)) / 2)), px(14), false);
-    int x = (bw + px(4));
-    if ((int)((git_branch).size()) > 0) {
-        int gx = (x + px(8));
-        int cyy = (y + (STATUS_H / 2));
-        circle((gx + px(2)), (cyy - px(4)), px(2), C_BRIGHT);
-        circle((gx + px(2)), (cyy + px(4)), px(2), C_BRIGHT);
-        circle((gx + px(8)), (cyy - px(2)), px(2), C_BRIGHT);
-        vline((gx + px(2)), (cyy - px(2)), px(4), C_BRIGHT);
-        x = x + px(12);
-        x = x + status_item(x, git_branch, "", false);
+static void chrome__draw_status() {
+    int y = (::state__win_h - ::state__STATUS_H);
+    ::draw__fill(0, y, ::state__win_w, ::state__STATUS_H, ::state__C_STATUS);
+    ::state__status_items_x.clear();
+    ::state__status_items_w.clear();
+    ::state__status_items_id.clear();
+    int bw = ::draw__px(34);
+    ::draw__fill(0, y, bw, ::state__STATUS_H, 0x16825D);
+    ::chrome__draw_logo(((bw - ::draw__px(14)) / 2), (y + ((::state__STATUS_H - ::draw__px(14)) / 2)), ::draw__px(14), false);
+    int x = (bw + ::draw__px(4));
+    if ((int)((::state__git_branch).size()) > 0) {
+        int gx = (x + ::draw__px(8));
+        int cyy = (y + (::state__STATUS_H / 2));
+        ::draw__circle((gx + ::draw__px(2)), (cyy - ::draw__px(4)), ::draw__px(2), ::state__C_BRIGHT);
+        ::draw__circle((gx + ::draw__px(2)), (cyy + ::draw__px(4)), ::draw__px(2), ::state__C_BRIGHT);
+        ::draw__circle((gx + ::draw__px(8)), (cyy - ::draw__px(2)), ::draw__px(2), ::state__C_BRIGHT);
+        ::draw__vline((gx + ::draw__px(2)), (cyy - ::draw__px(2)), ::draw__px(4), ::state__C_BRIGHT);
+        x = x + ::draw__px(12);
+        x = x + ::chrome__status_item(x, ::state__git_branch, "", false);
     }
-    int errs = problem_counts_err();
-    int warns = ((int)((prob_file).size()) - errs);
+    int errs = ::panel__problem_counts_err();
+    int warns = ((int)((::state__prob_file).size()) - errs);
     int px0 = x;
-    int pw = (tw(std::to_string(errs), UI_SMALL) + tw(std::to_string(warns), UI_SMALL) + px(52));
-    if (hovered(px0, y, pw, STATUS_H)) {
-        fill(px0, y, pw, STATUS_H, 0x1F77B4);
+    int pw = (::draw__tw(std::to_string(errs), ::state__UI_SMALL) + ::draw__tw(std::to_string(warns), ::state__UI_SMALL) + ::draw__px(52));
+    if (::draw__hovered(px0, y, pw, ::state__STATUS_H)) {
+        ::draw__fill(px0, y, pw, ::state__STATUS_H, 0x1F77B4);
     }
-    int cyy = (y + (STATUS_H / 2));
-    circle((px0 + px(14)), cyy, px(5), C_BRIGHT);
-    line((px0 + px(12)), (cyy - px(2)), (px0 + px(16)), (cyy + px(2)), C_BRIGHT, 1);
-    line((px0 + px(16)), (cyy - px(2)), (px0 + px(12)), (cyy + px(2)), C_BRIGHT, 1);
-    int tx = (px0 + px(22));
-    tx = tx + (txt_v(tx, y, STATUS_H, std::to_string(errs), C_BRIGHT, UI_SMALL) + px(8));
-    __nexa_gfx_tri((tx + px(5)), (cyy - px(5)), tx, (cyy + px(4)), (tx + px(10)), (cyy + px(4)), 255, 255, 255);
-    txt_v((tx + px(14)), y, STATUS_H, std::to_string(warns), C_BRIGHT, UI_SMALL);
-    status_items_x.push_back(px0);
-    status_items_w.push_back(pw);
-    status_items_id.push_back("view.problems");
+    int cyy = (y + (::state__STATUS_H / 2));
+    ::draw__circle((px0 + ::draw__px(14)), cyy, ::draw__px(5), ::state__C_BRIGHT);
+    ::draw__line((px0 + ::draw__px(12)), (cyy - ::draw__px(2)), (px0 + ::draw__px(16)), (cyy + ::draw__px(2)), ::state__C_BRIGHT, 1);
+    ::draw__line((px0 + ::draw__px(16)), (cyy - ::draw__px(2)), (px0 + ::draw__px(12)), (cyy + ::draw__px(2)), ::state__C_BRIGHT, 1);
+    int tx = (px0 + ::draw__px(22));
+    tx = tx + (::draw__txt_v(tx, y, ::state__STATUS_H, std::to_string(errs), ::state__C_BRIGHT, ::state__UI_SMALL) + ::draw__px(8));
+    __nexa_gfx_tri((tx + ::draw__px(5)), (cyy - ::draw__px(5)), tx, (cyy + ::draw__px(4)), (tx + ::draw__px(10)), (cyy + ::draw__px(4)), 255, 255, 255);
+    ::draw__txt_v((tx + ::draw__px(14)), y, ::state__STATUS_H, std::to_string(warns), ::state__C_BRIGHT, ::state__UI_SMALL);
+    ::state__status_items_x.push_back(px0);
+    ::state__status_items_w.push_back(pw);
+    ::state__status_items_id.push_back("view.problems");
     x = (px0 + pw);
-    if (task_running()) {
-        x = x + status_item(x, (task_label + "ing..."), "view.output", false);
+    if (::commands__task_running()) {
+        x = x + ::chrome__status_item(x, (::state__task_label + "ing..."), "view.output", false);
     }
-    if (now_ms < flash_until) {
-        x = x + status_item(x, flash_msg, "", false);
+    if (::state__now_ms < ::state__flash_until) {
+        x = x + ::chrome__status_item(x, ::state__flash_msg, "", false);
     }
-    int rx = (win_w - px(8));
-    if ((int)((nexac_version).size()) > 0) {
-        rx = rx - status_item(rx, nexac_version, "help.about", true);
+    int rx = (::state__win_w - ::draw__px(8));
+    if ((int)((::state__nexac_version).size()) > 0) {
+        rx = rx - ::chrome__status_item(rx, ::state__nexac_version, "help.about", true);
     }
-    if (is_file_tab()) {
-        rx = rx - status_item(rx, lang_name(doc_lang), "", true);
-        rx = rx - status_item(rx, ((doc_crlf) ? (std::string("CRLF")) : (std::string("LF"))), "status.eol", true);
-        rx = rx - status_item(rx, "UTF-8", "", true);
-        rx = rx - status_item(rx, "Spaces: 4", "", true);
-        std::string label = (std::string("Ln ") + std::to_string((cy + 1)) + ", Col " + std::to_string((vcol(L[cy], cx) + 1)));
-        if (has_sel()) {
-            std::string t = sel_text();
+    if (::buffer__is_file_tab()) {
+        rx = rx - ::chrome__status_item(rx, ::highlight__lang_name(::state__doc_lang), "", true);
+        rx = rx - ::chrome__status_item(rx, ((::state__doc_crlf) ? (std::string("CRLF")) : (std::string("LF"))), "status.eol", true);
+        rx = rx - ::chrome__status_item(rx, "UTF-8", "", true);
+        rx = rx - ::chrome__status_item(rx, "Spaces: 4", "", true);
+        std::string label = (std::string("Ln ") + std::to_string((::state__cy + 1)) + ", Col " + std::to_string((::nxtext__vcol(::state__L[::state__cy], ::state__cx) + 1)));
+        if (::buffer__has_sel()) {
+            std::string t = ::buffer__sel_text();
             label += (std::string(" (") + std::to_string((int)((t).size())) + " selected)");
         }
-        rx = rx - status_item(rx, label, "go.line", true);
+        rx = rx - ::chrome__status_item(rx, label, "go.line", true);
     }
 }
 
-static void status_mouse(int x, int y) {
-    for (int i = 0; i < (int)((status_items_x).size()); i++) {
-        int ix = status_items_x[i];
-        int w = status_items_w[i];
+static void chrome__status_mouse(int x, int y) {
+    for (int i = 0; i < (int)((::state__status_items_x).size()); i++) {
+        int ix = ::state__status_items_x[i];
+        int w = ::state__status_items_w[i];
         if (x >= ix && x < (ix + w)) {
-            std::string id = status_items_id[i];
+            std::string id = __nexa_text(::state__status_items_id[i]);
             if (id == "status.eol") {
-                if (is_file_tab()) {
-                    doc_crlf = (!doc_crlf);
-                    doc_ver = ver_seq;
-                    ver_seq = ver_seq + 1;
+                if (::buffer__is_file_tab()) {
+                    ::state__doc_crlf = (!::state__doc_crlf);
+                    ::state__doc_ver = ::state__ver_seq;
+                    ::state__ver_seq = ::state__ver_seq + 1;
                 }
             } else if ((int)((id).size()) > 0) {
-                run_cmd(id);
+                ::commands__run_cmd(id);
             }
             return;
         }
     }
 }
 
-static void shortcut_row(int x, int y, const std::string& label, const std::string& keys) {
-    int lw = tw(label, UI);
-    txt_v((x - lw - px(12)), y, px(24), label, C_MUTED, UI);
-    int kx = (x + px(4));
+static void chrome__shortcut_row(int x, int y, const std::string& label, const std::string& keys) {
+    int lw = ::draw__tw(label, ::state__UI);
+    ::draw__txt_v((x - lw - ::draw__px(12)), y, ::draw__px(24), label, ::state__C_MUTED, ::state__UI);
+    int kx = (x + ::draw__px(4));
     {
         const std::vector<std::string>& __nexa_forin_4 = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(keys, " ");
         for (const std::string& k : __nexa_forin_4) {
             std::vector<std::string> parts = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(k, "+");
             for (int j = 0; j < (int)((parts).size()); j++) {
-                kx = kx + (keycap(kx, (y + px(2)), parts[j]) + px(3));
+                kx = kx + (::draw__keycap(kx, (y + ::draw__px(2)), parts[j]) + ::draw__px(3));
                 if (j < ((int)((parts).size()) - 1)) {
-                    txt_v(kx, y, px(24), "+", C_MUTED, UI_SMALL);
-                    kx = kx + px(10);
+                    ::draw__txt_v(kx, y, ::draw__px(24), "+", ::state__C_MUTED, ::state__UI_SMALL);
+                    kx = kx + ::draw__px(10);
                 }
             }
-            kx = kx + px(6);
+            kx = kx + ::draw__px(6);
         }
     }
 }
 
-static void draw_watermark() {
-    fill(main_x, (TOOLBAR_H + TABS_H), main_w, (panel_y - TOOLBAR_H - TABS_H), C_EDITOR);
-    int top = (TOOLBAR_H + (((int)((bufs).size()) > 0) ? (TABS_H) : (0)));
-    if ((int)((bufs).size()) == 0) {
-        fill(main_x, TOOLBAR_H, main_w, TABS_H, C_EDITOR);
+static void chrome__draw_watermark() {
+    ::draw__fill(::state__main_x, (::state__TOOLBAR_H + ::state__TABS_H), ::state__main_w, (::state__panel_y - ::state__TOOLBAR_H - ::state__TABS_H), ::state__C_EDITOR);
+    int top = (::state__TOOLBAR_H + (((int)((::state__bufs).size()) > 0) ? (::state__TABS_H) : (0)));
+    if ((int)((::state__bufs).size()) == 0) {
+        ::draw__fill(::state__main_x, ::state__TOOLBAR_H, ::state__main_w, ::state__TABS_H, ::state__C_EDITOR);
     }
-    int h = (panel_y - top);
-    int cx_ = (main_x + (main_w / 2));
-    int size = imin(px(140), (h / 3));
-    int y = (top + imax(px(20), ((h - size - px(190)) / 2)));
-    if (size > px(40)) {
-        draw_logo_c((cx_ - (size / 2)), y, size, false, 0x2C2C2C, 0x1F3A52);
-        y = y + (size + px(30));
+    int h = (::state__panel_y - top);
+    int cx_ = (::state__main_x + (::state__main_w / 2));
+    int size = ::draw__imin(::draw__px(140), (h / 3));
+    int y = (top + ::draw__imax(::draw__px(20), ((h - size - ::draw__px(190)) / 2)));
+    if (size > ::draw__px(40)) {
+        ::chrome__draw_logo_c((cx_ - (size / 2)), y, size, false, 0x2C2C2C, 0x1F3A52);
+        y = y + (size + ::draw__px(30));
     }
-    shortcut_row(cx_, y, "Show All Commands", "Ctrl+Shift+P");
-    shortcut_row(cx_, (y + px(30)), "Go to File", "Ctrl+P");
-    shortcut_row(cx_, (y + px(60)), "Find in Files", "Ctrl+Shift+F");
-    shortcut_row(cx_, (y + px(90)), "Build and Run", "F5");
-    shortcut_row(cx_, (y + px(120)), "Toggle Terminal", "Ctrl+`");
-    if ((int)((folder).size()) == 0) {
-        shortcut_row(cx_, (y + px(150)), "Open Folder", "Ctrl+K Ctrl+O");
+    ::chrome__shortcut_row(cx_, y, "Show All Commands", "Ctrl+Shift+P");
+    ::chrome__shortcut_row(cx_, (y + ::draw__px(30)), "Go to File", "Ctrl+P");
+    ::chrome__shortcut_row(cx_, (y + ::draw__px(60)), "Find in Files", "Ctrl+Shift+F");
+    ::chrome__shortcut_row(cx_, (y + ::draw__px(90)), "Build and Run", "F5");
+    ::chrome__shortcut_row(cx_, (y + ::draw__px(120)), "Toggle Terminal", "Ctrl+`");
+    if ((int)((::state__folder).size()) == 0) {
+        ::chrome__shortcut_row(cx_, (y + ::draw__px(150)), "Open Folder", "Ctrl+K Ctrl+O");
     }
 }
 
-static bool link_button(int x, int y, const std::string& label) {
-    int w = (tw(label, UI) + px(4));
-    int h = px(22);
-    bool hov = hovered(x, y, w, h);
-    txt_v(x, y, h, label, ((hov) ? (0x4DAAFC) : (S_LINK)), UI);
+static bool chrome__link_button(int x, int y, const std::string& label) {
+    int w = (::draw__tw(label, ::state__UI) + ::draw__px(4));
+    int h = ::draw__px(22);
+    bool hov = ::draw__hovered(x, y, w, h);
+    ::draw__txt_v(x, y, h, label, ((hov) ? (0x4DAAFC) : (::state__S_LINK)), ::state__UI);
     if (hov) {
-        hline(x, (y + h - px(3)), (w - px(4)), 0x4DAAFC);
+        ::draw__hline(x, (y + h - ::draw__px(3)), (w - ::draw__px(4)), 0x4DAAFC);
     }
-    return clicked_in(x, y, w, h);
+    return ::app__clicked_in(x, y, w, h);
 }
 
-static void clamp_page(int content) {
-    int view_h = (panel_y - TOOLBAR_H - TABS_H);
-    page_scroll = clamp(page_scroll, 0, imax(0, (content - view_h)));
+static void chrome__clamp_page(int content) {
+    int view_h = (::state__panel_y - ::state__TOOLBAR_H - ::state__TABS_H);
+    ::state__page_scroll = ::draw__clamp(::state__page_scroll, 0, ::draw__imax(0, (content - view_h)));
 }
 
-static void draw_welcome() {
-    int top = (TOOLBAR_H + TABS_H);
-    fill(main_x, top, main_w, (panel_y - top), C_EDITOR);
-    clamp_page(px(640));
-    int x = (main_x + imax(px(40), ((main_w - px(860)) / 2)));
-    int y = (top + px(60) - page_scroll);
-    draw_logo(x, y, px(64), true);
-    __nexa_ui_heading((x + px(84)), (y + px(2)), std::string("Nexium"), px(34));
-    txt((x + px(86)), (y + px(44)), "A code editor for the Nexa language, written in Nexa.", C_MUTED, UI);
-    y = y + px(110);
-    int col2 = (x + px(420));
-    __nexa_ui_heading(x, y, std::string("Start"), px(19));
-    int ly = (y + px(36));
-    if (link_button(x, ly, "New File...")) {
-        run_cmd("file.new");
+static void chrome__draw_welcome() {
+    int top = (::state__TOOLBAR_H + ::state__TABS_H);
+    ::draw__fill(::state__main_x, top, ::state__main_w, (::state__panel_y - top), ::state__C_EDITOR);
+    ::chrome__clamp_page(::draw__px(640));
+    int x = (::state__main_x + ::draw__imax(::draw__px(40), ((::state__main_w - ::draw__px(860)) / 2)));
+    int y = (top + ::draw__px(60) - ::state__page_scroll);
+    ::chrome__draw_logo(x, y, ::draw__px(64), true);
+    __nexa_ui_heading((x + ::draw__px(84)), (y + ::draw__px(2)), std::string("Nexium"), ::draw__px(34));
+    ::draw__txt((x + ::draw__px(86)), (y + ::draw__px(44)), "A code editor for the Nexa language, written in Nexa.", ::state__C_MUTED, ::state__UI);
+    y = y + ::draw__px(110);
+    int col2 = (x + ::draw__px(420));
+    __nexa_ui_heading(x, y, std::string("Start"), ::draw__px(19));
+    int ly = (y + ::draw__px(36));
+    if (::chrome__link_button(x, ly, "New File...")) {
+        ::commands__run_cmd("file.new");
     }
-    if (link_button(x, (ly + px(26)), "Open File...")) {
-        run_cmd("file.open");
+    if (::chrome__link_button(x, (ly + ::draw__px(26)), "Open File...")) {
+        ::commands__run_cmd("file.open");
     }
-    if (link_button(x, (ly + px(52)), "Open Folder...")) {
-        run_cmd("file.openFolder");
+    if (::chrome__link_button(x, (ly + ::draw__px(52)), "Open Folder...")) {
+        ::commands__run_cmd("file.openFolder");
     }
-    if (link_button(x, (ly + px(78)), "Settings")) {
-        run_cmd("app.settings");
+    if (::chrome__link_button(x, (ly + ::draw__px(78)), "Settings")) {
+        ::commands__run_cmd("app.settings");
     }
-    __nexa_ui_heading(x, (ly + px(122)), std::string("Recent"), px(19));
-    int ry = (ly + px(158));
-    if ((int)((recent).size()) == 0) {
-        txt(x, ry, "You have no recent folders.", C_MUTED, UI);
+    __nexa_ui_heading(x, (ly + ::draw__px(122)), std::string("Recent"), ::draw__px(19));
+    int ry = (ly + ::draw__px(158));
+    if ((int)((::state__recent).size()) == 0) {
+        ::draw__txt(x, ry, "You have no recent folders.", ::state__C_MUTED, ::state__UI);
     }
-    for (int i = 0; i < imin((int)((recent).size()), 8); i++) {
-        std::string r = recent[i];
-        if (link_button(x, ry, __nexa_file_basename((r).c_str()))) {
-            set_folder(r);
+    for (int i = 0; i < ::draw__imin((int)((::state__recent).size()), 8); i++) {
+        std::string r = __nexa_text(::state__recent[i]);
+        if (::chrome__link_button(x, ry, __nexa_file_basename((r).c_str()))) {
+            ::workspace__set_folder(r);
             return;
         }
-        int nw = tw(__nexa_file_basename((r).c_str()), UI);
-        txt_v((x + nw + px(14)), ry, px(22), fit(r, (col2 - x - nw - px(30)), UI), C_MUTED, UI);
-        ry = ry + px(26);
+        int nw = ::draw__tw(__nexa_file_basename((r).c_str()), ::state__UI);
+        ::draw__txt_v((x + nw + ::draw__px(14)), ry, ::draw__px(22), ::draw__fit(r, (col2 - x - nw - ::draw__px(30)), ::state__UI), ::state__C_MUTED, ::state__UI);
+        ry = ry + ::draw__px(26);
     }
-    __nexa_ui_heading(col2, y, std::string("Walkthroughs"), px(19));
-    int cy_ = (y + px(36));
+    __nexa_ui_heading(col2, y, std::string("Walkthroughs"), ::draw__px(19));
+    int cy_ = (y + ::draw__px(36));
     std::vector<std::string> cards = std::vector<std::string>{"Build and run|Press F5 to build the project with NexaC and run it. Output and errors show in the panel below.", "Find your way|Ctrl+P opens any file; type > for commands, @ for symbols in the file, or : and a line number.", "Check as you save|Saving a .nxa file runs the Nexa parser on it; problems appear as squiggles and in PROBLEMS."};
     {
         const std::vector<std::string>& __nexa_forin_0 = cards;
         for (const std::string& c : __nexa_forin_0) {
             std::vector<std::string> parts = ([](const std::string& __s, const std::string& __sep){ std::vector<std::string> __out; if (__sep.empty()) { __out.push_back(__s); return __out; } size_t __p = 0, __q; while ((__q = __s.find(__sep, __p)) != std::string::npos) { __out.push_back(__s.substr(__p, __q - __p)); __p = __q + __sep.size(); } __out.push_back(__s.substr(__p)); return __out; })(c, "|");
-            __nexa_ui_panel(col2, cy_, px(400), px(92), std::string());
-            __nexa_ui_heading((col2 + px(16)), (cy_ + px(12)), std::string(parts[0]), px(15));
-            para((col2 + px(16)), (cy_ + px(40)), px(368), parts[1], C_MUTED, UI);
-            cy_ = cy_ + px(104);
+            __nexa_ui_panel(col2, cy_, ::draw__px(400), ::draw__px(92), std::string());
+            __nexa_ui_heading((col2 + ::draw__px(16)), (cy_ + ::draw__px(12)), std::string(parts[0]), ::draw__px(15));
+            ::chrome__para((col2 + ::draw__px(16)), (cy_ + ::draw__px(40)), ::draw__px(368), parts[1], ::state__C_MUTED, ::state__UI);
+            cy_ = cy_ + ::draw__px(104);
         }
     }
 }
 
-static void draw_settings_page() {
-    int top = (TOOLBAR_H + TABS_H);
-    fill(main_x, top, main_w, (panel_y - top), C_EDITOR);
-    if (!(set_loaded)) {
-        set_compiler = nexac;
-        set_args = run_args;
-        set_loaded = true;
+static void chrome__draw_settings_page() {
+    int top = (::state__TOOLBAR_H + ::state__TABS_H);
+    ::draw__fill(::state__main_x, top, ::state__main_w, (::state__panel_y - top), ::state__C_EDITOR);
+    if (!(::state__set_loaded)) {
+        ::state__set_compiler = ::state__nexac;
+        ::state__set_args = ::state__run_args;
+        ::state__set_loaded = true;
     }
-    clamp_page(px(1260));
-    int x = (main_x + imax(px(40), ((main_w - px(720)) / 2)));
-    int w = imin(px(720), (main_w - px(80)));
-    int y = (top + px(36) - page_scroll);
-    __nexa_ui_heading(x, y, std::string("Settings"), px(28));
-    y = y + px(56);
-    __nexa_ui_panel(x, y, w, px(300), std::string("Text Editor"));
-    int iy = (y + px(56));
-    txt((x + px(20)), iy, "Font Size", C_TEXT, UI);
-    txt((x + px(20)), (iy + px(20)), "Size of the code font, in pixels.", C_MUTED, UI_SMALL);
-    int fs = __nexa_ui_slider((x + w - px(300)), (iy + px(8)), px(220), static_cast<int>(font_size), 8, 32);
-    txt((x + w - px(64)), (iy + px(8)), (std::to_string(fs) + " px"), C_TEXT, UI);
-    if (fs != font_size && drag == 0) {
-        set_font_size(fs);
+    ::chrome__clamp_page(::draw__px(1260));
+    int x = (::state__main_x + ::draw__imax(::draw__px(40), ((::state__main_w - ::draw__px(720)) / 2)));
+    int w = ::draw__imin(::draw__px(720), (::state__main_w - ::draw__px(80)));
+    int y = (top + ::draw__px(36) - ::state__page_scroll);
+    __nexa_ui_heading(x, y, std::string("Settings"), ::draw__px(28));
+    y = y + ::draw__px(56);
+    __nexa_ui_panel(x, y, w, ::draw__px(300), std::string("Text Editor"));
+    int iy = (y + ::draw__px(56));
+    ::draw__txt((x + ::draw__px(20)), iy, "Font Size", ::state__C_TEXT, ::state__UI);
+    ::draw__txt((x + ::draw__px(20)), (iy + ::draw__px(20)), "Size of the code font, in pixels.", ::state__C_MUTED, ::state__UI_SMALL);
+    int fs = __nexa_ui_slider((x + w - ::draw__px(300)), (iy + ::draw__px(8)), ::draw__px(220), static_cast<int>(::state__font_size), 8, 32);
+    ::draw__txt((x + w - ::draw__px(64)), (iy + ::draw__px(8)), (std::to_string(fs) + " px"), ::state__C_TEXT, ::state__UI);
+    if (fs != ::state__font_size && ::state__drag == 0) {
+        ::commands__set_font_size(fs);
     }
-    iy = iy + px(52);
-    bool ws = __nexa_ui_toggle((x + px(20)), iy, std::string("Render whitespace (dots for spaces, arrows for tabs)"), static_cast<bool>(show_ws));
-    if (ws != show_ws) {
-        show_ws = ws;
-        save_settings();
+    iy = iy + ::draw__px(52);
+    bool ws = __nexa_ui_toggle((x + ::draw__px(20)), iy, std::string("Render whitespace (dots for spaces, arrows for tabs)"), static_cast<bool>(::state__show_ws));
+    if (ws != ::state__show_ws) {
+        ::state__show_ws = ws;
+        ::app__save_settings();
     }
-    iy = iy + px(40);
-    bool asv = __nexa_ui_toggle((x + px(20)), iy, std::string("Auto save when switching tabs or windows"), static_cast<bool>(auto_save));
-    if (asv != auto_save) {
-        auto_save = asv;
-        save_settings();
+    iy = iy + ::draw__px(40);
+    bool asv = __nexa_ui_toggle((x + ::draw__px(20)), iy, std::string("Auto save when switching tabs or windows"), static_cast<bool>(::state__auto_save));
+    if (asv != ::state__auto_save) {
+        ::state__auto_save = asv;
+        ::app__save_settings();
     }
-    iy = iy + px(40);
-    bool mm = __nexa_ui_toggle((x + px(20)), iy, std::string("Show the minimap beside the scrollbar"), static_cast<bool>(show_minimap));
-    if (mm != show_minimap) {
-        show_minimap = mm;
-        save_settings();
+    iy = iy + ::draw__px(40);
+    bool mm = __nexa_ui_toggle((x + ::draw__px(20)), iy, std::string("Show the minimap beside the scrollbar"), static_cast<bool>(::state__show_minimap));
+    if (mm != ::state__show_minimap) {
+        ::state__show_minimap = mm;
+        ::app__save_settings();
     }
-    iy = iy + px(40);
-    txt((x + px(20)), (iy + px(8)), "Font family", C_TEXT, UI);
-    if ((int)((set_font).size()) == 0) {
-        set_font = font_family;
+    iy = iy + ::draw__px(40);
+    ::draw__txt((x + ::draw__px(20)), (iy + ::draw__px(8)), "Font family", ::state__C_TEXT, ::state__UI);
+    if ((int)((::state__set_font).size()) == 0) {
+        ::state__set_font = ::state__font_family;
     }
-    set_font = __nexa_ui_textbox((x + px(140)), iy, (w - px(280)), std::string(set_font), std::string("Cascadia Mono;Consolas"));
-    if (__nexa_ui_button((x + w - px(128)), iy, px(108), (__nexa_ui_text_height(UI) + px(16)), std::string("Apply"), std::string("secondary"))) {
-        font_family = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(set_font);
-        if ((int)((font_family).size()) == 0) {
-            font_family = "Cascadia Mono;Consolas";
+    ::state__set_font = __nexa_ui_textbox((x + ::draw__px(140)), iy, (w - ::draw__px(280)), std::string(::state__set_font), std::string("Cascadia Mono;Consolas"));
+    if (__nexa_ui_button((x + w - ::draw__px(128)), iy, ::draw__px(108), (__nexa_ui_text_height(::state__UI) + ::draw__px(16)), std::string("Apply"), std::string("secondary"))) {
+        ::state__font_family = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(::state__set_font);
+        if ((int)((::state__font_family).size()) == 0) {
+            ::state__font_family = "Cascadia Mono;Consolas";
         }
-        metrics_init();
-        save_settings();
+        ::draw__metrics_init();
+        ::app__save_settings();
     }
-    y = y + px(320);
-    __nexa_ui_panel(x, y, w, px(250), std::string("Nexa"));
-    iy = (y + px(56));
-    txt((x + px(20)), iy, "Compiler", C_TEXT, UI);
-    txt((x + px(20)), (iy + px(20)), "Name on PATH or full path of NexaC. Empty finds NexaC, Nexa or nexac.", C_MUTED, UI_SMALL);
-    set_compiler = __nexa_ui_textbox((x + px(20)), (iy + px(42)), (w - px(160)), std::string(set_compiler), std::string("NexaC"));
-    if (__nexa_ui_button((x + w - px(128)), (iy + px(42)), px(108), (__nexa_ui_text_height(UI) + px(16)), std::string("Apply"), std::string("secondary"))) {
-        nexac = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(set_compiler);
-        detect_compiler_version();
-        save_settings();
-        flash((((int)((nexac_version).size()) > 0) ? ((std::string("Using ") + nexac_version)) : (std::string("Compiler not found"))));
+    y = y + ::draw__px(320);
+    __nexa_ui_panel(x, y, w, ::draw__px(250), std::string("Nexa"));
+    iy = (y + ::draw__px(56));
+    ::draw__txt((x + ::draw__px(20)), iy, "Compiler", ::state__C_TEXT, ::state__UI);
+    ::draw__txt((x + ::draw__px(20)), (iy + ::draw__px(20)), "Name on PATH or full path of NexaC. Empty finds NexaC, Nexa or nexac.", ::state__C_MUTED, ::state__UI_SMALL);
+    ::state__set_compiler = __nexa_ui_textbox((x + ::draw__px(20)), (iy + ::draw__px(42)), (w - ::draw__px(160)), std::string(::state__set_compiler), std::string("NexaC"));
+    if (__nexa_ui_button((x + w - ::draw__px(128)), (iy + ::draw__px(42)), ::draw__px(108), (__nexa_ui_text_height(::state__UI) + ::draw__px(16)), std::string("Apply"), std::string("secondary"))) {
+        ::state__nexac = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(::state__set_compiler);
+        ::commands__detect_compiler_version();
+        ::app__save_settings();
+        ::panel__flash((((int)((::state__nexac_version).size()) > 0) ? ((std::string("Using ") + ::state__nexac_version)) : (std::string("Compiler not found"))));
     }
-    iy = iy + px(92);
-    txt((x + px(20)), iy, "Run arguments", C_TEXT, UI);
-    txt((x + px(20)), (iy + px(20)), "Passed to your program when you press F5.", C_MUTED, UI_SMALL);
-    std::string na = __nexa_ui_textbox((x + px(20)), (iy + px(42)), (w - px(40)), std::string(set_args), std::string("--flag value"));
-    if (na != set_args) {
-        set_args = na;
-        run_args = na;
-        save_settings();
+    iy = iy + ::draw__px(92);
+    ::draw__txt((x + ::draw__px(20)), iy, "Run arguments", ::state__C_TEXT, ::state__UI);
+    ::draw__txt((x + ::draw__px(20)), (iy + ::draw__px(20)), "Passed to your program when you press F5.", ::state__C_MUTED, ::state__UI_SMALL);
+    std::string na = __nexa_ui_textbox((x + ::draw__px(20)), (iy + ::draw__px(42)), (w - ::draw__px(40)), std::string(::state__set_args), std::string("--flag value"));
+    if (na != ::state__set_args) {
+        ::state__set_args = na;
+        ::state__run_args = na;
+        ::app__save_settings();
     }
-    y = y + px(270);
-    draw_agent_settings(x, y, w);
-    y = y + px(390);
-    __nexa_ui_panel(x, y, w, px(120), std::string("About"));
-    txt((x + px(20)), (y + px(56)), (std::string("Nexium ") + VERSION + ", written in Nexa and drawn with std/ui."), C_TEXT, UI);
-    std::string cv = (((int)((nexac_version).size()) > 0) ? (nexac_version) : (std::string("NexaC not found on PATH")));
-    txt((x + px(20)), (y + px(80)), (cv + "   \xC2\xB7   settings: " + settings_path), C_MUTED, UI_SMALL);
+    y = y + ::draw__px(270);
+    ::chrome__draw_agent_settings(x, y, w);
+    y = y + ::draw__px(390);
+    __nexa_ui_panel(x, y, w, ::draw__px(120), std::string("About"));
+    ::draw__txt((x + ::draw__px(20)), (y + ::draw__px(56)), (std::string("Nexium ") + ::state__VERSION + ", written in Nexa and drawn with std/ui."), ::state__C_TEXT, ::state__UI);
+    std::string cv = (((int)((::state__nexac_version).size()) > 0) ? (::state__nexac_version) : (std::string("NexaC not found on PATH")));
+    ::draw__txt((x + ::draw__px(20)), (y + ::draw__px(80)), (cv + "   \xC2\xB7   settings: " + ::state__settings_path), ::state__C_MUTED, ::state__UI_SMALL);
 }
 
-static void draw_agent_settings(int x, int y, int w) {
-    std::vector<std::string> providers = provider_ids();
-    if (set_provider != ag_provider) {
-        set_provider = ag_provider;
+static void chrome__draw_agent_settings(int x, int y, int w) {
+    std::vector<std::string> providers = ::agent__provider_ids();
+    if (::state__set_provider != ::state__ag_provider) {
+        ::state__set_provider = ::state__ag_provider;
         std::string k = "";
-        if (((ag_keys).find(ag_provider) != (ag_keys).end())) {
-            k = ag_keys[ag_provider];
+        if (((::state__ag_keys).find(::state__ag_provider) != (::state__ag_keys).end())) {
+            k = ::state__ag_keys[::state__ag_provider];
         }
-        fld_set(FLD_KEY, k);
-        set_url = ((((ag_urls).find(ag_provider) != (ag_urls).end())) ? (ag_urls[ag_provider]) : (std::string("")));
-        set_custom = ((((ag_custom).find(ag_provider) != (ag_custom).end())) ? (ag_custom[ag_provider]) : (std::string("")));
+        ::nxtext__fld_set(::state__FLD_KEY, k);
+        ::state__set_url = ((((::state__ag_urls).find(::state__ag_provider) != (::state__ag_urls).end())) ? (::state__ag_urls[::state__ag_provider]) : (std::string("")));
+        ::state__set_custom = ((((::state__ag_custom).find(::state__ag_provider) != (::state__ag_custom).end())) ? (::state__ag_custom[::state__ag_provider]) : (std::string("")));
     }
-    if ((int)((set_nexa_lang).size()) == 0) {
-        set_nexa_lang = nexa_lang;
+    if ((int)((::state__set_nexa_lang).size()) == 0) {
+        ::state__set_nexa_lang = ::state__nexa_lang;
     }
-    __nexa_ui_panel(x, y, w, px(370), std::string("Agent"));
-    int iy = (y + px(56));
-    int half = ((w - px(60)) / 2);
-    txt((x + px(20)), iy, "Provider", C_TEXT, UI);
-    txt((x + px(40) + half), iy, "Temperature", C_TEXT, UI);
-    int t100 = static_cast<int>(((ag_temp * 100.0) + 0.5));
-    int nt = __nexa_ui_slider((x + px(40) + half), (iy + px(30)), (half - px(60)), static_cast<int>(t100), 0, 100);
-    txt((x + w - px(56)), (iy + px(28)), (std::string("") + __nexa_fmt_f(static_cast<double>((static_cast<double>(nt) / 100.0)), " ", '>', 0, 0, false, 2, 0)), C_TEXT, UI);
+    __nexa_ui_panel(x, y, w, ::draw__px(370), std::string("Agent"));
+    int iy = (y + ::draw__px(56));
+    int half = ((w - ::draw__px(60)) / 2);
+    ::draw__txt((x + ::draw__px(20)), iy, "Provider", ::state__C_TEXT, ::state__UI);
+    ::draw__txt((x + ::draw__px(40) + half), iy, "Temperature", ::state__C_TEXT, ::state__UI);
+    int t100 = static_cast<int>(((::state__ag_temp * 100.0) + 0.5));
+    int nt = __nexa_ui_slider((x + ::draw__px(40) + half), (iy + ::draw__px(30)), (half - ::draw__px(60)), static_cast<int>(t100), 0, 100);
+    ::draw__txt((x + w - ::draw__px(56)), (iy + ::draw__px(28)), (std::string("") + __nexa_fmt_f(static_cast<double>((static_cast<double>(nt) / 100.0)), " ", '>', 0, 0, false, 2, 0)), ::state__C_TEXT, ::state__UI);
     if (nt != t100) {
-        ag_temp = (static_cast<double>(nt) / 100.0);
-        save_settings();
+        ::state__ag_temp = (static_cast<double>(nt) / 100.0);
+        ::app__save_settings();
     }
-    iy = iy + px(70);
-    txt((x + px(20)), iy, "API key", C_TEXT, UI);
-    std::string env = provider_env(ag_provider);
+    iy = iy + ::draw__px(70);
+    ::draw__txt((x + ::draw__px(20)), iy, "API key", ::state__C_TEXT, ::state__UI);
+    std::string env = ::agent__provider_env(::state__ag_provider);
     std::string hint = (((int)((env).size()) > 0) ? ((std::string("Stored in settings.json. Empty uses ") + env + ".")) : (std::string("Not needed for this provider.")));
-    txt((x + px(20)), (iy + px(20)), hint, C_MUTED, UI_SMALL);
-    key_x = (x + px(20));
-    key_y = (iy + px(42));
-    key_w = (w - px(40));
-    key_h = (__nexa_ui_text_height(UI) + px(16));
-    fld_draw(FLD_KEY, key_x, key_y, key_w, key_h, (focus == F_KEY), (((int)((ag_key()).size()) > 0) ? ((std::string("(using ") + env + ")")) : (std::string("sk-..."))));
-    iy = iy + px(90);
-    txt((x + px(20)), iy, "Base URL", C_TEXT, UI);
-    std::string nu = __nexa_ui_textbox((x + px(20)), (iy + px(24)), half, std::string(set_url), std::string(provider_url(ag_provider)));
-    if (nu != set_url) {
-        set_url = nu;
-        ag_urls[ag_provider] = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(nu);
-        save_settings();
+    ::draw__txt((x + ::draw__px(20)), (iy + ::draw__px(20)), hint, ::state__C_MUTED, ::state__UI_SMALL);
+    ::state__key_x = (x + ::draw__px(20));
+    ::state__key_y = (iy + ::draw__px(42));
+    ::state__key_w = (w - ::draw__px(40));
+    ::state__key_h = (__nexa_ui_text_height(::state__UI) + ::draw__px(16));
+    ::nxtext__fld_draw(::state__FLD_KEY, ::state__key_x, ::state__key_y, ::state__key_w, ::state__key_h, (::state__focus == ::state__F_KEY), (((int)((::agent__ag_key()).size()) > 0) ? ((std::string("(using ") + env + ")")) : (std::string("sk-..."))));
+    iy = iy + ::draw__px(90);
+    ::draw__txt((x + ::draw__px(20)), iy, "Base URL", ::state__C_TEXT, ::state__UI);
+    std::string nu = __nexa_ui_textbox((x + ::draw__px(20)), (iy + ::draw__px(24)), half, std::string(::state__set_url), std::string(::agent__provider_url(::state__ag_provider)));
+    if (nu != ::state__set_url) {
+        ::state__set_url = nu;
+        ::state__ag_urls[::state__ag_provider] = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(nu);
+        ::app__save_settings();
     }
-    txt((x + px(40) + half), iy, "Custom model id", C_TEXT, UI);
-    std::string nc = __nexa_ui_textbox((x + px(40) + half), (iy + px(24)), half, std::string(set_custom), std::string("overrides the model list"));
-    if (nc != set_custom) {
-        set_custom = nc;
-        ag_custom[ag_provider] = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(nc);
-        save_settings();
+    ::draw__txt((x + ::draw__px(40) + half), iy, "Custom model id", ::state__C_TEXT, ::state__UI);
+    std::string nc = __nexa_ui_textbox((x + ::draw__px(40) + half), (iy + ::draw__px(24)), half, std::string(::state__set_custom), std::string("overrides the model list"));
+    if (nc != ::state__set_custom) {
+        ::state__set_custom = nc;
+        ::state__ag_custom[::state__ag_provider] = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(nc);
+        ::app__save_settings();
     }
-    iy = iy + px(80);
-    txt((x + px(20)), iy, "Nexa-Lang folder", C_TEXT, UI);
-    txt((x + px(20)), (iy + px(20)), "The agent reads its SYNTAX notes so it writes real Nexa.", C_MUTED, UI_SMALL);
-    std::string nl = __nexa_ui_textbox((x + px(20)), (iy + px(42)), (w - px(40)), std::string(set_nexa_lang), std::string("D:\\Projects\\Nexa-Lang"));
-    if (nl != set_nexa_lang) {
-        set_nexa_lang = nl;
-        nexa_lang = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(nl);
-        save_settings();
+    iy = iy + ::draw__px(80);
+    ::draw__txt((x + ::draw__px(20)), iy, "Nexa-Lang folder", ::state__C_TEXT, ::state__UI);
+    ::draw__txt((x + ::draw__px(20)), (iy + ::draw__px(20)), "The agent reads its SYNTAX notes so it writes real Nexa.", ::state__C_MUTED, ::state__UI_SMALL);
+    std::string nl = __nexa_ui_textbox((x + ::draw__px(20)), (iy + ::draw__px(42)), (w - ::draw__px(40)), std::string(::state__set_nexa_lang), std::string("D:\\Projects\\Nexa-Lang"));
+    if (nl != ::state__set_nexa_lang) {
+        ::state__set_nexa_lang = nl;
+        ::state__nexa_lang = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(nl);
+        ::app__save_settings();
     }
     std::vector<std::string> plabels;
     {
         const std::vector<std::string>& __nexa_forin_3 = providers;
         for (const std::string& p : __nexa_forin_3) {
-            plabels.push_back(provider_label(p));
+            plabels.push_back(::agent__provider_label(p));
         }
     }
-    int pi = ([&](){ const auto& __nexa_v = providers; const auto& __nexa_x = ag_provider; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
-    int np = __nexa_ui_dropdown((x + px(20)), (y + px(56) + px(26)), half, plabels, pi);
+    int pi = ([&](){ const auto& __nexa_v = providers; const auto& __nexa_x = ::state__ag_provider; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
+    int np = __nexa_ui_dropdown((x + ::draw__px(20)), (y + ::draw__px(56) + ::draw__px(26)), half, plabels, pi);
     if (np != pi && np >= 0) {
-        ag_provider = providers[np];
-        save_settings();
+        ::state__ag_provider = providers[np];
+        ::app__save_settings();
     }
 }
 
-static void key_field_changed() {
-    std::string k = fld_text[FLD_KEY];
-    ag_keys[ag_provider] = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(k);
-    save_settings();
+static void chrome__key_field_changed() {
+    std::string k = ::state__fld_text[::state__FLD_KEY];
+    ::state__ag_keys[::state__ag_provider] = ([](const std::string& __s){ size_t __a = __s.find_first_not_of(" \t\n\r\f\v"); if (__a == std::string::npos) return std::string(); size_t __b = __s.find_last_not_of(" \t\n\r\f\v"); return __s.substr(__a, __b - __a + 1); })(k);
+    ::app__save_settings();
 }
 
-static std::string settings_file() {
+static std::string app__settings_file() {
     const char* __nexa_ge_0 = getenv("NEXIUM_CONFIG_DIR");
     std::string dir = __nexa_ge_0 ? __nexa_ge_0 : "";
     if ((int)((dir).size()) == 0) {
-        dir = path_join(__nexa_os_config_dir(), "Nexium");
+        dir = ::workspace__path_join(__nexa_os_config_dir(), "Nexium");
     }
     if (!(__nexa_file_isdir((dir).c_str()))) {
         (void)__nexa_file_mkdir((dir).c_str());
     }
-    return path_join(dir, "settings.json");
+    return ::workspace__path_join(dir, "settings.json");
 }
 
-static void load_settings() {
-    settings_path = settings_file();
-    if (!(__nexa_file_isfile((settings_path).c_str()))) {
+static void app__load_settings() {
+    ::state__settings_path = ::app__settings_file();
+    if (!(__nexa_file_isfile((::state__settings_path).c_str()))) {
         return;
     }
-    __nexa_json j = __nexa_json_parse(__nexa_file_read((settings_path).c_str()));
+    __nexa_json j = __nexa_json_parse(__nexa_file_read((::state__settings_path).c_str()));
     if (!(j.ok()) || !(j.is_object())) {
         return;
     }
     if (j.has("folder")) {
-        folder = j.get("folder").as_string();
+        ::state__folder = j.get("folder").as_string();
     }
     if (j.has("nexac")) {
-        nexac = j.get("nexac").as_string();
+        ::state__nexac = j.get("nexac").as_string();
     }
-    if (nexac == "Nexa") {
-        nexac = "";
+    if (::state__nexac == "Nexa") {
+        ::state__nexac = "";
     }
     if (j.has("run_args")) {
-        run_args = j.get("run_args").as_string();
+        ::state__run_args = j.get("run_args").as_string();
     }
     if (j.has("sidebar_w")) {
-        sidebar_w = j.get("sidebar_w").as_int();
+        ::state__sidebar_w = j.get("sidebar_w").as_int();
     }
     if (j.has("panel_h")) {
-        panel_h = j.get("panel_h").as_int();
+        ::state__panel_h = j.get("panel_h").as_int();
     }
     if (j.has("show_sidebar")) {
-        show_sidebar = j.get("show_sidebar").as_bool();
+        ::state__show_sidebar = j.get("show_sidebar").as_bool();
     }
     if (j.has("show_panel")) {
-        show_panel = j.get("show_panel").as_bool();
+        ::state__show_panel = j.get("show_panel").as_bool();
     }
     if (j.has("font_size")) {
-        font_size = clamp(j.get("font_size").as_int(), 8, 32);
+        ::state__font_size = ::draw__clamp(j.get("font_size").as_int(), 8, 32);
     }
     if (j.has("render_whitespace")) {
-        show_ws = j.get("render_whitespace").as_bool();
+        ::state__show_ws = j.get("render_whitespace").as_bool();
     }
     if (j.has("auto_save")) {
-        auto_save = j.get("auto_save").as_bool();
+        ::state__auto_save = j.get("auto_save").as_bool();
     }
     if (j.has("maximized")) {
-        win_max = j.get("maximized").as_bool();
+        ::state__win_max = j.get("maximized").as_bool();
     }
     if (j.has("window_w")) {
-        win_w = j.get("window_w").as_int();
+        ::state__win_w = j.get("window_w").as_int();
     }
     if (j.has("window_h")) {
-        win_h = j.get("window_h").as_int();
+        ::state__win_h = j.get("window_h").as_int();
     }
     if (j.has("recent")) {
         __nexa_json r = j.get("recent");
         for (int i = 0; i < r.len(); i++) {
-            recent.push_back(r.get_at(i).as_string());
+            ::state__recent.push_back(r.get_at(i).as_string());
         }
     }
     if (j.has("font_family") && (int)((j.get("font_family").as_string()).size()) > 0) {
-        font_family = j.get("font_family").as_string();
+        ::state__font_family = j.get("font_family").as_string();
     }
     if (j.has("minimap")) {
-        show_minimap = j.get("minimap").as_bool();
+        ::state__show_minimap = j.get("minimap").as_bool();
     }
     if (j.has("show_agent")) {
-        show_agent = j.get("show_agent").as_bool();
+        ::state__show_agent = j.get("show_agent").as_bool();
     }
     if (j.has("agent_w")) {
-        agent_w = j.get("agent_w").as_int();
+        ::state__agent_w = j.get("agent_w").as_int();
     }
     if (j.has("nexa_lang")) {
-        nexa_lang = j.get("nexa_lang").as_string();
+        ::state__nexa_lang = j.get("nexa_lang").as_string();
     }
     if (j.has("provider")) {
-        ag_provider = j.get("provider").as_string();
+        ::state__ag_provider = j.get("provider").as_string();
     }
-    if (!(([&](){ const auto& __nexa_v = provider_ids(); const auto& __nexa_x = ag_provider; for (const auto& __nexa_e : __nexa_v) { if (__nexa_e == __nexa_x) return true; } return false; })())) {
-        ag_provider = "openai";
+    if (!(([&](){ const auto& __nexa_v = ::agent__provider_ids(); const auto& __nexa_x = ::state__ag_provider; for (const auto& __nexa_e : __nexa_v) { if (__nexa_e == __nexa_x) return true; } return false; })())) {
+        ::state__ag_provider = "openai";
     }
     if (j.has("mode")) {
-        ag_mode = ((j.get("mode").as_string() == "chat") ? (std::string("chat")) : (std::string("agent")));
+        ::state__ag_mode = ((j.get("mode").as_string() == "chat") ? (std::string("chat")) : (std::string("agent")));
     }
     if (j.has("temperature")) {
-        ag_temp = j.get("temperature").as_float();
+        ::state__ag_temp = j.get("temperature").as_float();
     }
     if (j.has("providers") && j.get("providers").is_object()) {
         __nexa_json ps = j.get("providers");
         {
-            const std::vector<std::string>& __nexa_forin_0 = provider_ids();
+            const std::vector<std::string>& __nexa_forin_0 = ::agent__provider_ids();
             for (const std::string& id : __nexa_forin_0) {
                 if (!(ps.has(id))) {
                     continue;
                 }
                 __nexa_json slot = ps.get(id);
                 if (slot.has("api_key")) {
-                    ag_keys[id] = slot.get("api_key").as_string();
+                    ::state__ag_keys[id] = slot.get("api_key").as_string();
                 }
                 if (slot.has("base_url")) {
-                    ag_urls[id] = slot.get("base_url").as_string();
+                    ::state__ag_urls[id] = slot.get("base_url").as_string();
                 }
                 if (slot.has("model")) {
-                    ag_models[id] = slot.get("model").as_string();
+                    ::state__ag_models[id] = slot.get("model").as_string();
                 }
                 if (slot.has("custom_model")) {
-                    ag_custom[id] = slot.get("custom_model").as_string();
+                    ::state__ag_custom[id] = slot.get("custom_model").as_string();
                 }
             }
         }
@@ -13145,271 +13740,271 @@ static void load_settings() {
     if (j.has("open_files")) {
         __nexa_json r = j.get("open_files");
         for (int i = 0; i < r.len(); i++) {
-            last_files.push_back(r.get_at(i).as_string());
+            ::state__last_files.push_back(r.get_at(i).as_string());
         }
     }
 }
 
-static void save_settings() {
-    if ((int)((settings_path).size()) == 0) {
+static void app__save_settings() {
+    if ((int)((::state__settings_path).size()) == 0) {
         return;
     }
     __nexa_json j = __nexa_json::obj();
-    if (__nexa_file_isfile((settings_path).c_str())) {
-        __nexa_json old = __nexa_json_parse(__nexa_file_read((settings_path).c_str()));
+    if (__nexa_file_isfile((::state__settings_path).c_str())) {
+        __nexa_json old = __nexa_json_parse(__nexa_file_read((::state__settings_path).c_str()));
         if (old.ok() && old.is_object()) {
             j = old;
         }
     }
-    j.set("folder", __nexa_json::str(folder));
-    j.set("nexac", __nexa_json::str(nexac));
-    j.set("run_args", __nexa_json::str(run_args));
-    j.set("sidebar_w", __nexa_json::number(static_cast<double>(static_cast<int>((sidebar_w / SCALE)))));
-    j.set("panel_h", __nexa_json::number(static_cast<double>(static_cast<int>((panel_h / SCALE)))));
-    j.set("show_sidebar", __nexa_json::boolean(show_sidebar));
-    j.set("show_panel", __nexa_json::boolean(show_panel));
-    j.set("font_size", __nexa_json::number(static_cast<double>(font_size)));
-    j.set("render_whitespace", __nexa_json::boolean(show_ws));
-    j.set("auto_save", __nexa_json::boolean(auto_save));
+    j.set("folder", __nexa_json::str(::state__folder));
+    j.set("nexac", __nexa_json::str(::state__nexac));
+    j.set("run_args", __nexa_json::str(::state__run_args));
+    j.set("sidebar_w", __nexa_json::number(static_cast<double>(static_cast<int>((::state__sidebar_w / ::state__SCALE)))));
+    j.set("panel_h", __nexa_json::number(static_cast<double>(static_cast<int>((::state__panel_h / ::state__SCALE)))));
+    j.set("show_sidebar", __nexa_json::boolean(::state__show_sidebar));
+    j.set("show_panel", __nexa_json::boolean(::state__show_panel));
+    j.set("font_size", __nexa_json::number(static_cast<double>(::state__font_size)));
+    j.set("render_whitespace", __nexa_json::boolean(::state__show_ws));
+    j.set("auto_save", __nexa_json::boolean(::state__auto_save));
     j.set("maximized", __nexa_json::boolean((nx_maximized() == 1)));
-    j.set("font_family", __nexa_json::str(font_family));
-    j.set("minimap", __nexa_json::boolean(show_minimap));
-    j.set("show_agent", __nexa_json::boolean(show_agent));
-    j.set("agent_w", __nexa_json::number(static_cast<double>(static_cast<int>((agent_w / SCALE)))));
-    j.set("nexa_lang", __nexa_json::str(nexa_lang));
-    j.set("provider", __nexa_json::str(ag_provider));
-    j.set("mode", __nexa_json::str(ag_mode));
-    j.set("temperature", __nexa_json::number(ag_temp));
+    j.set("font_family", __nexa_json::str(::state__font_family));
+    j.set("minimap", __nexa_json::boolean(::state__show_minimap));
+    j.set("show_agent", __nexa_json::boolean(::state__show_agent));
+    j.set("agent_w", __nexa_json::number(static_cast<double>(static_cast<int>((::state__agent_w / ::state__SCALE)))));
+    j.set("nexa_lang", __nexa_json::str(::state__nexa_lang));
+    j.set("provider", __nexa_json::str(::state__ag_provider));
+    j.set("mode", __nexa_json::str(::state__ag_mode));
+    j.set("temperature", __nexa_json::number(::state__ag_temp));
     __nexa_json ps = __nexa_json::obj();
     {
-        const std::vector<std::string>& __nexa_forin_0 = provider_ids();
+        const std::vector<std::string>& __nexa_forin_0 = ::agent__provider_ids();
         for (const std::string& id : __nexa_forin_0) {
             __nexa_json slot = __nexa_json::obj();
-            slot.set("api_key", __nexa_json::str(((((ag_keys).find(id) != (ag_keys).end())) ? (ag_keys[id]) : (std::string("")))));
-            slot.set("base_url", __nexa_json::str(((((ag_urls).find(id) != (ag_urls).end())) ? (ag_urls[id]) : (std::string("")))));
-            slot.set("model", __nexa_json::str(((((ag_models).find(id) != (ag_models).end())) ? (ag_models[id]) : (std::string("")))));
-            slot.set("custom_model", __nexa_json::str(((((ag_custom).find(id) != (ag_custom).end())) ? (ag_custom[id]) : (std::string("")))));
+            slot.set("api_key", __nexa_json::str(((((::state__ag_keys).find(id) != (::state__ag_keys).end())) ? (::state__ag_keys[id]) : (std::string("")))));
+            slot.set("base_url", __nexa_json::str(((((::state__ag_urls).find(id) != (::state__ag_urls).end())) ? (::state__ag_urls[id]) : (std::string("")))));
+            slot.set("model", __nexa_json::str(((((::state__ag_models).find(id) != (::state__ag_models).end())) ? (::state__ag_models[id]) : (std::string("")))));
+            slot.set("custom_model", __nexa_json::str(((((::state__ag_custom).find(id) != (::state__ag_custom).end())) ? (::state__ag_custom[id]) : (std::string("")))));
             ps.set(id, slot);
         }
     }
     j.set("providers", ps);
     if (nx_maximized() == 0 && nx_minimized() == 0) {
-        j.set("window_w", __nexa_json::number(static_cast<double>(static_cast<int>((win_w / SCALE)))));
-        j.set("window_h", __nexa_json::number(static_cast<double>(static_cast<int>((win_h / SCALE)))));
+        j.set("window_w", __nexa_json::number(static_cast<double>(static_cast<int>((::state__win_w / ::state__SCALE)))));
+        j.set("window_h", __nexa_json::number(static_cast<double>(static_cast<int>((::state__win_h / ::state__SCALE)))));
     }
     __nexa_json r = __nexa_json::arr();
     {
-        const std::vector<std::string>& __nexa_forin_1 = recent;
+        const std::vector<std::string>& __nexa_forin_1 = ::state__recent;
         for (const std::string& p : __nexa_forin_1) {
             r.push(__nexa_json::str(p));
         }
     }
     j.set("recent", r);
     __nexa_json o = __nexa_json::arr();
-    for (int i = 0; i < (int)((bufs).size()); i++) {
-        std::string p = bufs[i].path;
-        if (bufs[i].kind == 0 && (int)((p).size()) > 0) {
+    for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+        std::string p = __nexa_text(::state__bufs[i].path);
+        if (::state__bufs[i].kind == 0 && (int)((p).size()) > 0) {
             o.push(__nexa_json::str(p));
         }
     }
     j.set("open_files", o);
-    ([&](const std::string& __nexa_fc) -> int { return __nexa_file_write((settings_path).c_str(), __nexa_fc.data(), __nexa_fc.size(), 0); })((j).stringify(2));
+    ([&](const std::string& __nexa_fc) -> int { return __nexa_file_write((::state__settings_path).c_str(), __nexa_fc.data(), __nexa_fc.size(), 0); })((j).stringify(2));
 }
 
-static void remember_files() {
-    frame_dirty = true;
+static void app__remember_files() {
+    ::state__frame_dirty = true;
 }
 
-static void update_title() {
+static void app__update_title() {
     std::string t = "Nexium";
-    if ((int)((folder).size()) > 0) {
-        t = (__nexa_file_basename((folder).c_str()) + " - Nexium");
+    if ((int)((::state__folder).size()) > 0) {
+        t = (__nexa_file_basename((::state__folder).c_str()) + " - Nexium");
     }
-    if (active >= 0 && active < (int)((bufs).size())) {
-        std::string nm = bufs[active].name;
-        t = (nm + ((buf_dirty(active)) ? (std::string(" \xE2\x97\x8F")) : (std::string(""))) + " - " + t);
+    if (::state__active >= 0 && ::state__active < (int)((::state__bufs).size())) {
+        std::string nm = ::state__bufs[::state__active].name;
+        t = (nm + ((::buffer__buf_dirty(::state__active)) ? (std::string(" \xE2\x97\x8F")) : (std::string(""))) + " - " + t);
     }
     nx_title(t.c_str());
 }
 
-static bool clicked_in(int x, int y, int w, int h) {
-    return (up_this_frame && inside(up_x, up_y, x, y, w, h) && inside(down_x, down_y, x, y, w, h));
+static bool app__clicked_in(int x, int y, int w, int h) {
+    return (::state__up_this_frame && ::draw__inside(::state__up_x, ::state__up_y, x, y, w, h) && ::draw__inside(::state__down_x, ::state__down_y, x, y, w, h));
 }
 
 static void collect_events() {
-    ev_t.clear();
-    ev_a.clear();
-    ev_x.clear();
-    ev_y.clear();
-    ev_m.clear();
-    ev_c.clear();
+    ::state__ev_t.clear();
+    ::state__ev_a.clear();
+    ::state__ev_x.clear();
+    ::state__ev_y.clear();
+    ::state__ev_m.clear();
+    ::state__ev_c.clear();
     while (true) {
         int t = nx_next();
         if (t == 0) {
             break;
         }
-        ev_t.push_back(t);
-        ev_a.push_back(nx_ev_a());
-        ev_x.push_back(nx_ev_x());
-        ev_y.push_back(nx_ev_y());
-        ev_m.push_back(nx_ev_mods());
-        ev_c.push_back(nx_ev_clicks());
+        ::state__ev_t.push_back(t);
+        ::state__ev_a.push_back(nx_ev_a());
+        ::state__ev_x.push_back(nx_ev_x());
+        ::state__ev_y.push_back(nx_ev_y());
+        ::state__ev_m.push_back(nx_ev_mods());
+        ::state__ev_c.push_back(nx_ev_clicks());
     }
 }
 
 static bool is_ctrl(int m) {
-    return ((m & M_CTRL) != 0 && (m & M_ALT) == 0);
+    return ((m & ::state__M_CTRL) != 0 && (m & ::state__M_ALT) == 0);
 }
 
 static bool global_key(int vk, int m) {
-    bool ctrl = is_ctrl(m);
-    bool shift = ((m & M_SHIFT) != 0);
-    if (chord_k) {
-        chord_k = false;
+    bool ctrl = ::is_ctrl(m);
+    bool shift = ((m & ::state__M_SHIFT) != 0);
+    if (::state__chord_k) {
+        ::state__chord_k = false;
         if (ctrl && vk == 79) {
-            run_cmd("file.openFolder");
+            ::commands__run_cmd("file.openFolder");
             return true;
         }
         if (vk == 83) {
-            run_cmd("file.saveAll");
+            ::commands__run_cmd("file.saveAll");
             return true;
         }
         if ((ctrl && vk == 87) || vk == 87) {
-            run_cmd("file.closeAll");
+            ::commands__run_cmd("file.closeAll");
             return true;
         }
         return true;
     }
     if (ctrl && vk == 75 && !(shift)) {
-        chord_k = true;
-        flash("(Ctrl+K) was pressed. Waiting for second key of chord...");
+        ::state__chord_k = true;
+        ::panel__flash("(Ctrl+K) was pressed. Waiting for second key of chord...");
         return true;
     }
-    if (vk == K_F1 || (ctrl && shift && vk == 80)) {
-        run_cmd("view.palette");
+    if (vk == ::state__K_F1 || (ctrl && shift && vk == 80)) {
+        ::commands__run_cmd("view.palette");
         return true;
     }
     if (ctrl && !(shift) && vk == 80) {
-        run_cmd("view.quickOpen");
+        ::commands__run_cmd("view.quickOpen");
         return true;
     }
     if (ctrl && shift && vk == 79) {
-        run_cmd("go.symbol");
+        ::commands__run_cmd("go.symbol");
         return true;
     }
     if (ctrl && !(shift) && vk == 71) {
-        run_cmd("go.line");
+        ::commands__run_cmd("go.line");
         return true;
     }
     if (ctrl && !(shift) && vk == 78) {
-        run_cmd("file.new");
+        ::commands__run_cmd("file.new");
         return true;
     }
     if (ctrl && !(shift) && vk == 79) {
-        run_cmd("file.open");
+        ::commands__run_cmd("file.open");
         return true;
     }
     if (ctrl && !(shift) && vk == 83) {
-        run_cmd("file.save");
+        ::commands__run_cmd("file.save");
         return true;
     }
     if (ctrl && shift && vk == 83) {
-        run_cmd("file.saveAs");
+        ::commands__run_cmd("file.saveAs");
         return true;
     }
     if (ctrl && !(shift) && (vk == 87 || vk == 115)) {
-        run_cmd("file.close");
+        ::commands__run_cmd("file.close");
         return true;
     }
-    if (ctrl && vk == K_COMMA) {
-        run_cmd("app.settings");
+    if (ctrl && vk == ::state__K_COMMA) {
+        ::commands__run_cmd("app.settings");
         return true;
     }
     if (ctrl && !(shift) && vk == 66) {
-        run_cmd("view.sidebar");
+        ::commands__run_cmd("view.sidebar");
         return true;
     }
     if (ctrl && shift && vk == 76) {
-        run_cmd("view.agent");
+        ::commands__run_cmd("view.agent");
         return true;
     }
     if (ctrl && !(shift) && vk == 74) {
-        run_cmd("view.panel");
+        ::commands__run_cmd("view.panel");
         return true;
     }
     if (ctrl && shift && vk == 77) {
-        run_cmd("view.problems");
+        ::commands__run_cmd("view.problems");
         return true;
     }
     if (ctrl && shift && vk == 85) {
-        run_cmd("view.output");
+        ::commands__run_cmd("view.output");
         return true;
     }
     if (ctrl && shift && vk == 69) {
-        run_cmd("view.explorer");
+        ::commands__run_cmd("view.explorer");
         return true;
     }
     if (ctrl && shift && vk == 70) {
-        run_cmd("view.search");
+        ::commands__run_cmd("view.search");
         return true;
     }
-    if (ctrl && vk == K_BACKTICK) {
-        run_cmd("view.terminal");
+    if (ctrl && vk == ::state__K_BACKTICK) {
+        ::commands__run_cmd("view.terminal");
         return true;
     }
-    if (ctrl && (vk == K_PLUS || vk == 107)) {
-        run_cmd("view.zoomIn");
+    if (ctrl && (vk == ::state__K_PLUS || vk == 107)) {
+        ::commands__run_cmd("view.zoomIn");
         return true;
     }
-    if (ctrl && (vk == K_MINUS || vk == 109)) {
-        run_cmd("view.zoomOut");
+    if (ctrl && (vk == ::state__K_MINUS || vk == 109)) {
+        ::commands__run_cmd("view.zoomOut");
         return true;
     }
     if (ctrl && (vk == 48 || vk == 96)) {
-        run_cmd("view.zoomReset");
+        ::commands__run_cmd("view.zoomReset");
         return true;
     }
-    if (ctrl && vk == K_TAB) {
-        run_cmd(((shift) ? (std::string("go.prevTab")) : (std::string("go.nextTab"))));
+    if (ctrl && vk == ::state__K_TAB) {
+        ::commands__run_cmd(((shift) ? (std::string("go.prevTab")) : (std::string("go.nextTab"))));
         return true;
     }
-    if (ctrl && vk == K_PGDN) {
-        run_cmd("go.nextTab");
+    if (ctrl && vk == ::state__K_PGDN) {
+        ::commands__run_cmd("go.nextTab");
         return true;
     }
-    if (ctrl && vk == K_PGUP) {
-        run_cmd("go.prevTab");
+    if (ctrl && vk == ::state__K_PGUP) {
+        ::commands__run_cmd("go.prevTab");
         return true;
     }
-    if (vk == K_F5 && shift) {
-        run_cmd("run.stop");
+    if (vk == ::state__K_F5 && shift) {
+        ::commands__run_cmd("run.stop");
         return true;
     }
-    if (vk == K_F5) {
-        run_cmd("run.run");
+    if (vk == ::state__K_F5) {
+        ::commands__run_cmd("run.run");
         return true;
     }
     if (ctrl && shift && vk == 66) {
-        run_cmd("run.build");
+        ::commands__run_cmd("run.build");
         return true;
     }
-    if ((m & M_CTRL) != 0 && (m & M_ALT) != 0 && vk == 66) {
-        run_cmd("run.build");
+    if ((m & ::state__M_CTRL) != 0 && (m & ::state__M_ALT) != 0 && vk == 66) {
+        ::commands__run_cmd("run.build");
         return true;
     }
     if (ctrl && !(shift) && vk == 70) {
-        run_cmd("edit.find");
+        ::commands__run_cmd("edit.find");
         return true;
     }
     if (ctrl && !(shift) && vk == 72) {
-        run_cmd("edit.replace");
+        ::commands__run_cmd("edit.replace");
         return true;
     }
-    if (vk == K_F3 && is_file_tab()) {
-        if ((int)((fld_text[FLD_FIND]).size()) == 0) {
-            open_find(false);
+    if (vk == ::state__K_F3 && ::buffer__is_file_tab()) {
+        if ((int)((::state__fld_text[::state__FLD_FIND]).size()) == 0) {
+            ::editor__open_find(false);
         } else {
-            run_cmd(((shift) ? (std::string("edit.findPrev")) : (std::string("edit.findNext"))));
+            ::commands__run_cmd(((shift) ? (std::string("edit.findPrev")) : (std::string("edit.findNext"))));
         }
         return true;
     }
@@ -13420,363 +14015,363 @@ static bool global_key(int vk, int m) {
 }
 
 static void on_key(int vk, int m) {
-    blink_ms = now_ms;
-    frame_dirty = true;
+    ::state__blink_ms = ::state__now_ms;
+    ::state__frame_dirty = true;
     if (vk == 16 || vk == 17 || vk == 18 || vk == 91 || vk == 92) {
         return;
     }
-    if (menu_open >= 0) {
-        if (vk == K_ESC) {
-            menu_open = -1;
+    if (::state__menu_open >= 0) {
+        if (vk == ::state__K_ESC) {
+            ::state__menu_open = -1;
             return;
         }
     }
-    if (quick_open && (vk == K_ESC || vk == K_ENTER || vk == K_UP || vk == K_DOWN || vk == K_PGUP || vk == K_PGDN)) {
-        quick_key_press(vk, m);
+    if (::state__quick_open && (vk == ::state__K_ESC || vk == ::state__K_ENTER || vk == ::state__K_UP || vk == ::state__K_DOWN || vk == ::state__K_PGUP || vk == ::state__K_PGDN)) {
+        ::workspace__quick_key_press(vk, m);
         return;
     }
-    if (global_key(vk, m)) {
+    if (::global_key(vk, m)) {
         return;
     }
-    if (quick_open) {
-        quick_key_press(vk, m);
+    if (::state__quick_open) {
+        ::workspace__quick_key_press(vk, m);
         return;
     }
-    if (focus == F_FIND || focus == F_REPLACE) {
-        find_field_key(vk, m);
+    if (::state__focus == ::state__F_FIND || ::state__focus == ::state__F_REPLACE) {
+        ::editor__find_field_key(vk, m);
         return;
     }
-    if (focus == F_TERM) {
-        term_key(vk, m);
+    if (::state__focus == ::state__F_TERM) {
+        ::panel__term_key(vk, m);
         return;
     }
-    if (focus == F_AGENT && show_agent) {
-        agent_key(vk, m);
+    if (::state__focus == ::state__F_AGENT && ::state__show_agent) {
+        ::agent__agent_key(vk, m);
         return;
     }
-    if (focus == F_KEY) {
-        if (vk == K_ESC || vk == K_ENTER || vk == K_TAB) {
-            focus = F_NONE;
+    if (::state__focus == ::state__F_KEY) {
+        if (vk == ::state__K_ESC || vk == ::state__K_ENTER || vk == ::state__K_TAB) {
+            ::state__focus = ::state__F_NONE;
             return;
         }
-        if (fld_key(FLD_KEY, vk, m) == 2) {
-            key_field_changed();
+        if (::nxtext__fld_key(::state__FLD_KEY, vk, m) == 2) {
+            ::chrome__key_field_changed();
         }
         return;
     }
-    if (focus == F_SEARCH) {
-        search_key(vk, m);
+    if (::state__focus == ::state__F_SEARCH) {
+        ::workspace__search_key(vk, m);
         return;
     }
-    if (focus == F_RENAME) {
-        rename_key(vk, m);
+    if (::state__focus == ::state__F_RENAME) {
+        ::workspace__rename_key(vk, m);
         return;
     }
-    if (focus == F_TREE) {
-        tree_key(vk, m);
+    if (::state__focus == ::state__F_TREE) {
+        ::workspace__tree_key(vk, m);
         return;
     }
-    if (is_file_tab()) {
-        focus = F_EDITOR;
-        ed_key(vk, m);
+    if (::buffer__is_file_tab()) {
+        ::state__focus = ::state__F_EDITOR;
+        ::editor__ed_key(vk, m);
     }
 }
 
 static void on_char(int cp) {
-    blink_ms = now_ms;
-    frame_dirty = true;
-    if ((nx_mods() & M_CTRL) != 0 && (nx_mods() & M_ALT) == 0) {
+    ::state__blink_ms = ::state__now_ms;
+    ::state__frame_dirty = true;
+    if ((nx_mods() & ::state__M_CTRL) != 0 && (nx_mods() & ::state__M_ALT) == 0) {
         return;
     }
-    if (chord_k) {
+    if (::state__chord_k) {
         return;
     }
-    if (quick_open) {
-        fld_char(FLD_QUICK, cp);
+    if (::state__quick_open) {
+        ::nxtext__fld_char(::state__FLD_QUICK, cp);
         return;
     }
-    if (focus == F_FIND || focus == F_REPLACE) {
-        int id = ((focus == F_REPLACE) ? (FLD_REPLACE) : (FLD_FIND));
-        fld_char(id, cp);
-        if (id == FLD_FIND) {
-            find_as_you_type();
+    if (::state__focus == ::state__F_FIND || ::state__focus == ::state__F_REPLACE) {
+        int id = ((::state__focus == ::state__F_REPLACE) ? (::state__FLD_REPLACE) : (::state__FLD_FIND));
+        ::nxtext__fld_char(id, cp);
+        if (id == ::state__FLD_FIND) {
+            ::editor__find_as_you_type();
         }
         return;
     }
-    if (focus == F_TERM) {
-        fld_char(FLD_TERM, cp);
-        term_follow = true;
+    if (::state__focus == ::state__F_TERM) {
+        ::nxtext__fld_char(::state__FLD_TERM, cp);
+        ::state__term_follow = true;
         return;
     }
-    if (focus == F_AGENT && show_agent) {
-        fld_char(FLD_AGENT, cp);
+    if (::state__focus == ::state__F_AGENT && ::state__show_agent) {
+        ::nxtext__fld_char(::state__FLD_AGENT, cp);
         return;
     }
-    if (focus == F_KEY) {
-        fld_char(FLD_KEY, cp);
-        key_field_changed();
+    if (::state__focus == ::state__F_KEY) {
+        ::nxtext__fld_char(::state__FLD_KEY, cp);
+        ::chrome__key_field_changed();
         return;
     }
-    if (focus == F_SEARCH) {
-        fld_char(FLD_SEARCH, cp);
+    if (::state__focus == ::state__F_SEARCH) {
+        ::nxtext__fld_char(::state__FLD_SEARCH, cp);
         return;
     }
-    if (focus == F_RENAME) {
-        fld_char(FLD_RENAME, cp);
+    if (::state__focus == ::state__F_RENAME) {
+        ::nxtext__fld_char(::state__FLD_RENAME, cp);
         return;
     }
-    if (focus == F_TREE) {
+    if (::state__focus == ::state__F_TREE) {
         return;
     }
-    if (focus == F_EDITOR && is_file_tab()) {
-        ed_char(cp);
+    if (::state__focus == ::state__F_EDITOR && ::buffer__is_file_tab()) {
+        ::editor__ed_char(cp);
     }
 }
 
 static void on_mouse_down(int btn, int x, int y, int clicks, int m) {
-    frame_dirty = true;
+    ::state__frame_dirty = true;
     if (btn == 0) {
-        down_x = x;
-        down_y = y;
+        ::state__down_x = x;
+        ::state__down_y = y;
     }
-    if (menu_open >= 0) {
-        if (menu_mouse(x, y)) {
+    if (::state__menu_open >= 0) {
+        if (::commands__menu_mouse(x, y)) {
             return;
         }
     }
-    if (quick_open) {
-        if (quick_mouse(x, y)) {
+    if (::state__quick_open) {
+        if (::workspace__quick_mouse(x, y)) {
             return;
         }
     }
-    if (comp_click(x, y)) {
+    if (::editor__comp_click(x, y)) {
         return;
     }
-    comp_open = false;
-    if (y < TOOLBAR_H) {
+    ::state__comp_open = false;
+    if (y < ::state__TOOLBAR_H) {
         if (btn == 0) {
-            toolbar_mouse(x, y);
+            ::chrome__toolbar_mouse(x, y);
         }
         return;
     }
-    if (y >= (win_h - STATUS_H)) {
+    if (y >= (::state__win_h - ::state__STATUS_H)) {
         if (btn == 0) {
-            status_mouse(x, y);
+            ::chrome__status_mouse(x, y);
         }
         return;
     }
-    if (x < ACT_W) {
+    if (x < ::state__ACT_W) {
         if (btn == 0) {
-            activity_mouse(x, y);
+            ::chrome__activity_mouse(x, y);
         }
         return;
     }
-    if (show_agent && x >= (agent_x() - px(2))) {
-        if (x < (agent_x() + px(3))) {
-            drag = 7;
-            drag_off = (x - agent_x());
+    if (::state__show_agent && x >= (::agent__agent_x() - ::draw__px(2))) {
+        if (x < (::agent__agent_x() + ::draw__px(3))) {
+            ::state__drag = 7;
+            ::state__drag_off = (x - ::agent__agent_x());
         } else if (btn == 0) {
-            agent_mouse(x, y, btn);
+            ::agent__agent_mouse(x, y, btn);
         }
         return;
     }
-    if (show_sidebar && x >= (side_x + sidebar_w - px(2)) && x < (side_x + sidebar_w + px(3))) {
-        drag = 1;
-        drag_off = (x - (side_x + sidebar_w));
+    if (::state__show_sidebar && x >= (::state__side_x + ::state__sidebar_w - ::draw__px(2)) && x < (::state__side_x + ::state__sidebar_w + ::draw__px(3))) {
+        ::state__drag = 1;
+        ::state__drag_off = (x - (::state__side_x + ::state__sidebar_w));
         return;
     }
-    if (show_sidebar && x < (side_x + sidebar_w)) {
-        if (rename_mode > 0 && focus == F_RENAME && view == 0) {
-            int ri = ([&](){ const auto& __nexa_v = tree_rows; const auto& __nexa_x = "\x01new"; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
-            if (rename_mode == 3) {
-                ri = ([&](){ const auto& __nexa_v = tree_rows; const auto& __nexa_x = rename_path; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
+    if (::state__show_sidebar && x < (::state__side_x + ::state__sidebar_w)) {
+        if (::state__rename_mode > 0 && ::state__focus == ::state__F_RENAME && ::state__view == 0) {
+            int ri = ([&](){ const auto& __nexa_v = ::state__tree_rows; const auto& __nexa_x = "\x01new"; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
+            if (::state__rename_mode == 3) {
+                ri = ([&](){ const auto& __nexa_v = ::state__tree_rows; const auto& __nexa_x = ::state__rename_path; int __nexa_i = (int)(0); if (__nexa_i < 0) __nexa_i = 0; for (; __nexa_i < (int)__nexa_v.size(); __nexa_i++) { if (__nexa_v[(size_t)__nexa_i] == __nexa_x) return __nexa_i; } return -1; })();
             }
-            if (ri < 0 || y < tree_row_y(ri) || y >= (tree_row_y(ri) + ROW_H)) {
-                finish_rename(true);
+            if (ri < 0 || y < ::workspace__tree_row_y(ri) || y >= (::workspace__tree_row_y(ri) + ::state__ROW_H)) {
+                ::workspace__finish_rename(true);
             }
         }
-        if (view == 0) {
-            explorer_mouse(x, y, btn, clicks);
-        } else if (view == 1) {
-            search_mouse(x, y, m);
+        if (::state__view == 0) {
+            ::workspace__explorer_mouse(x, y, btn, clicks);
+        } else if (::state__view == 1) {
+            ::workspace__search_mouse(x, y, m);
         } else {
-            outline_mouse(x, y);
+            ::workspace__outline_mouse(x, y);
         }
         return;
     }
-    if (show_panel && y >= (panel_y - px(2)) && y < (panel_y + px(3))) {
-        drag = 2;
-        drag_off = (y - panel_y);
+    if (::state__show_panel && y >= (::state__panel_y - ::draw__px(2)) && y < (::state__panel_y + ::draw__px(3))) {
+        ::state__drag = 2;
+        ::state__drag_off = (y - ::state__panel_y);
         return;
     }
-    if (show_panel && y >= panel_y) {
-        panel_mouse(x, y, btn, clicks);
+    if (::state__show_panel && y >= ::state__panel_y) {
+        ::panel__panel_mouse(x, y, btn, clicks);
         return;
     }
-    if (y < (TOOLBAR_H + TABS_H)) {
-        tabs_mouse(x, y, btn, clicks);
+    if (y < (::state__TOOLBAR_H + ::state__TABS_H)) {
+        ::chrome__tabs_mouse(x, y, btn, clicks);
         return;
     }
-    if (!(is_file_tab())) {
-        if (active_kind() == 1 && inside(x, y, key_x, key_y, key_w, key_h)) {
-            focus = F_KEY;
-            fld_caret[FLD_KEY] = (int)((fld_text[FLD_KEY]).size());
-            fld_anchor[FLD_KEY] = fld_caret[FLD_KEY];
+    if (!(::buffer__is_file_tab())) {
+        if (::buffer__active_kind() == 1 && ::draw__inside(x, y, ::state__key_x, ::state__key_y, ::state__key_w, ::state__key_h)) {
+            ::state__focus = ::state__F_KEY;
+            ::state__fld_caret[::state__FLD_KEY] = (int)((::state__fld_text[::state__FLD_KEY]).size());
+            ::state__fld_anchor[::state__FLD_KEY] = ::state__fld_caret[::state__FLD_KEY];
         } else {
-            focus = F_NONE;
+            ::state__focus = ::state__F_NONE;
         }
         return;
     }
-    if (y < ed_y) {
+    if (y < ::state__ed_y) {
         return;
     }
-    if (find_mouse(x, y, m)) {
+    if (::editor__find_mouse(x, y, m)) {
         return;
     }
     if (btn == 0) {
-        ed_mouse_down(x, y, clicks, m);
+        ::editor__ed_mouse_down(x, y, clicks, m);
     } else if (btn == 1) {
-        focus = F_EDITOR;
-        hit_test(x, y);
-        sel_bounds();
-        bool in_sel = (has_sel() && (hit_y > sel_y1 || (hit_y == sel_y1 && hit_x >= sel_x1)) && (hit_y < sel_y2 || (hit_y == sel_y2 && hit_x <= sel_x2)));
+        ::state__focus = ::state__F_EDITOR;
+        ::editor__hit_test(x, y);
+        ::buffer__sel_bounds();
+        bool in_sel = (::buffer__has_sel() && (::state__hit_y > ::state__sel_y1 || (::state__hit_y == ::state__sel_y1 && ::state__hit_x >= ::state__sel_x1)) && (::state__hit_y < ::state__sel_y2 || (::state__hit_y == ::state__sel_y2 && ::state__hit_x <= ::state__sel_x2)));
         if (!(in_sel)) {
-            set_cursor(hit_y, hit_x, false);
+            ::buffer__set_cursor(::state__hit_y, ::state__hit_x, false);
         }
-        menu_open = 102;
-        menu_x = x;
-        menu_y = y;
+        ::state__menu_open = 102;
+        ::state__menu_x = x;
+        ::state__menu_y = y;
     }
 }
 
 static void on_mouse_up(int btn, int x, int y) {
     if (btn == 0) {
-        up_this_frame = true;
-        up_x = x;
-        up_y = y;
-        if (drag == 1 || drag == 2 || drag == 7) {
-            save_settings();
+        ::state__up_this_frame = true;
+        ::state__up_x = x;
+        ::state__up_y = y;
+        if (::state__drag == 1 || ::state__drag == 2 || ::state__drag == 7) {
+            ::app__save_settings();
         }
-        drag = 0;
+        ::state__drag = 0;
     }
-    frame_dirty = true;
+    ::state__frame_dirty = true;
 }
 
 static void on_wheel(int delta, int x, int y, bool horizontal) {
-    frame_dirty = true;
-    if (menu_open >= 0) {
+    ::state__frame_dirty = true;
+    if (::state__menu_open >= 0) {
         return;
     }
-    if (quick_open) {
-        int n = (int)((quick_items).size());
+    if (::state__quick_open) {
+        int n = (int)((::state__quick_items).size());
         if (n > 0) {
-            quick_sel = clamp((quick_sel - (delta / 120)), 0, (n - 1));
+            ::state__quick_sel = ::draw__clamp((::state__quick_sel - (delta / 120)), 0, (n - 1));
         }
         return;
     }
-    if (show_agent && x >= agent_x() && y > TOOLBAR_H) {
-        agent_wheel(delta);
+    if (::state__show_agent && x >= ::agent__agent_x() && y > ::state__TOOLBAR_H) {
+        ::agent__agent_wheel(delta);
         return;
     }
-    if (show_sidebar && x >= side_x && x < (side_x + sidebar_w) && y > TOOLBAR_H) {
-        if (view == 0) {
-            tree_scroll = imax(0, (tree_scroll - (delta * ROW_H * 3 / 120)));
-        } else if (view == 2) {
-            outline_scroll = imax(0, (outline_scroll - (delta * ROW_H * 3 / 120)));
+    if (::state__show_sidebar && x >= ::state__side_x && x < (::state__side_x + ::state__sidebar_w) && y > ::state__TOOLBAR_H) {
+        if (::state__view == 0) {
+            ::state__tree_scroll = ::draw__imax(0, (::state__tree_scroll - (delta * ::state__ROW_H * 3 / 120)));
+        } else if (::state__view == 2) {
+            ::state__outline_scroll = ::draw__imax(0, (::state__outline_scroll - (delta * ::state__ROW_H * 3 / 120)));
         } else {
-            search_scroll = imax(0, (search_scroll - (delta * ROW_H * 3 / 120)));
+            ::state__search_scroll = ::draw__imax(0, (::state__search_scroll - (delta * ::state__ROW_H * 3 / 120)));
         }
         return;
     }
-    if (show_panel && y >= panel_y) {
-        panel_wheel(delta);
+    if (::state__show_panel && y >= ::state__panel_y) {
+        ::panel__panel_wheel(delta);
         return;
     }
-    if (y >= TOOLBAR_H && y < (TOOLBAR_H + TABS_H) && x >= main_x) {
-        tab_scroll = imax(0, (tab_scroll - (delta / 2)));
+    if (y >= ::state__TOOLBAR_H && y < (::state__TOOLBAR_H + ::state__TABS_H) && x >= ::state__main_x) {
+        ::state__tab_scroll = ::draw__imax(0, (::state__tab_scroll - (delta / 2)));
         return;
     }
-    if (active >= 0 && !(is_file_tab()) && x >= main_x && y >= (TOOLBAR_H + TABS_H)) {
-        page_scroll = imax(0, (page_scroll - (delta * px(60) / 120)));
+    if (::state__active >= 0 && !(::buffer__is_file_tab()) && x >= ::state__main_x && y >= (::state__TOOLBAR_H + ::state__TABS_H)) {
+        ::state__page_scroll = ::draw__imax(0, (::state__page_scroll - (delta * ::draw__px(60) / 120)));
         return;
     }
-    if (is_file_tab() && x >= main_x && y >= ed_y) {
+    if (::buffer__is_file_tab() && x >= ::state__main_x && y >= ::state__ed_y) {
         if (horizontal) {
-            ed_wheel((0 - delta), true);
+            ::editor__ed_wheel((0 - delta), true);
         } else {
-            ed_wheel(delta, false);
+            ::editor__ed_wheel(delta, false);
         }
     }
 }
 
 static void handle_input() {
-    up_this_frame = false;
-    for (int i = 0; i < (int)((ev_t).size()); i++) {
-        int t = ev_t[i];
-        int a = ev_a[i];
+    ::state__up_this_frame = false;
+    for (int i = 0; i < (int)((::state__ev_t).size()); i++) {
+        int t = ::state__ev_t[i];
+        int a = ::state__ev_a[i];
         if (t == 1) {
-            on_key(a, ev_m[i]);
+            ::on_key(a, ::state__ev_m[i]);
         } else if (t == 2) {
-            on_char(a);
+            ::on_char(a);
         } else if (t == 3) {
-            on_mouse_down(a, ev_x[i], ev_y[i], ev_c[i], ev_m[i]);
+            ::on_mouse_down(a, ::state__ev_x[i], ::state__ev_y[i], ::state__ev_c[i], ::state__ev_m[i]);
         } else if (t == 4) {
-            on_mouse_up(a, ev_x[i], ev_y[i]);
+            ::on_mouse_up(a, ::state__ev_x[i], ::state__ev_y[i]);
         } else if (t == 5 || t == 6) {
-            on_wheel(a, ev_x[i], ev_y[i], (t == 6));
+            ::on_wheel(a, ::state__ev_x[i], ::state__ev_y[i], (t == 6));
         }
     }
-    if (drag != 0) {
-        if (nx_mouse_down(0) == 0 && !(up_this_frame)) {
-            drag = 0;
+    if (::state__drag != 0) {
+        if (nx_mouse_down(0) == 0 && !(::state__up_this_frame)) {
+            ::state__drag = 0;
         }
     }
-    if (drag == 1) {
-        sidebar_w = clamp((mx - side_x - drag_off), px(170), (win_w / 2));
-        frame_dirty = true;
-    } else if (drag == 2) {
-        panel_h = clamp((win_h - STATUS_H - (my - drag_off)), px(100), (win_h - px(240)));
-        frame_dirty = true;
-    } else if (drag == 3 || drag == 4) {
-        if (is_file_tab()) {
-            ed_drag();
+    if (::state__drag == 1) {
+        ::state__sidebar_w = ::draw__clamp((::state__mx - ::state__side_x - ::state__drag_off), ::draw__px(170), (::state__win_w / 2));
+        ::state__frame_dirty = true;
+    } else if (::state__drag == 2) {
+        ::state__panel_h = ::draw__clamp((::state__win_h - ::state__STATUS_H - (::state__my - ::state__drag_off)), ::draw__px(100), (::state__win_h - ::draw__px(240)));
+        ::state__frame_dirty = true;
+    } else if (::state__drag == 3 || ::state__drag == 4) {
+        if (::buffer__is_file_tab()) {
+            ::editor__ed_drag();
         }
-    } else if (drag == 6) {
-        if (is_file_tab()) {
-            minimap_drag();
+    } else if (::state__drag == 6) {
+        if (::buffer__is_file_tab()) {
+            ::editor__minimap_drag();
         }
-    } else if (drag == 7) {
-        agent_w = clamp((win_w - mx + drag_off), px(280), (win_w / 2));
-        frame_dirty = true;
+    } else if (::state__drag == 7) {
+        ::state__agent_w = ::draw__clamp((::state__win_w - ::state__mx + ::state__drag_off), ::draw__px(280), (::state__win_w / 2));
+        ::state__frame_dirty = true;
     }
 }
 
 static void update_cursor_shape() {
     int c = 0;
-    if (drag == 1 || drag == 7) {
+    if (::state__drag == 1 || ::state__drag == 7) {
         c = 2;
-    } else if (drag == 2) {
+    } else if (::state__drag == 2) {
         c = 3;
-    } else if (drag == 3) {
+    } else if (::state__drag == 3) {
         c = 1;
-    } else if (menu_open < 0 && !(quick_open)) {
-        if (show_sidebar && mx >= (side_x + sidebar_w - px(2)) && mx < (side_x + sidebar_w + px(3)) && my > TOOLBAR_H && my < (win_h - STATUS_H)) {
+    } else if (::state__menu_open < 0 && !(::state__quick_open)) {
+        if (::state__show_sidebar && ::state__mx >= (::state__side_x + ::state__sidebar_w - ::draw__px(2)) && ::state__mx < (::state__side_x + ::state__sidebar_w + ::draw__px(3)) && ::state__my > ::state__TOOLBAR_H && ::state__my < (::state__win_h - ::state__STATUS_H)) {
             c = 2;
-        } else if (show_agent && mx >= (agent_x() - px(2)) && mx < (agent_x() + px(3)) && my > TOOLBAR_H && my < (win_h - STATUS_H)) {
+        } else if (::state__show_agent && ::state__mx >= (::agent__agent_x() - ::draw__px(2)) && ::state__mx < (::agent__agent_x() + ::draw__px(3)) && ::state__my > ::state__TOOLBAR_H && ::state__my < (::state__win_h - ::state__STATUS_H)) {
             c = 2;
-        } else if (show_agent && mx >= agent_x() && inside(mx, my, ag_in_x, ag_in_y, (ag_in_w - px(64)), ag_in_h)) {
+        } else if (::state__show_agent && ::state__mx >= ::agent__agent_x() && ::draw__inside(::state__mx, ::state__my, ::state__ag_in_x, ::state__ag_in_y, (::state__ag_in_w - ::draw__px(64)), ::state__ag_in_h)) {
             c = 1;
-        } else if (show_panel && my >= (panel_y - px(2)) && my < (panel_y + px(3)) && mx >= main_x) {
+        } else if (::state__show_panel && ::state__my >= (::state__panel_y - ::draw__px(2)) && ::state__my < (::state__panel_y + ::draw__px(3)) && ::state__mx >= ::state__main_x) {
             c = 3;
-        } else if (is_file_tab() && mx >= text_x && mx < (ed_x + ed_w - SCROLL_W - mm_w()) && my >= ed_y && my < (ed_y + ed_h)) {
+        } else if (::buffer__is_file_tab() && ::state__mx >= ::state__text_x && ::state__mx < (::state__ed_x + ::state__ed_w - ::state__SCROLL_W - ::editor__mm_w()) && ::state__my >= ::state__ed_y && ::state__my < (::state__ed_y + ::state__ed_h)) {
             c = 1;
-            if (find_open) {
-                find_layout();
-                if (inside(mx, my, fw_x, fw_y, fw_w, fw_h)) {
+            if (::state__find_open) {
+                ::editor__find_layout();
+                if (::draw__inside(::state__mx, ::state__my, ::state__fw_x, ::state__fw_y, ::state__fw_w, ::state__fw_h)) {
                     c = 0;
                 }
             }
-            if ((nx_mods() & M_CTRL) != 0) {
+            if ((nx_mods() & ::state__M_CTRL) != 0) {
                 c = 4;
             }
         }
@@ -13785,47 +14380,47 @@ static void update_cursor_shape() {
 }
 
 static void draw_frame() {
-    tip_text = "";
+    ::state__tip_text = "";
     __nexa_ui_background();
-    layout();
-    if (active < 0) {
-        draw_watermark();
-    } else if (active_kind() == 0) {
-        draw_editor();
-        draw_crumbs();
-    } else if (active_kind() == 1) {
-        draw_settings_page();
+    ::chrome__layout();
+    if (::state__active < 0) {
+        ::chrome__draw_watermark();
+    } else if (::buffer__active_kind() == 0) {
+        ::editor__draw_editor();
+        ::chrome__draw_crumbs();
+    } else if (::buffer__active_kind() == 1) {
+        ::chrome__draw_settings_page();
     } else {
-        draw_welcome();
+        ::chrome__draw_welcome();
     }
-    draw_panel();
-    if ((int)((bufs).size()) > 0) {
-        draw_tabs();
+    ::panel__draw_panel();
+    if ((int)((::state__bufs).size()) > 0) {
+        ::chrome__draw_tabs();
     }
-    draw_sidebar();
-    draw_agent();
-    draw_activity();
-    draw_status();
-    draw_toolbar();
-    if (show_panel && (drag == 2 || (hovered(main_x, (panel_y - px(2)), main_w, px(5)) && drag == 0))) {
-        fill(main_x, (panel_y - 1), main_w, px(3), C_ACCENT);
+    ::chrome__draw_sidebar();
+    ::agent__draw_agent();
+    ::chrome__draw_activity();
+    ::chrome__draw_status();
+    ::chrome__draw_toolbar();
+    if (::state__show_panel && (::state__drag == 2 || (::draw__hovered(::state__main_x, (::state__panel_y - ::draw__px(2)), ::state__main_w, ::draw__px(5)) && ::state__drag == 0))) {
+        ::draw__fill(::state__main_x, (::state__panel_y - 1), ::state__main_w, ::draw__px(3), ::state__C_ACCENT);
     }
-    draw_completion();
-    draw_quick();
-    draw_menu();
-    draw_tooltip();
+    ::editor__draw_completion();
+    ::workspace__draw_quick();
+    ::commands__draw_menu();
+    ::chrome__draw_tooltip();
 }
 
 static bool confirm_quit() {
-    doc_store();
-    for (int i = 0; i < (int)((bufs).size()); i++) {
-        if (buf_dirty(i)) {
-            switch_to(i);
-            int r = nx_ask_save(bufs[i].name.c_str());
+    ::buffer__doc_store();
+    for (int i = 0; i < (int)((::state__bufs).size()); i++) {
+        if (::buffer__buf_dirty(i)) {
+            ::buffer__switch_to(i);
+            int r = nx_ask_save(::state__bufs[i].name.c_str());
             if (r == 0) {
                 return false;
             }
-            if (r == 1 && !(save_doc())) {
+            if (r == 1 && !(::buffer__save_doc())) {
                 return false;
             }
         }
@@ -13835,11 +14430,11 @@ static bool confirm_quit() {
 
 static void open_arg(std::string p) {
     if (__nexa_file_isdir((p).c_str())) {
-        set_folder(p);
+        ::workspace__set_folder(p);
     } else if (__nexa_file_isfile((p).c_str())) {
-        open_file(__nexa_file_abspath((p).c_str()), false);
-        if ((int)((folder).size()) == 0) {
-            set_folder(__nexa_file_dirname((__nexa_file_abspath((p).c_str())).c_str()));
+        ::buffer__open_file(__nexa_file_abspath((p).c_str()), false);
+        if ((int)((::state__folder).size()) == 0) {
+            ::workspace__set_folder(__nexa_file_dirname((__nexa_file_abspath((p).c_str())).c_str()));
         }
     }
 }
@@ -13850,157 +14445,157 @@ int main(int argc, char** argv) {
     for (int __nexa_ai = 0; __nexa_ai < argc; ++__nexa_ai) {
         args.emplace_back(argv[__nexa_ai] ? argv[__nexa_ai] : "");
     }
-    test_mode = ((int)((([]{ const char* __p = getenv("NEXIUM_OFFSCREEN"); return __p ? std::string(__p) : std::string(""); }())).size()) > 0);
+    ::state__test_mode = ((int)((([]{ const char* __p = getenv("NEXIUM_OFFSCREEN"); return __p ? std::string(__p) : std::string(""); }())).size()) > 0);
     int scale_pct = nx_dpi_init();
-    SCALE = (scale_pct / 100.0);
-    if (SCALE < 1.0) {
-        SCALE = 1.0;
+    ::state__SCALE = (scale_pct / 100.0);
+    if (::state__SCALE < 1.0) {
+        ::state__SCALE = 1.0;
     }
-    load_settings();
-    sidebar_w = px(sidebar_w);
-    panel_h = px(panel_h);
-    agent_w = px(agent_w);
-    int w0 = px(win_w);
-    int h0 = px(win_h);
+    ::app__load_settings();
+    ::state__sidebar_w = ::draw__px(::state__sidebar_w);
+    ::state__panel_h = ::draw__px(::state__panel_h);
+    ::state__agent_w = ::draw__px(::state__agent_w);
+    int w0 = ::draw__px(::state__win_w);
+    int h0 = ::draw__px(::state__win_h);
     __nexa_ui_open(std::string("Nexium"), w0, h0);
-    nx_init(px(640), px(420));
-    nx_place(w0, h0, ((win_max) ? (1) : (0)));
+    nx_init(::draw__px(640), ::draw__px(420));
+    nx_place(w0, h0, ((::state__win_max) ? (1) : (0)));
     __nexa_ui_theme_set(std::string("dark"));
     __nexa_ui_accent_set(0, 120, 212);
-    __nexa_ui_rounding_set(px(4));
-    __nexa_ui_font_size_set(px(13));
-    metrics_init();
-    fld_init();
-    hl_init();
-    cmd_init();
-    doc_load(-1);
-    detect_compiler_version();
+    __nexa_ui_rounding_set(::draw__px(4));
+    __nexa_ui_font_size_set(::draw__px(13));
+    ::draw__metrics_init();
+    ::nxtext__fld_init();
+    ::highlight__hl_init();
+    ::commands__cmd_init();
+    ::buffer__doc_load(-1);
+    ::commands__detect_compiler_version();
     if ((int)((args).size()) > 1) {
         for (int i = 0; i < (int)((args).size()); i++) {
             if (i > 0) {
-                open_arg(args[i]);
+                ::open_arg(args[i]);
             }
         }
     } else {
-        if ((int)((folder).size()) > 0 && __nexa_file_isdir((folder).c_str())) {
-            std::string f = folder;
-            folder = "";
-            set_folder(f);
+        if ((int)((::state__folder).size()) > 0 && __nexa_file_isdir((::state__folder).c_str())) {
+            std::string f = ::state__folder;
+            ::state__folder = "";
+            ::workspace__set_folder(f);
         } else {
-            folder = "";
+            ::state__folder = "";
         }
         {
-            const std::vector<std::string>& __nexa_forin_1 = last_files;
+            const std::vector<std::string>& __nexa_forin_1 = ::state__last_files;
             for (const std::string& p : __nexa_forin_1) {
                 if (__nexa_file_isfile((p).c_str())) {
-                    open_file(p, false);
+                    ::buffer__open_file(p, false);
                 }
             }
         }
-        if ((int)((bufs).size()) > 0) {
-            switch_to(0);
+        if ((int)((::state__bufs).size()) > 0) {
+            ::buffer__switch_to(0);
         }
     }
-    read_git_branch();
-    update_title();
-    if (show_panel && panel_tab == 2) {
-        ensure_terminal();
+    ::workspace__read_git_branch();
+    ::app__update_title();
+    if (::state__show_panel && ::state__panel_tab == 2) {
+        ::panel__ensure_terminal();
     }
     int was_focused = 1;
     int last_frame = 0;
-    while (!(quit)) {
+    while (!(::state__quit)) {
         __nexa_gfx_poll();
-        if (nx_close_requested() == 1 || quit_requested) {
-            quit_requested = false;
-            if (confirm_quit()) {
+        if (nx_close_requested() == 1 || ::state__quit_requested) {
+            ::state__quit_requested = false;
+            if (::confirm_quit()) {
                 break;
             }
         }
-        now_ms = static_cast<int>(nx_ms());
+        ::state__now_ms = static_cast<int>(nx_ms());
         int cw_ = nx_client_w();
         int ch_ = nx_client_h();
-        if (test_mode && (cw_ <= 0 || ch_ <= 0)) {
+        if (::state__test_mode && (cw_ <= 0 || ch_ <= 0)) {
             cw_ = __nexa_gfx_width();
             ch_ = __nexa_gfx_height();
         }
-        if ((nx_minimized() == 1 && !(test_mode)) || cw_ <= 0 || ch_ <= 0) {
+        if ((nx_minimized() == 1 && !(::state__test_mode)) || cw_ <= 0 || ch_ <= 0) {
             nx_wait(100);
             continue;
         }
         if (cw_ != __nexa_gfx_width() || ch_ != __nexa_gfx_height()) {
             __nexa_gfx_resize(cw_, ch_, 1);
-            frame_dirty = true;
+            ::state__frame_dirty = true;
         }
-        win_w = cw_;
-        win_h = ch_;
-        mx = nx_mouse_x();
-        my = nx_mouse_y();
+        ::state__win_w = cw_;
+        ::state__win_h = ch_;
+        ::state__mx = nx_mouse_x();
+        ::state__my = nx_mouse_y();
         int f = nx_focused();
         if (f == 1 && was_focused == 0) {
-            refresh_tree();
-            check_disk_changes();
+            ::workspace__refresh_tree();
+            ::buffer__check_disk_changes();
         }
-        if (f == 0 && was_focused == 1 && auto_save) {
-            save_all();
+        if (f == 0 && was_focused == 1 && ::state__auto_save) {
+            ::buffer__save_all();
         }
         was_focused = f;
-        collect_events();
-        layout();
-        handle_input();
-        poll_processes();
-        agent_poll();
-        maybe_check();
+        ::collect_events();
+        ::chrome__layout();
+        ::handle_input();
+        ::panel__poll_processes();
+        ::agent__agent_poll();
+        ::panel__maybe_check();
         std::string dropped = __nexa_gfx_drop();
         while ((int)((dropped).size()) > 0) {
-            open_arg(dropped);
+            ::open_arg(dropped);
             dropped = __nexa_gfx_drop();
         }
-        update_cursor_shape();
-        draw_frame();
-        if (test_mode) {
-            test_hook();
+        ::update_cursor_shape();
+        ::draw_frame();
+        if (::state__test_mode) {
+            ::test_hook();
         }
         __nexa_gfx_present();
-        std::string t = buf_title_key();
-        if (t != last_title) {
-            last_title = t;
-            update_title();
+        std::string t = ::buf_title_key();
+        if (t != ::state__last_title) {
+            ::state__last_title = t;
+            ::app__update_title();
         }
-        bool busy = (drag != 0 || task_proc >= 0 || check_proc >= 0 || (int)((ev_t).size()) > 0 || agent_busy());
+        bool busy = (::state__drag != 0 || ::state__task_proc >= 0 || ::state__check_proc >= 0 || (int)((::state__ev_t).size()) > 0 || ::agent__agent_busy());
         if (!(busy)) {
-            nx_wait(((term_proc >= 0) ? (50) : (250)));
+            nx_wait(((::state__term_proc >= 0) ? (50) : (250)));
         } else {
-            int spent = (static_cast<int>(nx_ms()) - now_ms);
+            int spent = (static_cast<int>(nx_ms()) - ::state__now_ms);
             if (spent < 8) {
                 nx_sleep((8 - spent));
             }
         }
     }
-    save_settings();
-    agent_stop();
-    if (term_proc >= 0) {
-        nx_proc_free(term_proc);
+    ::app__save_settings();
+    ::agent__agent_stop();
+    if (::state__term_proc >= 0) {
+        nx_proc_free(::state__term_proc);
     }
-    if (task_proc >= 0) {
-        nx_proc_free(task_proc);
+    if (::state__task_proc >= 0) {
+        nx_proc_free(::state__task_proc);
     }
     return 0;
 }
 static void test_hook() {
-    std::string dir = __nexa_file_dirname((settings_path).c_str());
-    std::string req = path_join(dir, "shot.req");
+    std::string dir = __nexa_file_dirname((::state__settings_path).c_str());
+    std::string req = ::workspace__path_join(dir, "shot.req");
     if (__nexa_file_exists((req).c_str())) {
-        __nexa_gfx_save(path_join(dir, "shot.bmp"));
+        __nexa_gfx_save(::workspace__path_join(dir, "shot.bmp"));
         (void)(__nexa_file_remove((req).c_str()));
     }
 }
 
 static std::string buf_title_key() {
-    if (active < 0) {
-        return folder;
+    if (::state__active < 0) {
+        return ::state__folder;
     }
-    std::string nm = bufs[active].name;
-    return (folder + "|" + nm + ((buf_dirty(active)) ? (std::string("*")) : (std::string(""))));
+    std::string nm = ::state__bufs[::state__active].name;
+    return (::state__folder + "|" + nm + ((::buffer__buf_dirty(::state__active)) ? (std::string("*")) : (std::string(""))));
 }
 
 
@@ -21516,8 +22111,24 @@ static const __nexa_ui_Theme __nexa_ui_themes[] = {
 };
 static const int __nexa_ui_theme_count = (int)(sizeof(__nexa_ui_themes) / sizeof(__nexa_ui_themes[0]));
 
+// A style is how widgets are built -- their shapes, edges and states -- where
+// a theme is their colours: "modern" is std/ui's own look, "fluent" is
+// Windows 11's controls.
+enum { __NEXA_UI_MODERN, __NEXA_UI_FLUENT };
+static const char* const __nexa_ui_styles[] = {"modern", "fluent"};
+static const int __nexa_ui_style_count = (int)(sizeof(__nexa_ui_styles) / sizeof(__nexa_ui_styles[0]));
+
+// What an open dialog draws at gfx.present(), over everything.
+struct __nexa_ui_Dialog {
+    int x = 0, y = 0, w = 0, h = 0, body = 0, ts = 0, by = 0, bh = 0;
+    std::string title;
+    std::vector<std::string> lines, buttons;
+    std::vector<int> bx, bw, hover, held;
+};
+
 struct __nexa_ui_State {
     int theme = 0;
+    int style = __NEXA_UI_MODERN;
     int accent_set = 0;
     unsigned int accent = 0;
     int rounding = 6;
@@ -21544,6 +22155,24 @@ struct __nexa_ui_State {
     int osel = -1;
     std::vector<std::string> oitems;
     int open_frames = 0;
+    int okind = 0;                // what is open: 0 a dropdown's list, 1 a menu
+    std::vector<int> otop;        // a menu's rows' tops, from oy (separators are short)
+    unsigned int closed_now = 0;  // what this frame's press closed
+    // the wheel: notches gathered by the polls, and this frame's, until a view takes them
+    int pend_wheel = 0, wheel = 0;
+    std::map<unsigned int, float> scrolls;  // lists' and tables' offsets
+    int grab = 0;                 // where on a scrollbar's thumb it was taken
+    // the last widget drawn, which ui.tooltip() is about
+    unsigned int last_id = 0;
+    int lx = 0, ly = 0, lw = 0, lh = 0;
+    // the tooltip: the widget the mouse rests on, since when, and what to show
+    unsigned int tip_id = 0;
+    long long tip_ms = 0;
+    int tip_armed = 0, tip_touched = 0, tip_show = 0;
+    std::string tip_text;
+    // a dialog this frame, and last frame (whose widgets it blocks)
+    int modal = 0, modal_prev = 0, in_modal = 0;
+    __nexa_ui_Dialog dlg;
 };
 static __nexa_ui_State __nexa_ui;
 
@@ -21584,6 +22213,66 @@ static unsigned int __nexa_ui_shade(unsigned int c, int amount) {
 static unsigned int __nexa_ui_text_on(unsigned int fill) {
     return __nexa_ui_luma(fill) > 150 ? 0x111418 : 0xFFFFFF;
 }
+static int __nexa_ui_is(int style) { return __nexa_ui.style == style; }
+
+// Windows 11's colours, for the fluent style. The light and dark themes take
+// Windows' own (its Mica page, cards, text and accent); paper and midnight keep
+// their page, cards, text and accent, with the control colours worked out from
+// them the way Windows layers its translucent fills; contrast keeps its white
+// outlines on black, as Windows' high-contrast themes do.
+struct __nexa_ui_Fluent {
+    int dark;
+    unsigned int bg, card, card_edge, text, text2;
+    unsigned int ctrl, ctrl_hover, ctrl_press, ctrl_edge, ctrl_bottom;
+    unsigned int strong, alt, input, input_focus, thumb;
+    unsigned int flyout, flyout_edge, divider, subtle_hover, subtle_press;
+    unsigned int accent, on_accent, critical, on_critical;
+};
+static __nexa_ui_Fluent __nexa_ui_fl() {
+    const __nexa_ui_Theme& t = __nexa_ui_t();
+    int light = std::strcmp(t.name, "light") == 0, dark = std::strcmp(t.name, "dark") == 0;
+    __nexa_ui_Fluent f;
+    if (light) { f.bg = 0xF3F3F3; f.card = 0xFBFBFB; f.text = 0x1A1A1A; }
+    else if (dark) { f.bg = 0x202020; f.card = 0x2B2B2B; f.text = 0xFFFFFF; }
+    else { f.bg = t.bg; f.card = t.surface; f.text = t.text; }
+    f.dark = __nexa_ui_luma(f.bg) < 128;
+    const unsigned int k = f.card, W = 0xFFFFFF, B = 0x000000;
+    auto mix = __nexa_ui_mix;
+    if (!f.dark) {
+        f.card_edge = mix(k, B, 16); f.text2 = mix(f.text, k, 85);
+        f.ctrl = mix(k, W, 180); f.ctrl_hover = mix(f.ctrl, B, 8); f.ctrl_press = mix(f.ctrl, B, 14);
+        f.ctrl_edge = mix(k, B, 20); f.ctrl_bottom = mix(k, B, 50);
+        f.strong = mix(k, B, 115); f.alt = mix(k, B, 6);
+        f.input = f.ctrl; f.input_focus = W; f.thumb = W;
+        f.flyout = mix(k, W, 128); f.flyout_edge = mix(k, B, 20); f.divider = mix(k, B, 18);
+        f.subtle_hover = mix(k, B, 10); f.subtle_press = mix(k, B, 6);
+    } else {
+        f.card_edge = mix(k, B, 90); f.text2 = mix(f.text, k, 50);
+        f.ctrl = mix(k, W, 20); f.ctrl_hover = mix(f.ctrl, W, 8); f.ctrl_press = mix(f.ctrl, B, 20);
+        f.ctrl_edge = mix(k, W, 30); f.ctrl_bottom = mix(k, W, 14);
+        f.strong = mix(k, W, 150); f.alt = mix(k, B, 30);
+        f.input = mix(k, W, 14); f.input_focus = mix(k, B, 60); f.thumb = mix(k, W, 40);
+        f.flyout = mix(k, W, 4); f.flyout_edge = mix(k, W, 26); f.divider = mix(k, W, 20);
+        f.subtle_hover = mix(k, W, 14); f.subtle_press = mix(k, W, 8);
+    }
+    f.accent = __nexa_ui.accent_set ? __nexa_ui.accent : light ? 0x005FB8 : dark ? 0x60CDFF : t.accent;
+    f.on_accent = __nexa_ui_text_on(f.accent);
+    f.critical = light ? 0xC42B1C : dark ? 0xFF99A4 : t.danger;
+    f.on_critical = __nexa_ui_text_on(f.critical);
+    if (std::strcmp(t.name, "contrast") == 0) {
+        f.card_edge = f.ctrl_edge = f.ctrl_bottom = f.strong = f.flyout_edge = t.border;
+        f.ctrl = f.ctrl_press = f.input = f.input_focus = f.alt = f.flyout = f.thumb = t.surface;
+        f.ctrl_hover = f.subtle_hover = f.subtle_press = t.raised;
+        f.divider = t.track;
+        f.text2 = t.muted;
+        if (!__nexa_ui.accent_set) f.on_accent = t.on_accent;
+    }
+    return f;
+}
+// The page, body text and secondary text in the current style.
+static unsigned int __nexa_ui_col_page() { return __nexa_ui_is(__NEXA_UI_FLUENT) ? __nexa_ui_fl().bg : __nexa_ui_t().bg; }
+static unsigned int __nexa_ui_col_text() { return __nexa_ui_is(__NEXA_UI_FLUENT) ? __nexa_ui_fl().text : __nexa_ui_t().text; }
+static unsigned int __nexa_ui_col_muted() { return __nexa_ui_is(__NEXA_UI_FLUENT) ? __nexa_ui_fl().text2 : __nexa_ui_t().muted; }
 
 // --- pixels -----------------------------------------------------------------------
 
@@ -21883,7 +22572,7 @@ static float __nexa_ui_text_top(float y, float h, int font, int size) {
 
 // An editing key k arrives in the queue as -1 - k (see __nexa_ui_key_ev).
 enum { __NEXA_UI_BKSP, __NEXA_UI_DEL, __NEXA_UI_LEFT, __NEXA_UI_RIGHT, __NEXA_UI_ENTER,
-       __NEXA_UI_ESC, __NEXA_UI_TAB, __NEXA_UI_HOME, __NEXA_UI_END };
+       __NEXA_UI_ESC, __NEXA_UI_TAB, __NEXA_UI_HOME, __NEXA_UI_END, __NEXA_UI_UP, __NEXA_UI_DOWN };
 
 // Called by gfx.poll(), which a frame runs twice: only gathers.
 static void __nexa_ui_after_poll() {
@@ -21892,6 +22581,7 @@ static void __nexa_ui_after_poll() {
     if ((!d && __nexa_ui.seen_down) || __nexa_ui_ev_up) __nexa_ui.pend_release = 1;
     __nexa_ui_ev_down = __nexa_ui_ev_up = 0;
     __nexa_ui.seen_down = d;
+    __nexa_ui.pend_wheel += __nexa_g.wheel_y;
     // Like gfx.typed(), nothing typed while the window was not focused counts.
     if (__nexa_gfx_has_focus()) {
         __nexa_ui.pend_ev.insert(__nexa_ui.pend_ev.end(), __nexa_ui_evq.begin(), __nexa_ui_evq.end());
@@ -21912,6 +22602,21 @@ static void __nexa_ui_begin() {
     __nexa_ui.ev.swap(__nexa_ui.pend_ev);
     __nexa_ui.pend_ev.clear();
     __nexa_ui.pend_press = __nexa_ui.pend_release = 0;
+    __nexa_ui.wheel = __nexa_ui.pend_wheel;
+    __nexa_ui.pend_wheel = 0;
+    __nexa_ui.closed_now = 0;
+    // a tooltip is forgotten once the mouse is off its widget for a frame
+    if (!__nexa_ui.tip_touched) __nexa_ui.tip_id = 0;
+    __nexa_ui.tip_touched = 0;
+    __nexa_ui.tip_show = 0;
+    // A dialog up last frame has the mouse and keys this frame: nothing else
+    // keeps the keyboard, and nothing else stays open.
+    __nexa_ui.modal_prev = __nexa_ui.modal;
+    __nexa_ui.modal = 0;
+    if (__nexa_ui.modal_prev) {
+        __nexa_ui.focus = 0;
+        __nexa_ui.open = 0;
+    }
     // A click outside the text box takes the keyboard away from it; a click
     // outside an open list closes it. Widgets under the click take it back.
     if (__nexa_ui.pressed) {
@@ -21919,7 +22624,10 @@ static void __nexa_ui_begin() {
         if (__nexa_ui.open && __nexa_ui.open_frames > 0) {
             int inside = __nexa_ui.mx >= __nexa_ui.ox && __nexa_ui.mx < __nexa_ui.ox + __nexa_ui.ow &&
                          __nexa_ui.my >= __nexa_ui.oy && __nexa_ui.my < __nexa_ui.oy + __nexa_ui.oh;
-            if (!inside) __nexa_ui.open = 0;
+            if (!inside) {
+                __nexa_ui.closed_now = __nexa_ui.open;
+                __nexa_ui.open = 0;
+            }
         }
     }
 }
@@ -21933,6 +22641,8 @@ static unsigned int __nexa_ui_id(int kind, int x, int y) {
 }
 
 static int __nexa_ui_in(int x, int y, int w, int h) {
+    // behind a dialog, nothing is under the mouse
+    if (__nexa_ui.modal_prev && !__nexa_ui.in_modal) return 0;
     int mx = __nexa_ui.mx, my = __nexa_ui.my;
     if (!(mx >= x && mx < x + w && my >= y && my < y + h)) return 0;
     // Under an open list, the list has the mouse.
@@ -21951,10 +22661,21 @@ static int __nexa_ui_clickable(unsigned int id, int x, int y, int w, int h, int&
     return __nexa_ui.active == id && __nexa_ui.released && hover;
 }
 
-// Called by gfx.present(), before the frame goes out.
+// The widget ui.tooltip() will be about.
+static void __nexa_ui_mark(unsigned int id, int x, int y, int w, int h) {
+    __nexa_ui.last_id = id;
+    __nexa_ui.lx = x; __nexa_ui.ly = y; __nexa_ui.lw = w; __nexa_ui.lh = h;
+}
+
+// Called by gfx.present(), before the frame goes out: what goes over
+// everything -- an open list or menu, a tooltip, a dialog.
 static void __nexa_ui_draw_list();
+static void __nexa_ui_draw_tip();
+static void __nexa_ui_draw_dialog();
 static void __nexa_ui_before_present() {
     __nexa_ui_draw_list();
+    __nexa_ui_draw_tip();
+    __nexa_ui_draw_dialog();
     if (!__nexa_ui.down) __nexa_ui.active = 0;
     if (__nexa_ui.open) __nexa_ui.open_frames++;
     __nexa_ui.fresh = 1;
@@ -21977,6 +22698,15 @@ static void __nexa_ui_before_present() {
     __nexa_ui.accent = (unsigned int)((c8(r) << 16) | (c8(g) << 8) | c8(b));
     __nexa_ui.accent_set = 1;
 }
+[[maybe_unused]] static void __nexa_ui_style_set(const std::string& name) {
+    for (int i = 0; i < __nexa_ui_style_count; i++) {
+        if (name == __nexa_ui_styles[i]) {
+            __nexa_ui.style = i;
+            return;
+        }
+    }
+}
+[[maybe_unused]] static std::string __nexa_ui_style_get() { return __nexa_ui_styles[__nexa_ui.style]; }
 [[maybe_unused]] static void __nexa_ui_rounding_set(int px) { __nexa_ui.rounding = px < 0 ? 0 : (px > 64 ? 64 : px); }
 [[maybe_unused]] static void __nexa_ui_font_size_set(int px) { __nexa_ui.size = px < 6 ? 6 : (px > 200 ? 200 : px); }
 
@@ -21989,7 +22719,7 @@ static void __nexa_ui_before_present() {
 [[maybe_unused]] static void __nexa_ui_background() {
     if (!__nexa_g.fb) return;
     __nexa_ui_begin();
-    unsigned int c = __nexa_ui_t().bg;
+    unsigned int c = __nexa_ui_col_page();
     int n = __nexa_g.w * __nexa_g.h;
     for (int i = 0; i < n; i++) {
         __nexa_gfx_put4(i * 4, (unsigned char)((c >> 16) & 255), (unsigned char)((c >> 8) & 255),
@@ -22000,18 +22730,24 @@ static void __nexa_ui_before_present() {
 [[maybe_unused]] static int __nexa_ui_text(int x, int y, const std::string& s, int size, int r, int g, int b) {
     __nexa_ui_begin();
     if (size <= 0) size = __nexa_ui.size;
-    unsigned int c = r < 0 ? __nexa_ui_t().text : (unsigned int)(((r & 255) << 16) | ((g & 255) << 8) | (b & 255));
-    return (int)std::ceil(__nexa_ui_text_run((float)x, (float)y, s, 0, size, c, 255, true));
+    unsigned int c = r < 0 ? __nexa_ui_col_text() : (unsigned int)(((r & 255) << 16) | ((g & 255) << 8) | (b & 255));
+    int wv = (int)std::ceil(__nexa_ui_text_run((float)x, (float)y, s, 0, size, c, 255, true));
+    __nexa_ui_mark(__nexa_ui_id(20, x, y), x, y, wv, __nexa_ui_line_h(0, size));
+    return wv;
 }
 [[maybe_unused]] static int __nexa_ui_heading(int x, int y, const std::string& s, int size) {
     __nexa_ui_begin();
     if (size <= 0) size = (int)(__nexa_ui.size * 1.5f + 0.5f);
-    return (int)std::ceil(__nexa_ui_text_run((float)x, (float)y, s, 1, size, __nexa_ui_t().text, 255, true));
+    int wv = (int)std::ceil(__nexa_ui_text_run((float)x, (float)y, s, 1, size, __nexa_ui_col_text(), 255, true));
+    __nexa_ui_mark(__nexa_ui_id(20, x, y), x, y, wv, __nexa_ui_line_h(1, size));
+    return wv;
 }
 [[maybe_unused]] static int __nexa_ui_caption(int x, int y, const std::string& s) {
     __nexa_ui_begin();
     int size = __nexa_ui.size - 2 < 6 ? 6 : __nexa_ui.size - 2;
-    return (int)std::ceil(__nexa_ui_text_run((float)x, (float)y, s, 0, size, __nexa_ui_t().muted, 255, true));
+    int wv = (int)std::ceil(__nexa_ui_text_run((float)x, (float)y, s, 0, size, __nexa_ui_col_muted(), 255, true));
+    __nexa_ui_mark(__nexa_ui_id(20, x, y), x, y, wv, __nexa_ui_line_h(0, size));
+    return wv;
 }
 [[maybe_unused]] static int __nexa_ui_text_width(const std::string& s, int size) {
     if (size <= 0) size = __nexa_ui.size;
@@ -22022,8 +22758,179 @@ static void __nexa_ui_before_present() {
     return __nexa_ui_line_h(0, size);
 }
 
+// --- the fluent style ----------------------------------------------------------------
+//
+// Windows 11's controls, drawn from WinUI's own measurements: 4 px corners on
+// controls and 8 px on cards and menus, the darker bottom edge that lifts a
+// button off the page, the accent line under a text box that has the
+// keyboard, 20 px checkboxes and radio buttons, a 40 x 20 switch, a slider
+// thumb with an accent centre, a 3 px progress bar on a hairline. The widgets
+// below do the input the same way for every style and call in only to draw.
+
+static void __nexa_ui_chevron(float cx, float cy, unsigned int c, int down);
+
+// A horizontal hairline, whole pixels.
+static void __nexa_ui_hline(float x, float y, float w, float t, unsigned int c, int a) {
+    __nexa_ui_rrect(x, y, w, t, 0, c, a);
+}
+
+// A control's resting frame: a light edge all round and a darker bottom edge.
+static void __nexa_ui_fl_frame(float x, float y, float w, float h, float r, unsigned int edge, unsigned int bottom) {
+    __nexa_ui_rrect_line(x, y, w, h, r, 1.0f, edge, 255);
+    __nexa_ui_hline(x + r, y + h - 1, w - 2 * r, 1.0f, bottom, 255);
+}
+
+static void __nexa_ui_fl_label(int x, int y, int w, int h, const std::string& label, unsigned int c) {
+    int size = __nexa_ui.size;
+    float tw = __nexa_ui_text_run(0, 0, label, 0, size, 0, 0, false);
+    float ty = __nexa_ui_text_top((float)y, (float)h, 0, size);
+    int sx0 = __nexa_ui.cx0, sy0 = __nexa_ui.cy0, sx1 = __nexa_ui.cx1, sy1 = __nexa_ui.cy1;
+    __nexa_ui.cx0 = x + 4; __nexa_ui.cy0 = y; __nexa_ui.cx1 = x + w - 4; __nexa_ui.cy1 = y + h;
+    __nexa_ui_text_run(std::floor(x + (w - tw) * 0.5f), ty, label, 0, size, c, 255, true);
+    __nexa_ui.cx0 = sx0; __nexa_ui.cy0 = sy0; __nexa_ui.cx1 = sx1; __nexa_ui.cy1 = sy1;
+}
+
+static void __nexa_ui_panel_fluent(int x, int y, int w, int h, const std::string& title) {
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, 8.0f, f.card, 255);
+    __nexa_ui_rrect_line((float)x, (float)y, (float)w, (float)h, 8.0f, 1.0f, f.card_edge, 255);
+    if (!title.empty()) {
+        int size = __nexa_ui.size;
+        int bar = __nexa_ui_line_h(1, size) + 22;
+        float ty = __nexa_ui_text_top((float)y, (float)bar, 1, size);
+        __nexa_ui_text_run((float)(x + 16), ty, title, 1, size, f.text, 255, true);
+        __nexa_ui_hline((float)(x + 1), (float)(y + bar), (float)(w - 2), 1.0f, f.divider, 255);
+    }
+}
+
+static void __nexa_ui_button_fluent(int x, int y, int w, int h, const std::string& label, const std::string& kind,
+                                    int hover, int held) {
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    float r = 4.0f;
+    if (kind == "ghost") {
+        // a subtle button: no fill until the mouse is over it
+        if (hover || held) __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, r, held ? f.subtle_press : f.subtle_hover, 255);
+        __nexa_ui_fl_label(x, y, w, h, label, held ? f.text2 : f.text);
+    } else if (kind == "secondary") {
+        __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, r, held ? f.ctrl_press : hover ? f.ctrl_hover : f.ctrl, 255);
+        __nexa_ui_fl_frame((float)x, (float)y, (float)w, (float)h, r, f.ctrl_edge, held ? f.ctrl_edge : f.ctrl_bottom);
+        __nexa_ui_fl_label(x, y, w, h, label, held ? f.text2 : f.text);
+    } else {
+        // the accent button, or the critical colour for "danger"
+        bool danger = kind == "danger";
+        unsigned int base = danger ? f.critical : f.accent;
+        unsigned int on = danger ? f.on_critical : f.on_accent;
+        unsigned int fill = held ? __nexa_ui_mix(base, f.card, 52) : hover ? __nexa_ui_mix(base, f.card, 26) : base;
+        __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, r, fill, 255);
+        if (!held) {
+            __nexa_ui_hline(x + r, (float)y, w - 2 * r, 1.0f, __nexa_ui_mix(fill, 0xFFFFFF, 22), 255);
+            __nexa_ui_hline(x + r, (float)(y + h - 1), w - 2 * r, 1.0f, __nexa_ui_mix(fill, 0x000000, f.dark ? 40 : 90), 255);
+        }
+        __nexa_ui_fl_label(x, y, w, h, label, held ? __nexa_ui_mix(on, fill, 70) : on);
+    }
+}
+
+static void __nexa_ui_checkbox_fluent(int x, int y, int box, bool checked, int hover, int held) {
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    float r = 4.0f;
+    if (checked) {
+        unsigned int fill = held ? __nexa_ui_mix(f.accent, f.card, 52) : hover ? __nexa_ui_mix(f.accent, f.card, 26) : f.accent;
+        __nexa_ui_rrect((float)x, (float)y, (float)box, (float)box, r, fill, 255);
+        __nexa_ui_segment(x + 5.0f, y + 10.5f, x + 8.5f, y + 14.0f, 1.5f, f.on_accent, 255);
+        __nexa_ui_segment(x + 8.5f, y + 14.0f, x + 15.0f, y + 6.5f, 1.5f, f.on_accent, 255);
+    } else {
+        unsigned int fill = held ? f.subtle_press : hover ? f.subtle_hover : f.alt;
+        __nexa_ui_rrect((float)x, (float)y, (float)box, (float)box, r, fill, 255);
+        __nexa_ui_rrect_line((float)x, (float)y, (float)box, (float)box, r, 1.0f, f.strong, 255);
+    }
+}
+
+static void __nexa_ui_radio_fluent(int x, int y, int box, int sel, int hover, int held) {
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    float cx = x + box * 0.5f, cy = y + box * 0.5f;
+    if (sel) {
+        // an accent ring round a white centre that grows under the mouse
+        __nexa_ui_circle(cx, cy, box * 0.5f, hover && !held ? __nexa_ui_mix(f.accent, f.card, 26) : f.accent, 255);
+        __nexa_ui_circle(cx, cy, held ? 5.0f : hover ? 7.0f : 6.0f, f.on_accent, 255);
+    } else {
+        __nexa_ui_circle(cx, cy, box * 0.5f, f.strong, 255);
+        __nexa_ui_circle(cx, cy, box * 0.5f - 1.0f, held ? f.subtle_press : hover ? f.subtle_hover : f.alt, 255);
+        if (held) __nexa_ui_circle(cx, cy, 5.0f, f.strong, 255);
+    }
+}
+
+static void __nexa_ui_toggle_fluent(int x, int y, int tw, int th, bool on, int hover, int held) {
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    float r = th * 0.5f, cy = y + r;
+    float kr = hover || held ? 7.0f : 6.0f;
+    if (on) {
+        __nexa_ui_rrect((float)x, (float)y, (float)tw, (float)th, r, hover ? __nexa_ui_mix(f.accent, f.card, 26) : f.accent, 255);
+        __nexa_ui_circle(x + tw - r, cy, kr, f.on_accent, 255);
+    } else {
+        __nexa_ui_rrect((float)x, (float)y, (float)tw, (float)th, r, hover ? f.subtle_hover : f.alt, 255);
+        __nexa_ui_rrect_line((float)x, (float)y, (float)tw, (float)th, r, 1.0f, f.strong, 255);
+        __nexa_ui_circle(x + r, cy, kr, f.strong, 255);
+    }
+}
+
+// kx is the thumb's centre; the rail runs along cy.
+static void __nexa_ui_slider_fluent(int x, int w, float kx, float cy, int hover, int dragging) {
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    __nexa_ui_rrect((float)x, cy - 2, (float)w, 4, 2, f.strong, 255);
+    __nexa_ui_rrect((float)x, cy - 2, kx - x, 4, 2, f.accent, 255);
+    __nexa_ui_circle(kx, cy, 10.0f, f.ctrl_edge, 255);
+    __nexa_ui_circle(kx, cy, 9.0f, f.thumb, 255);
+    __nexa_ui_circle(kx, cy, dragging ? 5.0f : hover ? 7.0f : 6.0f, dragging ? __nexa_ui_mix(f.accent, f.card, 40) : f.accent, 255);
+}
+
+static void __nexa_ui_progress_fluent(int x, int y, int w, double fraction) {
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    // a hairline rail and a 3 px bar along it
+    __nexa_ui_hline((float)x, (float)(y + 4), (float)w, 1.0f, f.strong, 255);
+    if (fraction > 0) __nexa_ui_rrect((float)x, (float)(y + 3), (float)(w * fraction), 3, 1.5f, f.accent, 255);
+}
+
+// A text box's frame, or with button on, a dropdown's (which is a button).
+static void __nexa_ui_field_fluent(int x, int y, int w, int h, int hover, int lit, int button) {
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    float r = 4.0f;
+    if (button) {
+        __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, r, lit ? f.ctrl_press : hover ? f.ctrl_hover : f.ctrl, 255);
+        __nexa_ui_fl_frame((float)x, (float)y, (float)w, (float)h, r, f.ctrl_edge, lit ? f.ctrl_edge : f.ctrl_bottom);
+        return;
+    }
+    __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, r, lit ? f.input_focus : hover ? f.ctrl_hover : f.input, 255);
+    __nexa_ui_rrect_line((float)x, (float)y, (float)w, (float)h, r, 1.0f, f.ctrl_edge, 255);
+    if (lit) __nexa_ui_hline((float)(x + 1), (float)(y + h - 2), (float)(w - 2), 2.0f, f.accent, 255);
+    else __nexa_ui_hline(x + r, (float)(y + h - 1), w - 2 * r, 1.0f, f.strong, 255);
+}
+
+// The open list: an 8 px menu lifted off the page; rows are inset, and the
+// chosen one carries a short accent bar at its left.
+static void __nexa_ui_list_fluent(int x, int y, int w, int h) {
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    __nexa_ui_shadow((float)x, (float)y, (float)w, (float)h, 8.0f, 16.0f, 6.0f, f.dark ? 110 : 40);
+    __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, 8.0f, f.flyout, 255);
+    __nexa_ui_rrect_line((float)x, (float)y, (float)w, (float)h, 8.0f, 1.0f, f.flyout_edge, 255);
+}
+static unsigned int __nexa_ui_list_row_fluent(int x, int iy, int w, int ih, int hover, int chosen) {
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    if (hover || chosen) {
+        __nexa_ui_rrect((float)(x + 4), (float)(iy + 1), (float)(w - 8), (float)(ih - 2), 4.0f,
+                        hover ? f.subtle_hover : f.subtle_press, 255);
+    }
+    if (chosen) __nexa_ui_rrect((float)(x + 5), iy + ih * 0.5f - 8, 3, 16, 1.5f, f.accent, 255);
+    return f.text;
+}
+
+// --- containers -------------------------------------------------------------------
+
 [[maybe_unused]] static void __nexa_ui_panel(int x, int y, int w, int h, const std::string& title) {
     __nexa_ui_begin();
+    if (__nexa_ui_is(__NEXA_UI_FLUENT)) {
+        __nexa_ui_panel_fluent(x, y, w, h, title);
+        return;
+    }
     const __nexa_ui_Theme& t = __nexa_ui_t();
     float r = (float)(__nexa_ui.rounding + 2);
     __nexa_ui_shadow((float)x, (float)y, (float)w, (float)h, r, 10.0f, 3.0f, t.shadow_alpha);
@@ -22040,17 +22947,23 @@ static void __nexa_ui_before_present() {
 
 [[maybe_unused]] static void __nexa_ui_separator(int x, int y, int w) {
     __nexa_ui_begin();
+    if (__nexa_ui_is(__NEXA_UI_FLUENT)) {
+        __nexa_ui_hline((float)x, (float)y, (float)w, 1.0f, __nexa_ui_fl().divider, 255);
+        return;
+    }
     __nexa_ui_rrect((float)x, (float)y, (float)w, 1.0f, 0, __nexa_ui_t().border, 255);
 }
 
 // --- widgets ----------------------------------------------------------------------
 
-[[maybe_unused]] static bool __nexa_ui_button(int x, int y, int w, int h, const std::string& label, const std::string& style) {
-    __nexa_ui_begin();
+// A button's look in a given state; __nexa_ui_button reads the mouse.
+static void __nexa_ui_button_paint(int x, int y, int w, int h, const std::string& label, const std::string& style,
+                                   int hover, int held) {
     const __nexa_ui_Theme& t = __nexa_ui_t();
-    unsigned int id = __nexa_ui_id(1, x, y);
-    int hover, held;
-    bool clicked = __nexa_ui_clickable(id, x, y, w, h, hover, held) != 0;
+    if (__nexa_ui_is(__NEXA_UI_FLUENT)) {
+        __nexa_ui_button_fluent(x, y, w, h, label, style, hover, held);
+        return;
+    }
     float r = (float)__nexa_ui.rounding;
     unsigned int fill, text, edge = 0;
     int filled = 1, outlined = 0;
@@ -22079,6 +22992,15 @@ static void __nexa_ui_before_present() {
     __nexa_ui.cx0 = x + 4; __nexa_ui.cy0 = y; __nexa_ui.cx1 = x + w - 4; __nexa_ui.cy1 = y + h;
     __nexa_ui_text_run(std::floor(x + (w - tw) * 0.5f), ty, label, 1, size, text, 255, true);
     __nexa_ui.cx0 = sx0; __nexa_ui.cy0 = sy0; __nexa_ui.cx1 = sx1; __nexa_ui.cy1 = sy1;
+}
+
+[[maybe_unused]] static bool __nexa_ui_button(int x, int y, int w, int h, const std::string& label, const std::string& style) {
+    __nexa_ui_begin();
+    unsigned int id = __nexa_ui_id(1, x, y);
+    int hover, held;
+    bool clicked = __nexa_ui_clickable(id, x, y, w, h, hover, held) != 0;
+    __nexa_ui_mark(id, x, y, w, h);
+    __nexa_ui_button_paint(x, y, w, h, label, style, hover, held);
     return clicked;
 }
 
@@ -22089,9 +23011,10 @@ static int __nexa_ui_labelled(int kind, int x, int y, int bw, int bh, const std:
     int h = bh > __nexa_ui_line_h(0, __nexa_ui.size) ? bh : __nexa_ui_line_h(0, __nexa_ui.size);
     unsigned int id = __nexa_ui_id(kind, x, y);
     int clicked = __nexa_ui_clickable(id, x, y, bw + lw, h, hover, held);
+    __nexa_ui_mark(id, x, y, bw + lw, h);
     if (!label.empty()) {
         float ty = __nexa_ui_text_top((float)y, (float)bh, 0, __nexa_ui.size);
-        __nexa_ui_text_run((float)(x + bw + 8), ty, label, 0, __nexa_ui.size, __nexa_ui_t().text, 255, true);
+        __nexa_ui_text_run((float)(x + bw + 8), ty, label, 0, __nexa_ui.size, __nexa_ui_col_text(), 255, true);
     }
     return clicked;
 }
@@ -22100,8 +23023,12 @@ static int __nexa_ui_labelled(int kind, int x, int y, int bw, int bh, const std:
     __nexa_ui_begin();
     const __nexa_ui_Theme& t = __nexa_ui_t();
     int hover, held;
-    int box = 18;
+    int box = __nexa_ui_is(__NEXA_UI_FLUENT) ? 20 : 18;
     if (__nexa_ui_labelled(2, x, y, box, box, label, hover, held)) checked = !checked;
+    if (__nexa_ui_is(__NEXA_UI_FLUENT)) {
+        __nexa_ui_checkbox_fluent(x, y, box, checked, hover, held);
+        return checked;
+    }
     float r = (float)(__nexa_ui.rounding < 5 ? __nexa_ui.rounding : 5);
     if (checked) {
         unsigned int a = __nexa_ui_accent();
@@ -22122,8 +23049,12 @@ static int __nexa_ui_labelled(int kind, int x, int y, int bw, int bh, const std:
     __nexa_ui_begin();
     const __nexa_ui_Theme& t = __nexa_ui_t();
     int hover, held;
-    int tw = 36, th = 20;
+    int tw = __nexa_ui_is(__NEXA_UI_FLUENT) ? 40 : 36, th = 20;
     if (__nexa_ui_labelled(3, x, y, tw, th, label, hover, held)) on = !on;
+    if (__nexa_ui_is(__NEXA_UI_FLUENT)) {
+        __nexa_ui_toggle_fluent(x, y, tw, th, on, hover, held);
+        return on;
+    }
     unsigned int rail = on ? __nexa_ui_accent() : t.track;
     if (hover) rail = __nexa_ui_shade(rail, 20);
     __nexa_ui_rrect((float)x, (float)y, (float)tw, (float)th, th * 0.5f, rail, 255);
@@ -22137,9 +23068,13 @@ static int __nexa_ui_labelled(int kind, int x, int y, int bw, int bh, const std:
     __nexa_ui_begin();
     const __nexa_ui_Theme& t = __nexa_ui_t();
     int hover, held;
-    int box = 18;
+    int box = __nexa_ui_is(__NEXA_UI_FLUENT) ? 20 : 18;
     if (__nexa_ui_labelled(4, x, y, box, box, label, hover, held)) current = value;
     float cx = x + box * 0.5f, cy = y + box * 0.5f;
+    if (__nexa_ui_is(__NEXA_UI_FLUENT)) {
+        __nexa_ui_radio_fluent(x, y, box, current == value, hover, held);
+        return current;
+    }
     if (current == value) {
         unsigned int a = __nexa_ui_accent();
         if (hover) a = __nexa_ui_shade(a, 22);
@@ -22162,6 +23097,7 @@ static int __nexa_ui_labelled(int kind, int x, int y, int bw, int bh, const std:
     float kr = 8.0f;
     unsigned int id = __nexa_ui_id(5, x, y);
     int hover = __nexa_ui_in(x, y, w, h);
+    __nexa_ui_mark(id, x, y, w, h);
     if (hover && __nexa_ui.pressed) __nexa_ui.active = id;
     int dragging = __nexa_ui.active == id && __nexa_ui.down;
     if (dragging && w > 2 * kr && hi > lo) {
@@ -22173,6 +23109,10 @@ static int __nexa_ui_labelled(int kind, int x, int y, int bw, int bh, const std:
     float f = hi > lo ? (float)(value - lo) / (hi - lo) : 0;
     float cy = y + h * 0.5f;
     float kx = x + kr + f * (w - 2 * kr);
+    if (__nexa_ui_is(__NEXA_UI_FLUENT)) {
+        __nexa_ui_slider_fluent(x, w, kx, cy, hover, dragging);
+        return value;
+    }
     __nexa_ui_rrect((float)x, cy - 2, (float)w, 4, 2, t.track, 255);
     __nexa_ui_rrect((float)x, cy - 2, kx - x, 4, 2, __nexa_ui_accent(), 255);
     __nexa_ui_shadow(kx - kr, cy - kr, 2 * kr, 2 * kr, kr, 3.0f, 1.0f, t.shadow_alpha + 20);
@@ -22188,6 +23128,10 @@ static int __nexa_ui_labelled(int kind, int x, int y, int bw, int bh, const std:
     const __nexa_ui_Theme& t = __nexa_ui_t();
     if (fraction < 0) fraction = 0;
     if (fraction > 1) fraction = 1;
+    if (__nexa_ui_is(__NEXA_UI_FLUENT)) {
+        __nexa_ui_progress_fluent(x, y, w, fraction);
+        return;
+    }
     __nexa_ui_rrect((float)x, (float)y, (float)w, 8, 4, t.track, 255);
     if (fraction > 0) __nexa_ui_rrect((float)x, (float)y, (float)(w * fraction), 8, 4, __nexa_ui_accent(), 255);
 }
@@ -22215,6 +23159,7 @@ static int __nexa_ui_hit(const std::string& s, float px, int size) {
     int pad = 10;
     unsigned int id = __nexa_ui_id(6, x, y);
     int hover = __nexa_ui_in(x, y, w, h);
+    __nexa_ui_mark(id, x, y, w, h);
     int focused = __nexa_ui.focus == id;
     if (hover && __nexa_ui.pressed) {
         if (!focused) __nexa_ui.scroll = 0;
@@ -22287,14 +23232,18 @@ static int __nexa_ui_hit(const std::string& s, float px, int size) {
         if (moved) __nexa_ui.caret_ms = __nexa_ui.frame_ms;
     }
     float r = (float)__nexa_ui.rounding;
-    __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, r, t.input, 255);
-    if (focused) {
-        unsigned int a = __nexa_ui_accent();
-        __nexa_ui_rrect_line(x - 3.0f, y - 3.0f, w + 6.0f, h + 6.0f, r + 3, 3.0f, a, 60);
-        __nexa_ui_rrect_line((float)x, (float)y, (float)w, (float)h, r, 1.5f, a, 255);
+    if (__nexa_ui_is(__NEXA_UI_FLUENT)) {
+        __nexa_ui_field_fluent(x, y, w, h, hover, focused, 0);
     } else {
-        __nexa_ui_rrect_line((float)x, (float)y, (float)w, (float)h, r, 1.0f,
-                             hover ? __nexa_ui_shade(t.border, 40) : t.border, 255);
+        __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, r, t.input, 255);
+        if (focused) {
+            unsigned int a = __nexa_ui_accent();
+            __nexa_ui_rrect_line(x - 3.0f, y - 3.0f, w + 6.0f, h + 6.0f, r + 3, 3.0f, a, 60);
+            __nexa_ui_rrect_line((float)x, (float)y, (float)w, (float)h, r, 1.5f, a, 255);
+        } else {
+            __nexa_ui_rrect_line((float)x, (float)y, (float)w, (float)h, r, 1.0f,
+                                 hover ? __nexa_ui_shade(t.border, 40) : t.border, 255);
+        }
     }
     int inner = w - 2 * pad;
     float ty = __nexa_ui_text_top((float)y, (float)h, 0, size);
@@ -22308,14 +23257,14 @@ static int __nexa_ui_hit(const std::string& s, float px, int size) {
     int sx0 = __nexa_ui.cx0, sy0 = __nexa_ui.cy0, sx1 = __nexa_ui.cx1, sy1 = __nexa_ui.cy1;
     __nexa_ui.cx0 = x + pad - 1; __nexa_ui.cy0 = y + 1; __nexa_ui.cx1 = x + w - pad + 1; __nexa_ui.cy1 = y + h - 1;
     if (text.empty() && !focused) {
-        __nexa_ui_text_run((float)(x + pad), ty, placeholder, 0, size, t.muted, 255, true);
+        __nexa_ui_text_run((float)(x + pad), ty, placeholder, 0, size, __nexa_ui_col_muted(), 255, true);
     } else {
-        __nexa_ui_text_run(x + pad - scroll, ty, text, 0, size, t.text, 255, true);
+        __nexa_ui_text_run(x + pad - scroll, ty, text, 0, size, __nexa_ui_col_text(), 255, true);
     }
     if (focused && ((__nexa_ui.frame_ms - __nexa_ui.caret_ms) % 1060) < 530) {
         float cxp = __nexa_ui_text_run(0, 0, text.substr(0, (size_t)__nexa_ui.caret), 0, size, 0, 0, false);
         float px = std::floor(x + pad - scroll + cxp);
-        __nexa_ui_rrect(px, (float)(y + 7), 1.5f, (float)(h - 14), 0, t.text, 255);
+        __nexa_ui_rrect(px, (float)(y + 7), 1.5f, (float)(h - 14), 0, __nexa_ui_col_text(), 255);
     }
     __nexa_ui.cx0 = sx0; __nexa_ui.cy0 = sy0; __nexa_ui.cx1 = sx1; __nexa_ui.cy1 = sy1;
     return text;
@@ -22353,6 +23302,7 @@ static void __nexa_ui_chevron(float cx, float cy, unsigned int c, int down) {
         }
     }
     int hover, held;
+    __nexa_ui_mark(id, x, y, w, h);
     if (__nexa_ui_clickable(id, x, y, w, h, hover, held)) {
         if (is_open) {
             __nexa_ui.open = 0;
@@ -22364,18 +23314,23 @@ static void __nexa_ui_chevron(float cx, float cy, unsigned int c, int down) {
         }
     }
     float r = (float)__nexa_ui.rounding;
-    __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, r, hover && !is_open ? t.raised : t.input, 255);
-    __nexa_ui_rrect_line((float)x, (float)y, (float)w, (float)h, r, is_open ? 1.5f : 1.0f,
-                         is_open ? __nexa_ui_accent() : t.border, 255);
+    if (__nexa_ui_is(__NEXA_UI_FLUENT)) {
+        __nexa_ui_field_fluent(x, y, w, h, hover, is_open, 1);
+    } else {
+        __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, r, hover && !is_open ? t.raised : t.input, 255);
+        __nexa_ui_rrect_line((float)x, (float)y, (float)w, (float)h, r, is_open ? 1.5f : 1.0f,
+                             is_open ? __nexa_ui_accent() : t.border, 255);
+    }
     float ty = __nexa_ui_text_top((float)y, (float)h, 0, size);
     std::string shown = selected >= 0 && selected < (int)items.size() ? items[(size_t)selected] : std::string();
     int sx0 = __nexa_ui.cx0, sy0 = __nexa_ui.cy0, sx1 = __nexa_ui.cx1, sy1 = __nexa_ui.cy1;
     __nexa_ui.cx0 = x + 10; __nexa_ui.cy0 = y; __nexa_ui.cx1 = x + w - 28; __nexa_ui.cy1 = y + h;
-    __nexa_ui_text_run((float)(x + 10), ty, shown, 0, size, t.text, 255, true);
+    __nexa_ui_text_run((float)(x + 10), ty, shown, 0, size, __nexa_ui_col_text(), 255, true);
     __nexa_ui.cx0 = sx0; __nexa_ui.cy0 = sy0; __nexa_ui.cx1 = sx1; __nexa_ui.cy1 = sy1;
-    __nexa_ui_chevron((float)(x + w - 16), y + h * 0.5f, t.muted, !is_open);
+    __nexa_ui_chevron((float)(x + w - 16), y + h * 0.5f, __nexa_ui_col_muted(), __nexa_ui_is(__NEXA_UI_FLUENT) || !is_open);
     if (is_open) {
         int ih = __nexa_ui_line_h(0, size) + 12;
+        __nexa_ui.okind = 0;
         __nexa_ui.item_h = ih;
         __nexa_ui.ox = x;
         __nexa_ui.oy = y + h + 4;
@@ -22388,26 +23343,729 @@ static void __nexa_ui_chevron(float cx, float cy, unsigned int c, int down) {
 }
 
 // The open list, over everything drawn this frame.
+static void __nexa_ui_draw_menu();
 static void __nexa_ui_draw_list() {
     if (!__nexa_ui.open || !__nexa_g.fb) return;
+    if (__nexa_ui.okind == 1) {
+        __nexa_ui_draw_menu();
+        return;
+    }
     const __nexa_ui_Theme& t = __nexa_ui_t();
     int x = __nexa_ui.ox, y = __nexa_ui.oy, w = __nexa_ui.ow, h = __nexa_ui.oh, ih = __nexa_ui.item_h;
     int size = __nexa_ui.size;
     float r = (float)__nexa_ui.rounding;
     int sx0 = __nexa_ui.cx0, sy0 = __nexa_ui.cy0, sx1 = __nexa_ui.cx1, sy1 = __nexa_ui.cy1;
     __nexa_ui.cx1 = -1;
-    __nexa_ui_shadow((float)x, (float)y, (float)w, (float)h, r, 14.0f, 5.0f, t.shadow_alpha + 20);
-    __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, r, t.surface, 255);
-    __nexa_ui_rrect_line((float)x, (float)y, (float)w, (float)h, r, 1.0f, t.border, 255);
+    int fl = __nexa_ui_is(__NEXA_UI_FLUENT);
+    if (fl) {
+        __nexa_ui_list_fluent(x, y, w, h);
+    } else {
+        __nexa_ui_shadow((float)x, (float)y, (float)w, (float)h, r, 14.0f, 5.0f, t.shadow_alpha + 20);
+        __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, r, t.surface, 255);
+        __nexa_ui_rrect_line((float)x, (float)y, (float)w, (float)h, r, 1.0f, t.border, 255);
+    }
     for (int k = 0; k < (int)__nexa_ui.oitems.size(); k++) {
         int iy = y + 4 + k * ih;
         int hover = __nexa_ui.mx >= x && __nexa_ui.mx < x + w && __nexa_ui.my >= iy && __nexa_ui.my < iy + ih;
-        if (hover) __nexa_ui_rrect((float)(x + 4), (float)iy, (float)(w - 8), (float)ih, r - 2 > 0 ? r - 2 : 0, t.raised, 255);
-        unsigned int c = k == __nexa_ui.osel ? __nexa_ui_accent() : t.text;
-        float ty = __nexa_ui_text_top((float)iy, (float)ih, k == __nexa_ui.osel ? 1 : 0, size);
+        unsigned int c;
+        if (fl) {
+            c = __nexa_ui_list_row_fluent(x, iy, w, ih, hover, k == __nexa_ui.osel);
+        } else {
+            if (hover) __nexa_ui_rrect((float)(x + 4), (float)iy, (float)(w - 8), (float)ih, r - 2 > 0 ? r - 2 : 0, t.raised, 255);
+            c = k == __nexa_ui.osel ? __nexa_ui_accent() : t.text;
+        }
+        // modern sets the chosen item in semibold; Windows keeps it regular
+        int font = k == __nexa_ui.osel && !fl ? 1 : 0;
+        float ty = __nexa_ui_text_top((float)iy, (float)ih, font, size);
         __nexa_ui.cx0 = x + 10; __nexa_ui.cy0 = y; __nexa_ui.cx1 = x + w - 10; __nexa_ui.cy1 = y + h;
-        __nexa_ui_text_run((float)(x + 12), ty, __nexa_ui.oitems[(size_t)k], k == __nexa_ui.osel ? 1 : 0, size, c, 255, true);
+        __nexa_ui_text_run((float)(x + (fl ? 16 : 12)), ty, __nexa_ui.oitems[(size_t)k], font, size, c, 255, true);
         __nexa_ui.cx1 = -1;
     }
     __nexa_ui.cx0 = sx0; __nexa_ui.cy0 = sy0; __nexa_ui.cx1 = sx1; __nexa_ui.cy1 = sy1;
+}
+
+// --- app widgets: tabs, lists, tables, menus, dialogs, tooltips -------------------
+
+// Sets the clip to a box, inside whatever clip there already is, until it
+// goes out of scope.
+struct __nexa_ui_Clip {
+    int s0, s1, s2, s3;
+    __nexa_ui_Clip(int x0, int y0, int x1, int y1) {
+        s0 = __nexa_ui.cx0; s1 = __nexa_ui.cy0; s2 = __nexa_ui.cx1; s3 = __nexa_ui.cy1;
+        int a0 = s0, b0 = s1, a1 = s2, b1 = s3;
+        if (a1 < 0) { a0 = 0; b0 = 0; a1 = __nexa_g.w; b1 = __nexa_g.h; }
+        __nexa_ui.cx0 = x0 > a0 ? x0 : a0;
+        __nexa_ui.cy0 = y0 > b0 ? y0 : b0;
+        __nexa_ui.cx1 = x1 < a1 ? x1 : a1;
+        __nexa_ui.cy1 = y1 < b1 ? y1 : b1;
+        if (__nexa_ui.cx1 < __nexa_ui.cx0) __nexa_ui.cx1 = __nexa_ui.cx0;
+        if (__nexa_ui.cy1 < __nexa_ui.cy0) __nexa_ui.cy1 = __nexa_ui.cy0;
+    }
+    ~__nexa_ui_Clip() { __nexa_ui.cx0 = s0; __nexa_ui.cy0 = s1; __nexa_ui.cx1 = s2; __nexa_ui.cy1 = s3; }
+};
+
+// The whole window as the clip, for what is drawn over everything.
+struct __nexa_ui_NoClip {
+    int s0, s1, s2, s3;
+    __nexa_ui_NoClip() {
+        s0 = __nexa_ui.cx0; s1 = __nexa_ui.cy0; s2 = __nexa_ui.cx1; s3 = __nexa_ui.cy1;
+        __nexa_ui.cx1 = -1;
+    }
+    ~__nexa_ui_NoClip() { __nexa_ui.cx0 = s0; __nexa_ui.cy0 = s1; __nexa_ui.cx1 = s2; __nexa_ui.cy1 = s3; }
+};
+
+static float __nexa_ui_width(const std::string& s, int font, int size) {
+    return __nexa_ui_text_run(0, 0, s, font, size, 0, 0, false);
+}
+
+// Lines of s no wider than maxw, broken at spaces and at every newline. A word
+// longer than a line is left whole (and clipped where it is drawn).
+static std::vector<std::string> __nexa_ui_wrap(const std::string& s, int font, int size, int maxw) {
+    std::vector<std::string> lines;
+    size_t start = 0;
+    for (;;) {
+        size_t nl = s.find('\n', start);
+        std::string para = s.substr(start, nl == std::string::npos ? std::string::npos : nl - start);
+        std::string line;
+        size_t i = 0;
+        for (;;) {
+            size_t sp = para.find(' ', i);
+            std::string word = para.substr(i, sp == std::string::npos ? std::string::npos : sp - i);
+            std::string trial = line.empty() ? word : line + " " + word;
+            if (!line.empty() && __nexa_ui_width(trial, font, size) > maxw) {
+                lines.push_back(line);
+                line = word;
+            } else {
+                line = trial;
+            }
+            if (sp == std::string::npos) break;
+            i = sp + 1;
+        }
+        lines.push_back(line);
+        if (nl == std::string::npos) break;
+        start = nl + 1;
+    }
+    return lines;
+}
+
+// --- scrolling ---
+
+static unsigned int __nexa_ui_bar_id(unsigned int id) { return (id ^ 0x9E3779B9u) ? (id ^ 0x9E3779B9u) : 2; }
+
+static void __nexa_ui_bar_geom(int y, int h, int content, int off, int& ty, int& th) {
+    int maxoff = content - h;
+    th = h * h / content;
+    if (th < 24) th = 24;
+    if (th > h) th = h;
+    ty = y + (maxoff > 0 ? (h - th) * off / maxoff : 0);
+}
+
+// A view of `content` pixels scrolled in the box (x, y, w, h): the wheel over
+// it and dragging its scrollbar move it. Returns how far down it is.
+static int __nexa_ui_scrollview(unsigned int id, int x, int y, int w, int h, int content, int step) {
+    float& off = __nexa_ui.scrolls[id];
+    int maxoff = content - h > 0 ? content - h : 0;
+    if (maxoff > 0 && __nexa_ui.wheel && __nexa_ui_in(x, y, w, h)) {
+        off -= (float)(__nexa_ui.wheel * step * 3);
+        __nexa_ui.wheel = 0;  // this view took it
+    }
+    if (off > maxoff) off = (float)maxoff;
+    if (off < 0) off = 0;
+    if (maxoff > 0) {
+        int ty, th;
+        __nexa_ui_bar_geom(y, h, content, (int)off, ty, th);
+        unsigned int bid = __nexa_ui_bar_id(id);
+        int bx = x + w - 12;
+        if (__nexa_ui.pressed && __nexa_ui_in(bx, y, 12, h)) {
+            __nexa_ui.active = bid;
+            int my = __nexa_ui.my;
+            __nexa_ui.grab = my >= ty && my < ty + th ? my - ty : th / 2;
+            __nexa_ui.pressed = 0;  // spent on the bar: the row beneath does not take it
+        }
+        if (__nexa_ui.active == bid && __nexa_ui.down && h > th) {
+            off = (float)(__nexa_ui.my - __nexa_ui.grab - y) * maxoff / (h - th);
+            if (off > maxoff) off = (float)maxoff;
+            if (off < 0) off = 0;
+        }
+    }
+    return (int)off;
+}
+
+// Scrolls so that a row from top to top + rh is in view.
+static int __nexa_ui_reveal(unsigned int id, int top, int rh, int h, int content) {
+    float& off = __nexa_ui.scrolls[id];
+    if (top - 4 < off) off = (float)(top - 4);
+    if (top + rh + 4 > off + h) off = (float)(top + rh + 4 - h);
+    int maxoff = content - h > 0 ? content - h : 0;
+    if (off > maxoff) off = (float)maxoff;
+    if (off < 0) off = 0;
+    return (int)off;
+}
+
+static void __nexa_ui_scrollbar(unsigned int id, int x, int y, int w, int h, int content, int off) {
+    if (content <= h) return;
+    int ty, th;
+    __nexa_ui_bar_geom(y, h, content, off, ty, th);
+    int bx = x + w - 12;
+    int over = __nexa_ui_in(x, y, w, h);
+    int drag = __nexa_ui.active == __nexa_ui_bar_id(id) && __nexa_ui.down;
+    if (__nexa_ui_is(__NEXA_UI_FLUENT)) {
+        // Windows: a hairline that widens into a bar when the mouse comes near
+        __nexa_ui_Fluent f = __nexa_ui_fl();
+        if (over || drag) __nexa_ui_rrect((float)(bx + 3), (float)(ty + 3), 6, (float)(th - 6), 3, f.strong, 255);
+        else __nexa_ui_rrect((float)(bx + 6), (float)(ty + 3), 2, (float)(th - 6), 1, f.strong, 200);
+    } else {
+        const __nexa_ui_Theme& t = __nexa_ui_t();
+        unsigned int c = drag ? t.muted : over ? __nexa_ui_shade(t.border, 40) : t.border;
+        __nexa_ui_rrect((float)(bx + 3), (float)(ty + 3), 6, (float)(th - 6), 3, c, 255);
+    }
+}
+
+// Up, Down, Home and End move a selection among n rows, in the list or table
+// that has the keyboard. Returns whether it moved.
+static int __nexa_ui_rows_keys(int& sel, int n) {
+    int moved = 0;
+    for (int v : __nexa_ui.ev) {
+        if (v >= 0 || n <= 0) continue;
+        int k = -1 - v;
+        if (k == __NEXA_UI_UP) { sel = sel <= 0 ? 0 : sel - 1; moved = 1; }
+        else if (k == __NEXA_UI_DOWN) { sel = sel < 0 ? 0 : (sel + 1 < n ? sel + 1 : n - 1); moved = 1; }
+        else if (k == __NEXA_UI_HOME) { sel = 0; moved = 1; }
+        else if (k == __NEXA_UI_END) { sel = n - 1; moved = 1; }
+    }
+    __nexa_ui.ev.clear();
+    return moved;
+}
+
+// The frame of a list or table.
+static void __nexa_ui_box(int x, int y, int w, int h, int lit) {
+    if (__nexa_ui_is(__NEXA_UI_FLUENT)) {
+        __nexa_ui_Fluent f = __nexa_ui_fl();
+        __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, 4.0f, f.input, 255);
+        __nexa_ui_rrect_line((float)x, (float)y, (float)w, (float)h, 4.0f, 1.0f, f.ctrl_edge, 255);
+        return;
+    }
+    const __nexa_ui_Theme& t = __nexa_ui_t();
+    float r = (float)__nexa_ui.rounding;
+    __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, r, t.input, 255);
+    __nexa_ui_rrect_line((float)x, (float)y, (float)w, (float)h, r, 1.0f, lit ? __nexa_ui_accent() : t.border, 255);
+}
+
+// One row's highlight; returns the colour its text is drawn in. The selected
+// row is solid accent while its list has the keyboard, tinted when not.
+static unsigned int __nexa_ui_row(int x, int iy, int w, int ih, int hover, int sel, int focused) {
+    if (__nexa_ui_is(__NEXA_UI_FLUENT)) {
+        __nexa_ui_Fluent f = __nexa_ui_fl();
+        if (hover || sel) {
+            __nexa_ui_rrect((float)x, (float)(iy + 1), (float)w, (float)(ih - 2), 4.0f,
+                            hover ? f.subtle_hover : f.subtle_press, 255);
+        }
+        if (sel) __nexa_ui_rrect((float)(x + 1), iy + ih * 0.5f - 8, 3, 16, 1.5f, f.accent, 255);
+        return f.text;
+    }
+    const __nexa_ui_Theme& t = __nexa_ui_t();
+    float r = (float)(__nexa_ui.rounding - 2 > 0 ? __nexa_ui.rounding - 2 : 0);
+    if (sel) {
+        unsigned int a = __nexa_ui_accent();
+        __nexa_ui_rrect((float)x, (float)iy, (float)w, (float)ih, r, a, focused ? 255 : 48);
+        if (focused) return __nexa_ui.accent_set ? __nexa_ui_text_on(a) : t.on_accent;
+    } else if (hover) {
+        __nexa_ui_rrect((float)x, (float)iy, (float)w, (float)ih, r, t.raised, 255);
+    }
+    return t.text;
+}
+
+// --- tabs ---
+
+[[maybe_unused]] static int __nexa_ui_tabs(int x, int y, int w, const std::vector<std::string>& labels, int selected) {
+    __nexa_ui_begin();
+    const __nexa_ui_Theme& t = __nexa_ui_t();
+    int fl = __nexa_ui_is(__NEXA_UI_FLUENT);
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    int size = __nexa_ui.size;
+    int h = __nexa_ui_line_h(0, size) + 18;
+    __nexa_ui_mark(__nexa_ui_id(17, x, y), x, y, w, h);
+    if (!fl) __nexa_ui_rrect((float)x, (float)(y + h - 1), (float)w, 1.0f, 0, t.border, 255);
+    int cx = x;
+    for (int k = 0; k < (int)labels.size(); k++) {
+        int tw = (int)std::ceil(__nexa_ui_width(labels[(size_t)k], 1, size)) + 32;
+        unsigned int id = __nexa_ui_id(8, cx, y);
+        int hover, held;
+        if (__nexa_ui_clickable(id, cx, y, tw, h, hover, held)) selected = k;
+        int sel = k == selected;
+        float ty = __nexa_ui_text_top((float)y, (float)(h - 2), 0, size);
+        if (fl) {
+            // Windows' selector bar: a wash under the mouse, a short accent
+            // bar under the chosen one
+            if (hover || held) __nexa_ui_rrect((float)(cx + 2), (float)(y + 4), (float)(tw - 4), (float)(h - 8), 4.0f,
+                                               held ? f.subtle_press : f.subtle_hover, 255);
+            float lw = __nexa_ui_width(labels[(size_t)k], 0, size);
+            __nexa_ui_text_run(std::floor(cx + (tw - lw) * 0.5f), ty, labels[(size_t)k], 0, size,
+                               sel || hover ? f.text : f.text2, 255, true);
+            if (sel) __nexa_ui_rrect(cx + tw * 0.5f - 8, (float)(y + h - 5), 16, 3, 1.5f, f.accent, 255);
+        } else {
+            // underlined tabs: the chosen one in semibold over an accent line
+            float lw = __nexa_ui_width(labels[(size_t)k], sel ? 1 : 0, size);
+            __nexa_ui_text_run(std::floor(cx + (tw - lw) * 0.5f), ty, labels[(size_t)k], sel ? 1 : 0, size,
+                               sel || hover ? t.text : t.muted, 255, true);
+            if (sel) __nexa_ui_rrect((float)(cx + 6), (float)(y + h - 3), (float)(tw - 12), 3, 1.5f, __nexa_ui_accent(), 255);
+            else if (hover) __nexa_ui_rrect((float)(cx + 6), (float)(y + h - 3), (float)(tw - 12), 3, 1.5f, t.border, 255);
+        }
+        cx += tw;
+    }
+    __nexa_ui_mark(__nexa_ui_id(17, x, y), x, y, w, h);
+    return selected;
+}
+
+// --- list and table ---
+
+[[maybe_unused]] static int __nexa_ui_list(int x, int y, int w, int h, const std::vector<std::string>& items, int selected) {
+    __nexa_ui_begin();
+    int fl = __nexa_ui_is(__NEXA_UI_FLUENT);
+    int size = __nexa_ui.size;
+    int ih = __nexa_ui_line_h(0, size) + 12;
+    int n = (int)items.size();
+    unsigned int id = __nexa_ui_id(12, x, y);
+    if (selected >= n) selected = n - 1;
+    int content = n * ih + 8;
+    int off = __nexa_ui_scrollview(id, x, y, w, h, content, ih);
+    int bar = content > h ? 12 : 0;
+    // a press on a row chooses it, and gives the list the keyboard
+    if (__nexa_ui.pressed && __nexa_ui_in(x, y, w - bar, h)) {
+        int k = (__nexa_ui.my - y - 4 + off) / ih;
+        if (k >= 0 && k < n) selected = k;
+        __nexa_ui.focus = id;
+    }
+    if (__nexa_ui.focus == id && __nexa_ui_rows_keys(selected, n)) {
+        off = __nexa_ui_reveal(id, selected * ih + 4, ih, h, content);
+    }
+    int focused = __nexa_ui.focus == id;
+    __nexa_ui_box(x, y, w, h, focused);
+    {
+        __nexa_ui_Clip clip(x + 1, y + 1, x + w - 1, y + h - 1);
+        int first = (off - 4) / ih;
+        for (int k = first < 0 ? 0 : first; k < n; k++) {
+            int iy = y + 4 + k * ih - off;
+            if (iy >= y + h) break;
+            int hover = __nexa_ui_in(x, iy, w - bar, ih) && __nexa_ui_in(x, y, w, h);
+            unsigned int c = __nexa_ui_row(x + 4, iy, w - 8 - bar, ih, hover, k == selected, focused);
+            __nexa_ui_Clip cell(x + 4, iy, x + w - bar - 8, iy + ih);
+            __nexa_ui_text_run((float)(x + (fl ? 16 : 12)), __nexa_ui_text_top((float)iy, (float)ih, 0, size),
+                               items[(size_t)k], 0, size, c, 255, true);
+        }
+    }
+    __nexa_ui_scrollbar(id, x, y, w, h, content, off);
+    __nexa_ui_mark(id, x, y, w, h);
+    return selected;
+}
+
+[[maybe_unused]] static int __nexa_ui_table(int x, int y, int w, int h, const std::vector<std::string>& headers,
+                                           const std::vector<std::vector<std::string>>& rows, int selected) {
+    __nexa_ui_begin();
+    const __nexa_ui_Theme& t = __nexa_ui_t();
+    int fl = __nexa_ui_is(__NEXA_UI_FLUENT);
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    int size = __nexa_ui.size;
+    int ih = __nexa_ui_line_h(0, size) + 12;
+    int hh = ih + 2;
+    int n = (int)rows.size(), cols = (int)headers.size();
+    unsigned int id = __nexa_ui_id(13, x, y);
+    if (selected >= n) selected = n - 1;
+    int vy = y + hh, vh = h - hh;
+    int content = n * ih + 4;
+    int off = __nexa_ui_scrollview(id, x, vy, w, vh, content, ih);
+    int bar = content > vh ? 12 : 0;
+    // Columns as wide as their widest cell (of the first 200 rows), then
+    // stretched or squeezed to the table's width.
+    std::vector<int> cw((size_t)(cols > 0 ? cols : 0));
+    int total = 0;
+    for (int c = 0; c < cols; c++) {
+        float m = __nexa_ui_width(headers[(size_t)c], 1, size);
+        for (int r = 0; r < n && r < 200; r++) {
+            if (c < (int)rows[(size_t)r].size()) {
+                float cwid = __nexa_ui_width(rows[(size_t)r][(size_t)c], 0, size);
+                if (cwid > m) m = cwid;
+            }
+        }
+        cw[(size_t)c] = (int)std::ceil(m) + 28;
+        total += cw[(size_t)c];
+    }
+    int inner = w - bar;
+    if (cols > 0 && total <= inner) {
+        cw[(size_t)(cols - 1)] += inner - total;
+    } else if (cols > 0) {
+        int used = 0;
+        for (int c = 0; c < cols; c++) {
+            cw[(size_t)c] = c == cols - 1 ? inner - used : cw[(size_t)c] * inner / total;
+            used += cw[(size_t)c];
+        }
+    }
+    if (__nexa_ui.pressed && __nexa_ui_in(x, vy, w - bar, vh)) {
+        int k = (__nexa_ui.my - vy - 2 + off) / ih;
+        if (k >= 0 && k < n) selected = k;
+        __nexa_ui.focus = id;
+    }
+    if (__nexa_ui.focus == id && __nexa_ui_rows_keys(selected, n)) {
+        off = __nexa_ui_reveal(id, selected * ih + 2, ih, vh, content);
+    }
+    int focused = __nexa_ui.focus == id;
+    __nexa_ui_box(x, y, w, h, focused);
+    // the header row
+    {
+        __nexa_ui_Clip clip(x + 1, y + 1, x + w - 1, vy);
+        int cx = x;
+        for (int c = 0; c < cols; c++) {
+            __nexa_ui_Clip cell(cx + 4, y, cx + cw[(size_t)c] - 6, vy);
+            __nexa_ui_text_run((float)(cx + (fl ? 16 : 14)), __nexa_ui_text_top((float)y, (float)hh, 1, size),
+                               headers[(size_t)c], 1, size, fl ? f.text2 : t.muted, 255, true);
+            cx += cw[(size_t)c];
+            if (!fl && c < cols - 1) __nexa_ui_rrect((float)(cx - 1), (float)(y + 8), 1, (float)(hh - 16), 0, t.border, 255);
+        }
+        __nexa_ui_rrect((float)(x + 1), (float)(vy - 1), (float)(w - 2), 1, 0, fl ? f.divider : t.border, 255);
+    }
+    {
+        __nexa_ui_Clip clip(x + 1, vy, x + w - 1, y + h - 1);
+        int first = (off - 2) / ih;
+        for (int k = first < 0 ? 0 : first; k < n; k++) {
+            int iy = vy + 2 + k * ih - off;
+            if (iy >= y + h) break;
+            int hover = __nexa_ui_in(x, iy, w - bar, ih) && __nexa_ui_in(x, vy, w, vh);
+            unsigned int col = __nexa_ui_row(x + 4, iy, w - 8 - bar, ih, hover, k == selected, focused);
+            int cx = x;
+            const std::vector<std::string>& row = rows[(size_t)k];
+            for (int c = 0; c < cols && c < (int)row.size(); c++) {
+                __nexa_ui_Clip cell(cx + 4, iy, cx + cw[(size_t)c] - 6, iy + ih);
+                __nexa_ui_text_run((float)(cx + (fl ? 16 : 14)), __nexa_ui_text_top((float)iy, (float)ih, 0, size),
+                                   row[(size_t)c], 0, size, col, 255, true);
+                cx += cw[(size_t)c];
+            }
+        }
+    }
+    __nexa_ui_scrollbar(id, x, vy, w, vh, content, off);
+    __nexa_ui_mark(id, x, y, w, h);
+    return selected;
+}
+
+// --- menus ---
+
+// A menu item's label and, after a tab, the shortcut shown at its right.
+static void __nexa_ui_menu_split(const std::string& item, std::string& label, std::string& hint) {
+    size_t tab = item.find('\t');
+    label = tab == std::string::npos ? item : item.substr(0, tab);
+    hint = tab == std::string::npos ? std::string() : item.substr(tab + 1);
+}
+
+[[maybe_unused]] static void __nexa_ui_menubar(int x, int y, int w) {
+    __nexa_ui_begin();
+    int h = __nexa_ui_line_h(0, __nexa_ui.size) + 14;
+    if (__nexa_ui_is(__NEXA_UI_FLUENT)) {
+        // Windows draws a menu bar straight on the window
+        __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, 0, __nexa_ui_fl().bg, 255);
+        return;
+    }
+    const __nexa_ui_Theme& t = __nexa_ui_t();
+    __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, 0, t.surface, 255);
+    __nexa_ui_rrect((float)x, (float)(y + h - 1), (float)w, 1, 0, t.border, 255);
+}
+
+[[maybe_unused]] static int __nexa_ui_menu(int x, int y, const std::string& label, const std::vector<std::string>& items) {
+    __nexa_ui_begin();
+    const __nexa_ui_Theme& t = __nexa_ui_t();
+    int fl = __nexa_ui_is(__NEXA_UI_FLUENT);
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    int size = __nexa_ui.size;
+    int h = __nexa_ui_line_h(0, size) + 14;
+    int tw = (int)std::ceil(__nexa_ui_width(label, 0, size)) + 24;
+    unsigned int id = __nexa_ui_id(15, x, y);
+    int result = -1;
+    int is_open = __nexa_ui.open == id;
+    // choosing from the open menu, laid out last frame
+    if (is_open && __nexa_ui.open_frames > 0 && __nexa_ui.pressed &&
+        __nexa_ui.mx >= __nexa_ui.ox && __nexa_ui.mx < __nexa_ui.ox + __nexa_ui.ow &&
+        __nexa_ui.my >= __nexa_ui.oy && __nexa_ui.my < __nexa_ui.oy + __nexa_ui.oh) {
+        for (int k = 0; k < (int)__nexa_ui.oitems.size() && k < (int)__nexa_ui.otop.size(); k++) {
+            int top = __nexa_ui.oy + __nexa_ui.otop[(size_t)k];
+            int rh = __nexa_ui.oitems[(size_t)k] == "-" ? 9 : __nexa_ui.item_h;
+            if (__nexa_ui.my >= top && __nexa_ui.my < top + rh && __nexa_ui.oitems[(size_t)k] != "-") result = k;
+        }
+        if (result >= 0) {
+            __nexa_ui.open = 0;
+            is_open = 0;
+        }
+        __nexa_ui.pressed = 0;
+        __nexa_ui.active = 0;
+    }
+    // Escape closes it
+    if (is_open) {
+        for (size_t i = 0; i < __nexa_ui.ev.size(); i++) {
+            if (__nexa_ui.ev[i] == -1 - __NEXA_UI_ESC) {
+                __nexa_ui.open = 0;
+                is_open = 0;
+                __nexa_ui.ev.erase(__nexa_ui.ev.begin() + (long)i);
+                break;
+            }
+        }
+    }
+    int hover = __nexa_ui_in(x, y, tw, h);
+    // A menu opens as the button goes down, as on every desktop; the press that
+    // closed it (it was open) leaves it closed.
+    if (hover && __nexa_ui.pressed) {
+        if (__nexa_ui.closed_now != id) {
+            __nexa_ui.open = id;
+            __nexa_ui.open_frames = 0;
+            is_open = 1;
+        }
+        __nexa_ui.pressed = 0;
+    }
+    // Across a menu bar: with another menu open, the one under the mouse takes over.
+    if (!is_open && hover && __nexa_ui.open && __nexa_ui.okind == 1 && __nexa_ui.open != id) {
+        __nexa_ui.open = id;
+        __nexa_ui.open_frames = 1;
+        is_open = 1;
+    }
+    if (fl) {
+        if (is_open || hover) __nexa_ui_rrect((float)x, (float)(y + 4), (float)tw, (float)(h - 8), 4.0f,
+                                              is_open ? f.subtle_press : f.subtle_hover, 255);
+    } else if (is_open || hover) {
+        float r = (float)(__nexa_ui.rounding - 2 > 0 ? __nexa_ui.rounding - 2 : 0);
+        __nexa_ui_rrect((float)x, (float)(y + 3), (float)tw, (float)(h - 6), r, is_open ? __nexa_ui_shade(t.raised, 10) : t.raised, 255);
+    }
+    __nexa_ui_text_run((float)(x + 12), __nexa_ui_text_top((float)y, (float)h, 0, size), label, 0, size,
+                       fl ? f.text : t.text, 255, true);
+    if (is_open) {
+        int ih = __nexa_ui_line_h(0, size) + 12;
+        float widest = 0;
+        __nexa_ui.otop.clear();
+        int top = 4;
+        for (const std::string& item : items) {
+            __nexa_ui.otop.push_back(top);
+            if (item == "-") { top += 9; continue; }
+            std::string l, k;
+            __nexa_ui_menu_split(item, l, k);
+            float wv = __nexa_ui_width(l, 0, size) + (k.empty() ? 0 : __nexa_ui_width(k, 0, size) + 40);
+            if (wv > widest) widest = wv;
+            top += ih;
+        }
+        __nexa_ui.okind = 1;
+        __nexa_ui.item_h = ih;
+        __nexa_ui.ox = x;
+        __nexa_ui.oy = y + h + (fl ? 4 : 2);
+        __nexa_ui.ow = (int)widest + 48 > 200 ? (int)widest + 48 : 200;
+        __nexa_ui.oh = top + 4;
+        __nexa_ui.oitems = items;
+    }
+    __nexa_ui_mark(id, x, y, tw, h);
+    return result;
+}
+
+static void __nexa_ui_draw_menu() {
+    const __nexa_ui_Theme& t = __nexa_ui_t();
+    int fl = __nexa_ui_is(__NEXA_UI_FLUENT);
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    int x = __nexa_ui.ox, y = __nexa_ui.oy, w = __nexa_ui.ow, h = __nexa_ui.oh, ih = __nexa_ui.item_h;
+    int size = __nexa_ui.size;
+    __nexa_ui_NoClip all;
+    float r = (float)__nexa_ui.rounding;
+    if (fl) {
+        __nexa_ui_list_fluent(x, y, w, h);
+    } else {
+        __nexa_ui_shadow((float)x, (float)y, (float)w, (float)h, r, 14.0f, 5.0f, t.shadow_alpha + 20);
+        __nexa_ui_rrect((float)x, (float)y, (float)w, (float)h, r, t.surface, 255);
+        __nexa_ui_rrect_line((float)x, (float)y, (float)w, (float)h, r, 1.0f, t.border, 255);
+    }
+    for (int k = 0; k < (int)__nexa_ui.oitems.size() && k < (int)__nexa_ui.otop.size(); k++) {
+        const std::string& item = __nexa_ui.oitems[(size_t)k];
+        int top = y + __nexa_ui.otop[(size_t)k];
+        if (item == "-") {
+            __nexa_ui_rrect((float)(x + (fl ? 1 : 8)), (float)(top + 4), (float)(w - (fl ? 2 : 16)), 1, 0, fl ? f.divider : t.border, 255);
+            continue;
+        }
+        int hover = __nexa_ui.mx >= x && __nexa_ui.mx < x + w && __nexa_ui.my >= top && __nexa_ui.my < top + ih;
+        if (hover) {
+            if (fl) __nexa_ui_rrect((float)(x + 4), (float)(top + 1), (float)(w - 8), (float)(ih - 2), 4.0f, f.subtle_hover, 255);
+            else __nexa_ui_rrect((float)(x + 4), (float)top, (float)(w - 8), (float)ih, r - 2 > 0 ? r - 2 : 0, t.raised, 255);
+        }
+        std::string l, hint;
+        __nexa_ui_menu_split(item, l, hint);
+        float ty = __nexa_ui_text_top((float)top, (float)ih, 0, size);
+        __nexa_ui_text_run((float)(x + 16), ty, l, 0, size, fl ? f.text : t.text, 255, true);
+        if (!hint.empty()) {
+            float hw = __nexa_ui_width(hint, 0, size - 1);
+            __nexa_ui_text_run(std::floor(x + w - 16 - hw), __nexa_ui_text_top((float)top, (float)ih, 0, size - 1), hint, 0,
+                               size - 1, fl ? f.text2 : t.muted, 255, true);
+        }
+    }
+}
+
+// --- tooltips ---
+
+[[maybe_unused]] static void __nexa_ui_tooltip(const std::string& text) {
+    __nexa_ui_begin();
+    if (!__nexa_ui.last_id || text.empty()) return;
+    if (!__nexa_ui_in(__nexa_ui.lx, __nexa_ui.ly, __nexa_ui.lw, __nexa_ui.lh)) return;
+    __nexa_ui.tip_touched = 1;
+    if (__nexa_ui.tip_id != __nexa_ui.last_id) {
+        __nexa_ui.tip_id = __nexa_ui.last_id;
+        __nexa_ui.tip_ms = __nexa_ui.frame_ms;
+        __nexa_ui.tip_armed = 1;
+    }
+    // a click puts it away until the mouse leaves and comes back
+    if (__nexa_ui.pressed || __nexa_ui.down) __nexa_ui.tip_armed = 0;
+    if (__nexa_ui.tip_armed && __nexa_ui.frame_ms - __nexa_ui.tip_ms >= 500) {
+        __nexa_ui.tip_show = 1;
+        __nexa_ui.tip_text = text;
+    }
+}
+
+static void __nexa_ui_draw_tip() {
+    if (!__nexa_ui.tip_show || __nexa_ui.modal || __nexa_ui.modal_prev) return;
+    int fl = __nexa_ui_is(__NEXA_UI_FLUENT);
+    const __nexa_ui_Theme& t = __nexa_ui_t();
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    int size = __nexa_ui.size - 2 < 8 ? 8 : __nexa_ui.size - 2;
+    std::vector<std::string> lines = __nexa_ui_wrap(__nexa_ui.tip_text, 0, size, 300);
+    float tw = 0;
+    for (const std::string& l : lines) {
+        float wv = __nexa_ui_width(l, 0, size);
+        if (wv > tw) tw = wv;
+    }
+    int lh = __nexa_ui_line_h(0, size);
+    int bw = (int)std::ceil(tw) + 18, bh = (int)lines.size() * lh + 12;
+    int px = __nexa_ui.mx + 12, py = __nexa_ui.my + 22;
+    if (px + bw > __nexa_g.w - 4) px = __nexa_g.w - 4 - bw;
+    if (py + bh > __nexa_g.h - 4) py = __nexa_ui.my - bh - 8;
+    if (px < 4) px = 4;
+    if (py < 4) py = 4;
+    __nexa_ui_NoClip all;
+    unsigned int ink;
+    if (fl) {
+        __nexa_ui_shadow((float)px, (float)py, (float)bw, (float)bh, 4.0f, 8.0f, 2.0f, f.dark ? 90 : 30);
+        __nexa_ui_rrect((float)px, (float)py, (float)bw, (float)bh, 4.0f, f.flyout, 255);
+        __nexa_ui_rrect_line((float)px, (float)py, (float)bw, (float)bh, 4.0f, 1.0f, f.flyout_edge, 255);
+        ink = f.text;
+    } else {
+        // modern: the theme turned inside out -- a dark tip on a light page
+        __nexa_ui_shadow((float)px, (float)py, (float)bw, (float)bh, 5.0f, 4.0f, 1.0f, t.shadow_alpha);
+        __nexa_ui_rrect((float)px, (float)py, (float)bw, (float)bh, 5.0f, t.text, 255);
+        ink = t.bg;
+    }
+    for (size_t i = 0; i < lines.size(); i++) {
+        __nexa_ui_text_run((float)(px + 9), (float)(py + 6 + (int)i * lh), lines[i], 0, size, ink, 255, true);
+    }
+}
+
+// --- dialogs ---
+
+[[maybe_unused]] static int __nexa_ui_dialog(const std::string& title, const std::string& message,
+                                            const std::vector<std::string>& buttons) {
+    __nexa_ui_begin();
+    int fl = __nexa_ui_is(__NEXA_UI_FLUENT);
+    int size = __nexa_ui.size;
+    __nexa_ui.modal = 1;
+    __nexa_ui.focus = 0;
+    __nexa_ui.open = 0;
+    __nexa_ui_Dialog& d = __nexa_ui.dlg;
+    int W = __nexa_g.w, H = __nexa_g.h;
+    d.w = W - 32 < 460 ? W - 32 : 460;
+    if (d.w < 160) d.w = 160;
+    int pad = 24;
+    d.ts = size + 5;
+    d.title = title;
+    d.lines = __nexa_ui_wrap(message, 0, size, d.w - 2 * pad);
+    int th = __nexa_ui_line_h(1, d.ts), lh = __nexa_ui_line_h(0, size);
+    d.bh = fl ? 32 : 36;
+    d.body = pad + th + 12 + (int)d.lines.size() * lh + pad;
+    d.h = d.body + (fl ? 2 * pad + d.bh : d.bh + pad);
+    d.x = (W - d.w) / 2;
+    d.y = (H - d.h) / 2;
+    d.by = d.y + d.body + (fl ? pad : 0);
+    int n = (int)buttons.size();
+    d.buttons = buttons;
+    d.bx.assign((size_t)n, 0);
+    d.bw.assign((size_t)n, 0);
+    d.hover.assign((size_t)n, 0);
+    d.held.assign((size_t)n, 0);
+    if (fl) {
+        // Windows: the buttons share the footer's width
+        int each = n > 0 ? (d.w - 2 * pad - 8 * (n - 1)) / n : 0;
+        for (int i = 0; i < n; i++) {
+            d.bx[(size_t)i] = d.x + pad + i * (each + 8);
+            d.bw[(size_t)i] = each;
+        }
+    } else {
+        int total = 0;
+        for (int i = 0; i < n; i++) {
+            int bw = (int)std::ceil(__nexa_ui_width(buttons[(size_t)i], 1, size)) + 40;
+            d.bw[(size_t)i] = bw < 88 ? 88 : bw;
+            total += d.bw[(size_t)i] + (i ? 8 : 0);
+        }
+        int bx = d.x + d.w - pad - total;
+        for (int i = 0; i < n; i++) {
+            d.bx[(size_t)i] = bx;
+            bx += d.bw[(size_t)i] + 8;
+        }
+    }
+    int result = -1;
+    __nexa_ui.in_modal = 1;
+    for (int i = 0; i < n; i++) {
+        int hv, hd;
+        if (__nexa_ui_clickable(__nexa_ui_id(16, d.bx[(size_t)i], d.by), d.bx[(size_t)i], d.by, d.bw[(size_t)i], d.bh, hv, hd)) result = i;
+        d.hover[(size_t)i] = hv;
+        d.held[(size_t)i] = hd;
+    }
+    __nexa_ui.in_modal = 0;
+    // Enter answers with the first button, Escape with the last -- keys that
+    // came while the dialog was up
+    if (__nexa_ui.modal_prev && n > 0) {
+        for (int v : __nexa_ui.ev) {
+            if (v == -1 - __NEXA_UI_ENTER && result < 0) result = 0;
+            if (v == -1 - __NEXA_UI_ESC && result < 0) result = n - 1;
+        }
+    }
+    __nexa_ui.ev.clear();
+    return result;
+}
+
+static void __nexa_ui_draw_dialog() {
+    if (!__nexa_ui.modal) return;
+    const __nexa_ui_Dialog& d = __nexa_ui.dlg;
+    const __nexa_ui_Theme& t = __nexa_ui_t();
+    int fl = __nexa_ui_is(__NEXA_UI_FLUENT);
+    __nexa_ui_Fluent f = __nexa_ui_fl();
+    int size = __nexa_ui.size, pad = 24;
+    __nexa_ui_NoClip all;
+    // the page behind goes dim
+    __nexa_ui_rrect(0, 0, (float)__nexa_g.w, (float)__nexa_g.h, 0, 0x000000, fl ? (f.dark ? 110 : 77) : 96);
+    unsigned int ink;
+    if (fl) {
+        // Windows' content dialog: a white body over a grey footer
+        __nexa_ui_shadow((float)d.x, (float)d.y, (float)d.w, (float)d.h, 8.0f, 28.0f, 10.0f, f.dark ? 170 : 70);
+        __nexa_ui_rrect((float)d.x, (float)d.y, (float)d.w, (float)d.h, 8.0f, f.bg, 255);
+        {
+            __nexa_ui_Clip top(d.x, d.y, d.x + d.w, d.y + d.body);
+            __nexa_ui_rrect((float)d.x, (float)d.y, (float)d.w, (float)d.h, 8.0f, f.dark ? f.card : 0xFFFFFF, 255);
+        }
+        __nexa_ui_rrect((float)d.x, (float)(d.y + d.body), (float)d.w, 1, 0, f.card_edge, 255);
+        __nexa_ui_rrect_line((float)d.x, (float)d.y, (float)d.w, (float)d.h, 8.0f, 1.0f, f.flyout_edge, 255);
+        ink = f.text;
+    } else {
+        float r = (float)(__nexa_ui.rounding + 4);
+        __nexa_ui_shadow((float)d.x, (float)d.y, (float)d.w, (float)d.h, r, 28.0f, 10.0f, t.shadow_alpha + 40);
+        __nexa_ui_rrect((float)d.x, (float)d.y, (float)d.w, (float)d.h, r, t.surface, 255);
+        __nexa_ui_rrect_line((float)d.x, (float)d.y, (float)d.w, (float)d.h, r, 1.0f, t.border, 255);
+        ink = t.text;
+    }
+    __nexa_ui_text_run((float)(d.x + pad), (float)(d.y + pad), d.title, 1, d.ts, ink, 255, true);
+    int lh = __nexa_ui_line_h(0, size);
+    int my = d.y + pad + __nexa_ui_line_h(1, d.ts) + 12;
+    {
+        __nexa_ui_Clip clip(d.x + pad, d.y, d.x + d.w - pad, d.y + d.body);
+        for (size_t i = 0; i < d.lines.size(); i++) {
+            __nexa_ui_text_run((float)(d.x + pad), (float)(my + (int)i * lh), d.lines[i], 0, size, ink, 255, true);
+        }
+    }
+    for (size_t i = 0; i < d.buttons.size(); i++) {
+        __nexa_ui_button_paint(d.bx[i], d.by, d.bw[i], d.bh, d.buttons[i], i == 0 ? "primary" : "secondary",
+                               d.hover[i], d.held[i]);
+    }
 }

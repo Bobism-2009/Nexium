@@ -298,16 +298,18 @@ fn trim_trailing() {
     end_edit(0);
 }
 
-fn change_case(upper: bool) {
+fn change_case(to_upper: bool) {
     if (!has_sel()) { select_word(); }
     if (!has_sel()) { return; }
-    let t = sel_text();
+    let t: string = sel_text();
     sel_bounds();
     let y1 = sel_y1;
     let x1 = sel_x1;
     let rev = ay > cy || (ay == cy && ax > cx);
     begin_edit("case");
-    insert_text(upper ? t.upper() : t.lower());
+    let cased: string = t.lower();
+    if (to_upper) { cased = t.upper(); }
+    insert_text(cased);
     if (rev) {
         ay = cy;
         ax = cx;
@@ -424,7 +426,7 @@ fn code_lang(): bool {
 }
 
 fn type_char(cp: int) {
-    let ch = utf8(cp);
+    let ch: string = utf8(cp);
     let close = closer_for(ch);
     let quote = ch == "\"" || ch == "'" || ch == "`";
     if (ch == "`" && doc_lang != L_MD) { close = ""; }
@@ -490,11 +492,11 @@ fn type_char(cp: int) {
 
 fn press_enter() {
     let s: string = L[cy];
-    let ind = leading_ws(s);
+    let ind: string = leading_ws(s);
     if (len(ind) > cx) { ind = ind.substring(0, cx); }
-    let before = s.substring(0, cx).trim();
-    let after = s.substring(cx, -1).trim();
-    let last = "";
+    let before: string = s.substring(0, cx).trim();
+    let after: string = s.substring(cx, -1).trim();
+    let last: string = "";
     if (len(before) > 0) { last = before.substring(len(before) - 1, 1); }
     begin_edit("enter");
     delete_sel();
@@ -982,15 +984,22 @@ fn ed_wheel(delta: int, horizontal: bool) {
 
 // ---- go to definition --------------------------------------------------------------------------------
 
-// Line in lines that defines name (fn, struct, enum, let at the start), or -1.
+// Strip a leading "priv " so outline/goto see the real declaration.
+fn strip_priv(s: string): string {
+    if (s.starts_with("priv ")) { return s.substring(5, -1); }
+    return s;
+}
+
+// Line in lines that defines name (fn, struct, enum, type, shape, let), or -1.
 fn find_def(lines: []string, name: string): int {
-    let pats = ["fn " + name + "(", "fn " + name + " (", "struct " + name, "enum " + name, "let " + name + " ", "let " + name + ":", "let " + name + "=", "let const " + name, "#define " + name, "class " + name];
+    let pats: []string = ["fn " + name + "(", "fn " + name + " (", "struct " + name, "enum " + name, "type " + name, "shape " + name, "let " + name + " ", "let " + name + ":", "let " + name + "=", "let const " + name, "#define " + name, "class " + name];
     for (k, len(lines)) {
-        let t: string = lines[k].trim();
-        for (p in pats) {
-            if (t.starts_with(p) || t.starts_with("extern " + p)) {
-                let after = t.substring(len(p), 1);
-                if (p.ends_with("(") || len(after) == 0 || !is_word_b(ubyte(after, 0))) { return k; }
+        let t: string = strip_priv(lines[k].trim());
+        for (pi, len(pats)) {
+            let pat: string = pats[pi];
+            if (t.starts_with(pat) || t.starts_with("extern " + pat)) {
+                let after: string = t.substring(len(pat), 1);
+                if (pat.ends_with("(") || len(after) == 0 || !is_word_b(ubyte(after, 0))) { return k; }
             }
         }
     }
@@ -999,7 +1008,8 @@ fn find_def(lines: []string, name: string): int {
 
 fn goto_definition(name: string) {
     if (len(name) == 0) { return; }
-    let k = find_def(L, name);
+    let cur_lines: []string = L;
+    let k = find_def(cur_lines, name);
     if (k >= 0) {
         let col = L[k].index_of(name);
         set_cursor(k, imax(col, 0), false);
@@ -1010,12 +1020,13 @@ fn goto_definition(name: string) {
     }
     // other Nexa files in the workspace
     ensure_files_index();
-    for (p in files_index) {
-        if (!p.lower().ends_with(".nxa") || same_path(p, doc_path)) { continue; }
-        let lines = split_lines(file.read(p));
+    for (fi, len(files_index)) {
+        let path: string = files_index[fi];
+        if (!path.lower().ends_with(".nxa") || same_path(path, doc_path)) { continue; }
+        let lines: []string = split_lines(file.read(path));
         let d = find_def(lines, name);
         if (d >= 0) {
-            open_file(p, false);
+            open_file(path, false);
             let col = L[d].index_of(name);
             set_cursor(d, imax(col, 0), false);
             ax = imax(col, 0);
@@ -1027,7 +1038,7 @@ fn goto_definition(name: string) {
     flash("No definition found for '" + name + "'");
 }
 
-// Symbols (fn, struct, enum) in the document, for the outline and quick open.
+// Symbols (fn, struct, enum, type, shape, top-level let) for outline and quick open.
 
 fn collect_symbols() {
     sym_names.clear();
@@ -1035,10 +1046,10 @@ fn collect_symbols() {
     sym_kinds.clear();
     for (k, len(L)) {
         let t: string = L[k];
-        if (len(t) == 0 || t[0] == ' ' && !t.contains("fn ")) { continue; }
-        let s = t.trim();
+        if (len(t) == 0 || t[0] == ' ' && !t.contains("fn ") && !t.contains("type ") && !t.contains("shape ")) { continue; }
+        let s: string = strip_priv(t.trim());
         let kind = 0;
-        let rest = "";
+        let rest: string = "";
         if (s.starts_with("fn ")) {
             kind = 1;
             rest = s.substring(3, -1);
@@ -1051,6 +1062,12 @@ fn collect_symbols() {
         } else if (s.starts_with("enum ")) {
             kind = 3;
             rest = s.substring(5, -1);
+        } else if (s.starts_with("type ")) {
+            kind = 5;
+            rest = s.substring(5, -1);
+        } else if (s.starts_with("shape ")) {
+            kind = 6;
+            rest = s.substring(6, -1);
         } else if (s.starts_with("let ") && len(leading_ws(t)) == 0) {
             kind = 4;
             rest = s.substring(4, -1);
@@ -1070,10 +1087,10 @@ fn collect_symbols() {
 fn enclosing_symbol(): string {
     let k = cy;
     while (k >= 0) {
-        let s: string = L[k].trim();
-        if (s.starts_with("fn ") || s.starts_with("struct ") || s.starts_with("enum ")) {
+        let s: string = strip_priv(L[k].trim());
+        if (s.starts_with("fn ") || s.starts_with("struct ") || s.starts_with("enum ") || s.starts_with("type ") || s.starts_with("shape ")) {
             let sp = s.index_of(" ");
-            let rest = s.substring(sp + 1, -1);
+            let rest: string = s.substring(sp + 1, -1);
             return rest.substring(0, word_end(rest, 0));
         }
         if (k < cy && len(L[k]) > 0 && L[k][0] == '}') { return ""; }
@@ -1099,8 +1116,8 @@ fn update_completion(force: bool) {
     let s: string = L[cy];
     let a = cx;
     while (a > 0 && is_word_b(ubyte(s, a - 1))) { a--; }
-    let prefix = s.substring(a, cx - a);
-    let member_of = "";
+    let prefix: string = s.substring(a, cx - a);
+    let member_of: string = "";
     if (a > 0 && s[a - 1] == '.') {
         let o = a - 1;
         while (o > 0 && is_word_b(ubyte(s, o - 1))) { o--; }
@@ -1126,25 +1143,34 @@ fn update_completion(force: bool) {
     comp_items.clear();
     comp_kinds.clear();
     comp_prefix = prefix;
-    let lp = prefix.lower();
+    let lp: string = prefix.lower();
     if (len(member_of) > 0) {
         if (nx_members.has(member_of)) {
-            for (m in nx_members[member_of]) {
+            let mems: []string = nx_members[member_of];
+            for (mi, len(mems)) {
+                let m: string = mems[mi];
                 if (m.lower().starts_with(lp)) { comp_add(m, 4); }
             }
         } else {
-            for (m in nx_methods) {
+            for (mi, len(nx_methods)) {
+                let m: string = nx_methods[mi];
                 if (m.lower().starts_with(lp)) { comp_add(m, 6); }
             }
         }
     } else {
-        for (w, k in nx_words) {
+        let word_keys: []string = nx_words.keys();
+        for (wi, len(word_keys)) {
+            let w: string = word_keys[wi];
+            let k: int = nx_words[w];
             if (doc_lang == L_NEXA && w.lower().starts_with(lp) && w != prefix) {
                 comp_add(w, k == 3 ? 2 : (k == 5 ? 3 : 1));
             }
         }
         if (doc_lang == L_CPP) {
-            for (w, k in cpp_words) {
+            let cpp_keys: []string = cpp_words.keys();
+            for (wi, len(cpp_keys)) {
+                let w: string = cpp_keys[wi];
+                let k: int = cpp_words[w];
                 if (w.lower().starts_with(lp) && w != prefix) { comp_add(w, k == 3 ? 2 : 1); }
             }
         }
@@ -1459,7 +1485,7 @@ fn open_find(replace: bool) {
     find_open = true;
     find_replace = replace || find_replace && find_open;
     if (!replace) { find_replace = false; }
-    let t = sel_text();
+    let t: string = sel_text();
     if (len(t) > 0 && !t.contains("\n")) {
         fld_set(FLD_FIND, t);
     } else if (!has_sel()) {

@@ -1,7 +1,7 @@
 # Nexium is written in Nexa (nexium/*.nxa) and drawn with std/ui. NexaC turns
 # it into one C++ file and compiles that; `make` also keeps that C++ in
 # transpiled/nexium.cpp so the generated source can be read, diffed and built
-# by hand. Needs NexaC 0.1.15 or newer (std/ui); point NEXAC at it if the one
+# by hand. Needs NexaC 0.1.16 or newer (std/ui); point NEXAC at it if the one
 # on PATH is older.
 NEXAC ?= NexaC
 SRC    = $(wildcard nexium/*.nxa) $(wildcard nexium/*.hpp)

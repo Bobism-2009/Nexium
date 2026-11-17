@@ -27,11 +27,11 @@ fn add_members(mod: string, names: string) {
 
 fn hl_init() {
     // 1 control, 2 keyword, 3 type, 4 constant, 5 module
-    add_words(0, "fn extern if else while for switch case default return break continue goto try catch throw", 1);
-    add_words(0, "let const struct enum new delete sizeof in self and or not", 2);
-    add_words(0, "int short long size_t string bool float char void unsigned map Result result Json json HttpResponse HttpServer HttpRequest", 3);
+    add_words(0, "fn extern if else while for switch case default return break continue defer goto try catch throw", 1);
+    add_words(0, "let const struct enum type shape priv new delete sizeof in self and or not", 2);
+    add_words(0, "int short long size_t string bool float float32 float64 char void unsigned map Result result Json json HttpResponse HttpServer HttpRequest", 3);
     add_words(0, "true false null", 4);
-    add_words(0, "io os dll file random math crypto http tcp udp json time thread gfx gfx3d ui", 5);
+    add_words(0, "io os dll file random math crypto http tcp udp json time thread term gfx gfx3d ui", 5);
 
     add_words(1, "if else for while do switch case default break continue return goto try catch throw co_await co_return co_yield", 1);
     add_words(1, "alignas alignof asm auto class concept const consteval constexpr constinit const_cast decltype delete dynamic_cast enum explicit export extern final friend inline mutable namespace new noexcept operator override private protected public register reinterpret_cast requires sizeof static static_assert static_cast struct template this thread_local typedef typeid typename union using virtual volatile and or not xor", 2);
@@ -42,23 +42,25 @@ fn hl_init() {
     add_words(2, "echo set setlocal endlocal export local declare readonly unset shift source alias cd pushd popd not exist defined errorlevel equ neq lss leq gtr geq ifeq ifneq ifdef ifndef endif define endef include PHONY", 2);
     add_words(2, "true false null $true $false $null", 4);
 
-    add_members("io", "print println flush readln read_int to_int getline trim");
-    add_members("os", "system spawn spawn_wait spawn_at wait kill platform arch cpu_count getenv setenv unsetenv hostname username user home tempdir cwd chdir executable which total_mem avail_mem page_size uptime shell newline path_sep lang isatty environ env config_dir cache_dir desktop endian exit getpid exe_dir clip_get clip_set notify open load save play lock shutdown reboot suspend logout set_volume get_volume mute unmute toggle_mute set_brightness get_brightness type messagebox getkey keypressed");
-    add_members("file", "read write append exists mkdir remove delete remove_all rename move copy list listdir isdir isfile size cwd chdir abspath join dirname parent basename name extension");
-    add_members("random", "int seed");
-    add_members("math", "abs min max pow sqrt floor ceil round sin cos tan log log10 exp pi e");
+    add_members("io", "print println eprint eprintln flush readln eof read_int to_int to_float parse_int parse_float getline trim");
+    add_members("os", "system spawn spawn_wait spawn_at wait kill inject inject_dll alloc_console platform arch cpu_count getenv setenv unsetenv hostname username user home tempdir cwd chdir executable which total_mem avail_mem page_size uptime shell newline path_sep lang isatty environ env config_dir cache_dir desktop endian exit getpid getprocessid exe_dir clip_get clip_set notify open load save play lock shutdown reboot suspend logout set_volume get_volume mute unmute toggle_mute set_brightness get_brightness type messagebox getkey keypressed");
+    add_members("file", "read lines write append exists mkdir remove delete remove_all rename move copy list listdir walk isdir isfile size modified cwd chdir abspath join dirname parent basename name extension stem");
+    add_members("random", "int float bool chance choice shuffle seed");
+    add_members("math", "abs min max pow sqrt floor ceil round trunc mod sign clamp lerp cbrt hypot sin cos tan asin acos atan atan2 sinh cosh tanh deg rad log log2 log10 exp pi tau e inf");
     add_members("crypto", "xor sha256 sha1 hmac_sha256 hex_encode hex_decode base64_encode base64_decode random_bytes");
     add_members("http", "get post put patch delete request localhost accept reply raw close");
     add_members("tcp", "connect listen accept send recv port close");
     add_members("udp", "open port send recv sender sender_port close");
     add_members("json", "parse stringify of null bool int float string array object");
-    add_members("time", "sleep seconds milliseconds now_ms");
-    add_members("thread", "spawn join worker run worker_join");
+    add_members("time", "sleep seconds milliseconds now_ms unix unix_ms format format_utc year month day hour minute second weekday");
+    add_members("thread", "spawn join worker run worker_join mutex lock unlock");
     add_members("dll", "load call");
-    add_members("gfx", "open resize width height scale title close poll closed clear plot get fill rect round_rect fill_round_rect line circle fill_circle ellipse fill_ellipse arc pie tri fill_tri poly fill_poly alpha save text text_size text_width text_height present maxfps fullscreen borderless ontop transparent audio sample audio_queued audio_flush sound play loop stop volume image decode image_w image_h blit blit_rot icon cursor key pressed released wheel wheel_x typed mouse_x mouse_y mouse drop opendialog openfile");
-    add_members("gfx3d", "open close closed poll present clear width height maxfps backend renderer camera perspective ambient light reset translate rotate scale draw cube box sphere cylinder cone capsule teapot grid tri line3 model model_tris get save key pressed released typed mouse mouse_x mouse_y wheel wheel_x audio sample audio_queued audio_flush sound sound_at play loop stop volume");
-    add_members("ui", "open background theme accent rounding font_size text heading caption text_width text_height panel separator button checkbox toggle radio slider progress textbox dropdown");
+    add_members("gfx", "open resize width height scale title close poll closed clear plot get fill rect round_rect fill_round_rect line circle fill_circle ellipse fill_ellipse arc pie tri fill_tri poly fill_poly alpha save text text_size text_width text_height present maxfps fullscreen borderless ontop transparent audio sample audio_queued audio_flush sound play loop stop volume image decode image_w image_h upload blit blit_rot icon cursor key pressed released wheel wheel_x typed mouse_x mouse_y mouse pads pad pad_pressed pad_axis rumble drop opendialog openfile");
+    add_members("gfx3d", "open close closed poll present clear width height maxfps backend renderer camera perspective ambient light reset translate rotate scale draw cube box sphere cylinder cone capsule teapot grid tri line3 model model_tris texture use shader use_shader shader_set shader_error get save key pressed released typed mouse mouse_x mouse_y wheel wheel_x pads pad pad_pressed pad_axis rumble audio sample audio_queued audio_flush sound sound_at play loop stop volume");
+    add_members("ui", "open background theme style accent rounding font_size text heading caption text_width text_height panel separator button checkbox toggle radio slider progress textbox dropdown tabs list table menubar menu dialog tooltip");
+    add_members("term", "color bg bold dim italic underline reverse clear clear_line clear_eol move home hide_cursor show_cursor cursor progress spinner alt_screen raw getkey key_available width height");
     nx_methods = "upper lower trim len contains starts_with ends_with index_of last_index_of count replace substring repeat split push pop insert remove clear has sort sort_desc reverse min max sum join keys values ok value error kind is_null is_bool is_number is_string is_array is_object is_error as_bool as_int as_float as_string get set".split(" ");
+    add_words(0, "bits from_bits32 from_bits64", 2);
 }
 
 fn lang_for(path: string): int {
@@ -309,6 +311,18 @@ fn hl_number(s: string, i: int): int {
     return j;
 }
 
+// A word that can sit in a type: a built-in, or a Capitalised name (Point).
+// ALL_CAPS stays a constant, so it is not a type.
+fn nexa_type_word(w: string): bool {
+    if (word_kind(L_NEXA, w) == 3) { return true; }
+    if (len(w) == 0 || !is_upper_b(ubyte(w, 0))) { return false; }
+    let caps = true;
+    for (k, len(w)) {
+        if (ubyte(w, k) >= 97 && ubyte(w, k) <= 122) { caps = false; }
+    }
+    return !caps || len(w) == 1;
+}
+
 fn hl_code(lang: int, s: string, st: int, dl: string): []int {
     let n = len(s);
     HC.clear();
@@ -367,6 +381,7 @@ fn hl_code(lang: int, s: string, st: int, dl: string): []int {
         }
     }
     let prev_word = "";
+    let type_depth = 0;
     while (i < n) {
         let c = s[i];
         let b = ubyte(s, i);
@@ -472,7 +487,7 @@ fn hl_code(lang: int, s: string, st: int, dl: string): []int {
                 color = S_CONTROL;
             } else if (prev_word == "fn") {
                 color = S_FUNC;
-            } else if (prev_word == "struct" || prev_word == "enum" || prev_word == "class" || prev_word == "namespace" || prev_word == "union") {
+            } else if (prev_word == "struct" || prev_word == "enum" || prev_word == "type" || prev_word == "shape" || prev_word == "class" || prev_word == "namespace" || prev_word == "union") {
                 color = S_TYPE;
             } else if (next_c == '(') {
                 color = S_FUNC;
@@ -494,9 +509,53 @@ fn hl_code(lang: int, s: string, st: int, dl: string): []int {
             i = e;
             continue;
         }
+        if (lang == L_NEXA && c == '[') {
+            // []T, [][]T: the brackets are part of the type, not an index.
+            let j = i;
+            let slices = 0;
+            while (j + 1 < n && s[j] == '[' && s[j + 1] == ']') {
+                slices++;
+                j += 2;
+                while (j < n && is_space_b(ubyte(s, j))) { j++; }
+            }
+            if (slices > 0 && j < n && is_word_b(ubyte(s, j))) {
+                let we = word_end(s, j);
+                if (nexa_type_word(s.substring(j, we - j))) {
+                    paint(i, j, S_TYPE);
+                    i = j;
+                    continue;
+                }
+            }
+            // Result[T] and map[K]: the brackets belong to the type.
+            if (prev_word == "Result" || prev_word == "result" || prev_word == "map") {
+                HC[i] = S_TYPE;
+                type_depth++;
+                prev_word = "";
+                i++;
+                continue;
+            }
+        }
+        if (lang == L_NEXA && c == '*') {
+            // *T and **T. A dereference *p is a lowercase name, so it stays plain.
+            let j = i;
+            while (j < n && s[j] == '*') { j++; }
+            let stars = j;
+            while (j < n && is_space_b(ubyte(s, j))) { j++; }
+            if (stars > i && j < n && is_word_b(ubyte(s, j))) {
+                let we = word_end(s, j);
+                if (nexa_type_word(s.substring(j, we - j))) {
+                    paint(i, stars, S_TYPE);
+                    i = stars;
+                    continue;
+                }
+            }
+        }
         if (c == '(' || c == '[' || c == '{') {
             HC[i] = bracket_color(depth);
             depth++;
+        } else if (c == ']' && type_depth > 0) {
+            type_depth--;
+            HC[i] = S_TYPE;
         } else if (c == ')' || c == ']' || c == '}') {
             depth--;
             if (depth < 0) {

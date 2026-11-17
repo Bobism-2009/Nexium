@@ -166,7 +166,8 @@ fn agent_system(): string {
     let agent_mode = ag_mode == "agent";
     let groq = ag_provider == "groq";
     let o = "You are Nexium, an AI assistant in a native Nexa IDE.\n";
-    o += "Nexa is a systems language (.nxa) that transpiles to C++ via NexaC.\n";
+    o += "Nexa is a systems language (.nxa) that transpiles to C++ via NexaC (0.1.16+).\n";
+    o += "It has priv, type aliases, shapes (T: Drawable), generics (fn id[T]), destructuring (let Point { x, y } = p), defer, float32/float64, and std modules including term/gfx/gfx3d/ui.\n";
     o += "Write real Nexa, not C++, unless the user is in inline_cpp! or asking about the compiler.\n";
     o += "The chat renders Markdown: headings, **bold**, lists, `inline code`, and fenced code blocks.\n";
     if (agent_mode) {

@@ -1,0 +1,134 @@
+// App-level helpers shared across included files (settings, title, hit tests).
+// Lives in its own file so buffer/workspace/commands can call it under 0.1.16
+// file scoping: included files cannot see the entry file's bare names.
+
+fn settings_file(): string {
+    // NEXIUM_CONFIG_DIR points a test copy somewhere other than the real settings
+    let dir = os.getenv("NEXIUM_CONFIG_DIR");
+    if (len(dir) == 0) { dir = path_join(os.config_dir(), "Nexium"); }
+    if (!file.isdir(dir)) { file.mkdir(dir); }
+    return path_join(dir, "settings.json");
+}
+
+fn load_settings() {
+    settings_path = settings_file();
+    if (!file.isfile(settings_path)) { return; }
+    let j: Json = json.parse(file.read(settings_path));
+    if (!j.ok() || !j.is_object()) { return; }
+    if (j.has("folder")) { folder = j.get("folder").as_string(); }
+    if (j.has("nexac")) { nexac = j.get("nexac").as_string(); }
+    // 1.x stored "Nexa" as the default; empty now means "look for one"
+    if (nexac == "Nexa") { nexac = ""; }
+    if (j.has("run_args")) { run_args = j.get("run_args").as_string(); }
+    if (j.has("sidebar_w")) { sidebar_w = j.get("sidebar_w").as_int(); }
+    if (j.has("panel_h")) { panel_h = j.get("panel_h").as_int(); }
+    if (j.has("show_sidebar")) { show_sidebar = j.get("show_sidebar").as_bool(); }
+    if (j.has("show_panel")) { show_panel = j.get("show_panel").as_bool(); }
+    if (j.has("font_size")) { font_size = clamp(j.get("font_size").as_int(), 8, 32); }
+    if (j.has("render_whitespace")) { show_ws = j.get("render_whitespace").as_bool(); }
+    if (j.has("auto_save")) { auto_save = j.get("auto_save").as_bool(); }
+    if (j.has("maximized")) { win_max = j.get("maximized").as_bool(); }
+    if (j.has("window_w")) { win_w = j.get("window_w").as_int(); }
+    if (j.has("window_h")) { win_h = j.get("window_h").as_int(); }
+    if (j.has("recent")) {
+        let r: Json = j.get("recent");
+        for (i, r.len()) { recent.push(r.get(i).as_string()); }
+    }
+    if (j.has("font_family") && len(j.get("font_family").as_string()) > 0) { font_family = j.get("font_family").as_string(); }
+    if (j.has("minimap")) { show_minimap = j.get("minimap").as_bool(); }
+    if (j.has("show_agent")) { show_agent = j.get("show_agent").as_bool(); }
+    if (j.has("agent_w")) { agent_w = j.get("agent_w").as_int(); }
+    if (j.has("nexa_lang")) { nexa_lang = j.get("nexa_lang").as_string(); }
+    if (j.has("provider")) { ag_provider = j.get("provider").as_string(); }
+    if (!provider_ids().contains(ag_provider)) { ag_provider = "openai"; }
+    if (j.has("mode")) { ag_mode = j.get("mode").as_string() == "chat" ? "chat" : "agent"; }
+    if (j.has("temperature")) { ag_temp = j.get("temperature").as_float(); }
+    if (j.has("providers") && j.get("providers").is_object()) {
+        let ps: Json = j.get("providers");
+        for (id in provider_ids()) {
+            if (!ps.has(id)) { continue; }
+            let slot: Json = ps.get(id);
+            if (slot.has("api_key")) { ag_keys[id] = slot.get("api_key").as_string(); }
+            if (slot.has("base_url")) { ag_urls[id] = slot.get("base_url").as_string(); }
+            if (slot.has("model")) { ag_models[id] = slot.get("model").as_string(); }
+            if (slot.has("custom_model")) { ag_custom[id] = slot.get("custom_model").as_string(); }
+        }
+    }
+    if (j.has("open_files")) {
+        let r: Json = j.get("open_files");
+        for (i, r.len()) { last_files.push(r.get(i).as_string()); }
+    }
+}
+
+// Writes our keys into settings.json, keeping any others (the agent settings
+// from Nexium 1.x among them).
+fn save_settings() {
+    if (len(settings_path) == 0) { return; }
+    let j: Json = json.object();
+    if (file.isfile(settings_path)) {
+        let old: Json = json.parse(file.read(settings_path));
+        if (old.ok() && old.is_object()) { j = old; }
+    }
+    j.set("folder", json.string(folder));
+    j.set("nexac", json.string(nexac));
+    j.set("run_args", json.string(run_args));
+    j.set("sidebar_w", json.int((int)(sidebar_w / SCALE)));
+    j.set("panel_h", json.int((int)(panel_h / SCALE)));
+    j.set("show_sidebar", json.bool(show_sidebar));
+    j.set("show_panel", json.bool(show_panel));
+    j.set("font_size", json.int(font_size));
+    j.set("render_whitespace", json.bool(show_ws));
+    j.set("auto_save", json.bool(auto_save));
+    j.set("maximized", json.bool(nx_maximized() == 1));
+    j.set("font_family", json.string(font_family));
+    j.set("minimap", json.bool(show_minimap));
+    j.set("show_agent", json.bool(show_agent));
+    j.set("agent_w", json.int((int)(agent_w / SCALE)));
+    j.set("nexa_lang", json.string(nexa_lang));
+    j.set("provider", json.string(ag_provider));
+    j.set("mode", json.string(ag_mode));
+    j.set("temperature", json.float(ag_temp));
+    let ps: Json = json.object();
+    for (id in provider_ids()) {
+        let slot: Json = json.object();
+        slot.set("api_key", json.string(ag_keys.has(id) ? ag_keys[id] : ""));
+        slot.set("base_url", json.string(ag_urls.has(id) ? ag_urls[id] : ""));
+        slot.set("model", json.string(ag_models.has(id) ? ag_models[id] : ""));
+        slot.set("custom_model", json.string(ag_custom.has(id) ? ag_custom[id] : ""));
+        ps.set(id, slot);
+    }
+    j.set("providers", ps);
+    if (nx_maximized() == 0 && nx_minimized() == 0) {
+        j.set("window_w", json.int((int)(win_w / SCALE)));
+        j.set("window_h", json.int((int)(win_h / SCALE)));
+    }
+    let r: Json = json.array();
+    for (p in recent) { r.push(json.string(p)); }
+    j.set("recent", r);
+    let o: Json = json.array();
+    for (i, len(bufs)) {
+        let p: string = bufs[i].path;
+        if (bufs[i].kind == 0 && len(p) > 0) { o.push(json.string(p)); }
+    }
+    j.set("open_files", o);
+    file.write(settings_path, json.stringify(j, 2));
+}
+
+fn remember_files() {
+    frame_dirty = true;
+}
+
+fn update_title() {
+    let t = "Nexium";
+    if (len(folder) > 0) { t = file.basename(folder) + " - Nexium"; }
+    if (active >= 0 && active < len(bufs)) {
+        let nm: string = bufs[active].name;
+        t = nm + (buf_dirty(active) ? " ●" : "") + " - " + t;
+    }
+    nx_title(t);
+}
+
+// A click (pressed and released) inside the rectangle this frame.
+fn clicked_in(x: int, y: int, w: int, h: int): bool {
+    return up_this_frame && inside(up_x, up_y, x, y, w, h) && inside(down_x, down_y, x, y, w, h);
+}
